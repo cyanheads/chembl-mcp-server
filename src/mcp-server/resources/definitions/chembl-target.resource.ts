@@ -23,7 +23,6 @@ export const chemblTargetResource = resource('chembl://target/{chemblId}', {
   }),
 
   handler(params, ctx) {
-    ctx.log.debug('Fetching target resource', { chemblId: params.chemblId });
     return getChemblService().getTarget(params.chemblId, ctx);
   },
 

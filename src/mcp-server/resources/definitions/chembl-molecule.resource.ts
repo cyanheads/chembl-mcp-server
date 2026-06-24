@@ -23,7 +23,6 @@ export const chemblMoleculeResource = resource('chembl://molecule/{chemblId}', {
   }),
 
   handler(params, ctx) {
-    ctx.log.debug('Fetching molecule resource', { chemblId: params.chemblId });
     return getChemblService().getMolecule(params.chemblId, ctx);
   },
 

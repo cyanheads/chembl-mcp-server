@@ -280,7 +280,7 @@ export class ChemblService {
       molecule_type: toStringOrNull(raw.molecule_type),
     };
     // similarity is present only on similarity/substructure search results.
-    if (raw.similarity !== undefined && raw.similarity !== null) {
+    if (raw.similarity != null) {
       molecule.similarity = toNumberOrNull(raw.similarity);
     }
     return molecule;
