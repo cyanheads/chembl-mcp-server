@@ -1,7 +1,7 @@
 {
   "name": "chembl-mcp-server",
   "version": "0.1.0",
-  "description": "Drug-discovery data over ChEMBL — connect compounds to protein targets through curated, standardized bioactivity, mechanisms, and indications.",
+  "description": "Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -39,7 +39,15 @@
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
     "start:http": "MCP_TRANSPORT_TYPE=http node dist/index.js"
   },
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "chembl",
+    "drug-discovery",
+    "bioactivity",
+    "cheminformatics"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cyanheads/chembl-mcp-server.git"

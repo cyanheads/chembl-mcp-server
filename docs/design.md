@@ -207,25 +207,29 @@ interface DrugInfo {
 ```
 
 **Canvas table — `bioactivities`.** When `chembl_get_bioactivities` spills, the staged table holds the
-flat `Activity` rows (coerced numerics) so SQL aggregates are honest. Columns available for SQL:
+full flat `Activity` rows (coerced numerics) so SQL aggregates are honest. The spill registers every
+field the handler yields — all **18 columns** available for SQL:
 `activity_id`, `molecule_chembl_id`, `molecule_pref_name`, `target_chembl_id`, `target_pref_name`,
-`target_organism`, `assay_chembl_id`, `assay_type`, `standard_type`, `standard_relation`,
-`standard_value` (DOUBLE), `standard_units`, `pchembl_value` (DOUBLE).
+`target_organism`, `assay_chembl_id`, `assay_type`, `assay_description`, `standard_type`,
+`standard_relation`, `standard_value` (DOUBLE), `standard_units`, `pchembl_value` (DOUBLE),
+and the raw upstream `type`, `value`, `units`, `relation` (carried as-is, uncoerced strings).
 Aggregate signal (median potency, distinct-compound count) MUST be computed in SQL over the full
-table, never over the inline preview. The raw `type`/`value`/`units`/`relation` fields are NOT staged
-(analytical queries should use the `standard_*` columns).
+table, never over the inline preview — and rank on the `standard_*` / `pchembl_value` columns, not the
+raw `type`/`value`/`units`/`relation` (those are present for audit but are not normalized for comparison).
 
 ## Services
 
 | Service | Responsibility | Key methods |
 |---|---|---|
-| `ChemblService` (`src/services/chembl/chembl-service.ts`) | The single upstream client. Wraps `https://www.ebi.ac.uk/chembl/api/data/`; builds Django-style filtered URLs, fetches `.json`, paginates `page_meta`, **coerces string numerics → number/null at the boundary**, flattens nested structures (`molecule_structures`, `molecule_properties`, `target_components`) into the flat domain types above. Each method wraps its full fetch+parse in `withRetry`. | `searchMolecules(opts)`, `structureSearch(smiles, type, threshold)`, `getActivities(opts)` (returns an async-iterable page stream for spillover), `searchTargets(opts)`, `getMolecule(id)`, `getMechanisms(molId)`, `getIndications(molId)`, `getAssay(id)` |
+| `ChemblService` (`src/services/chembl/chembl-service.ts`) | The single upstream client. Wraps `https://www.ebi.ac.uk/chembl/api/data/`; builds Django-style filtered URLs, fetches `.json`, paginates `page_meta`, **coerces string numerics → number/null at the boundary**, flattens nested structures (`molecule_structures`, `molecule_properties`, `target_components`) into the flat domain types above. Each method wraps its full fetch+parse in `withRetry`. | `searchMolecules(opts)`, `structureSearch(opts)`, `streamActivities(opts)` (returns an async-iterable page stream for spillover), `searchTargets(opts)`, `getMolecule(id)`, `getMechanisms(molId)`, `getIndications(molId)`, `getDrugInfo(molId)`, `getAssay(id)` |
 | `canvas-accessor` (`src/services/canvas-accessor.ts`) | Module-level holder for the optional `DataCanvas` wired in `createApp({ setup })`. `getCanvas()` returns `undefined` when canvas is disabled. | `setCanvas(core.canvas)`, `getCanvas()` |
 
-`chembl_get_bioactivities` uses `spillover({ canvas, source: chembl.getActivities(...), previewChars: 100_000, signal })`
-— preview rows inline, full set staged as the `bioactivities` table. The optional `canvas_id` input
-lets callers reuse an existing canvas (e.g. to append a second query's results to the same session);
-omit it to mint a fresh canvas. `chembl_get_drug_info` composes `getMolecule` + `getMechanisms` +
+`chembl_get_bioactivities` uses `spillover({ canvas, source: chembl.streamActivities(...), previewChars, tableName: 'bioactivities', signal })`
+(with `previewChars = max(40_000, limit * 600)`) — preview rows inline, full set staged as the
+`bioactivities` table. The optional `canvas_id` input lets callers reuse an existing canvas, but the
+table is always re-registered under the fixed name `bioactivities`, so a second query **replaces
+(overwrites)** the prior rows on that canvas rather than appending to them; omit `canvas_id` to mint a
+fresh canvas. `chembl_get_drug_info` composes `getMolecule` + `getMechanisms` +
 `getIndications` with `Promise.allSettled` so a missing mechanism or indication degrades to an empty
 array rather than tanking the call. `chembl_search_targets` validates at least one of `query`,
 `accession`, or `gene_symbol` is non-empty at the handler level — Zod marks all three optional for
@@ -444,7 +448,7 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 | `search_type` defaults to `name` | The most common case is name/ID/InChIKey lookup; callers opt in to structure modes explicitly. |
 | `similarity_threshold` typed as integer 40–100 | ChEMBL's `/similarity` endpoint rejects thresholds below 40; exposing the validated range in the schema prevents silent 400 errors from the upstream. |
 | XOR gates enforced in handler, not Zod | Zod can't cleanly XOR two `.optional()` fields. Runtime check with `ctx.fail('missing_filter'/'missing_input', …)` keeps the schema simple for form clients and produces a typed, recoverable error for agents. |
-| Raw upstream fields named `type`/`value`/`units`/`relation` in `Activity` | Carried alongside `standard_*` for auditability; not staged to the canvas (analytical queries should rank on `standard_*`). |
+| Raw upstream fields named `type`/`value`/`units`/`relation` in `Activity` | Carried alongside `standard_*` for auditability and staged to the canvas with the rest of the row (the full `Activity` spills); analytical queries should still rank on the normalized `standard_*` / `pchembl_value` columns, not the raw ones. |
 | `bioactivities` canvas table column list is explicit | Agents writing SQL against the canvas need the exact column names; prose-only was a gap that would cause repeated `invalid_sql` errors. |
 | `CHEMBL_DEFAULT_LIMIT` config field | The same default (25) applies to all search tools; centralizing it in config avoids scattered magic numbers and lets operators tune for slower connections. |
 | Bidirectional `chembl_get_bioactivities` with XOR input | The compound↔target bridge is symmetric; one tool with a molecule-or-target gate beats two near-duplicates. |

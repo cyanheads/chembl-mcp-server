@@ -130,7 +130,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       .string()
       .optional()
       .describe(
-        'Optional canvas ID from a prior call to reuse the same canvas (append a second query). Omit to mint a fresh one.',
+        'Optional canvas ID from a prior call to reuse the same canvas. The bioactivities table is re-staged, so a second query REPLACES (overwrites) the prior rows on that canvas — it does not append. Omit to mint a fresh canvas.',
       ),
   }),
   output: z.object({

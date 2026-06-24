@@ -196,7 +196,7 @@ export interface SearchTargetsOptions {
   targetType?: string | undefined;
 }
 
-/** Options for `getActivities` — exactly one of molecule/target id is set by the caller. */
+/** Options for `streamActivities` — exactly one of molecule/target id is set by the caller. */
 export interface GetActivitiesOptions {
   assayType?: string | undefined;
   limit: number;
