@@ -1,12 +1,12 @@
 {
   "name": "chembl-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "Drug-discovery data over ChEMBL — connect compounds to protein targets through curated, standardized bioactivity, mechanisms, and indications.",
   "author": {
-    "name": ""
+    "name": "cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/chembl-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/chembl-mcp-server",
   "license": "Apache-2.0",
   "mcpServers": {
     "chembl-mcp-server": {

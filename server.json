@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "chembl-mcp-server",
-  "description": "",
+  "name": "io.github.cyanheads/chembl-mcp-server",
+  "description": "Drug-discovery data over ChEMBL — connect compounds to protein targets through curated, standardized bioactivity, mechanisms, and indications.",
   "repository": {
-    "url": "",
+    "url": "https://github.com/cyanheads/chembl-mcp-server",
     "source": "github"
   },
   "version": "0.1.0",
@@ -25,6 +25,48 @@
         }
       ],
       "environmentVariables": [
+        {
+          "name": "CANVAS_PROVIDER_TYPE",
+          "description": "Set to 'duckdb' to enable the bioactivity DataCanvas spill and the chembl_dataframe_* SQL tools. When 'none', large bioactivity sets inline a preview but never spill.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
+        {
+          "name": "CHEMBL_API_BASE_URL",
+          "description": "Base URL for the ChEMBL REST data API. Override for a private mirror or pinned host.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://www.ebi.ac.uk/chembl/api/data"
+        },
+        {
+          "name": "CHEMBL_REQUEST_TIMEOUT_MS",
+          "description": "Per-request timeout in milliseconds for upstream ChEMBL fetches.",
+          "format": "string",
+          "isRequired": false,
+          "default": "30000"
+        },
+        {
+          "name": "CHEMBL_MAX_PAGE_SIZE",
+          "description": "ChEMBL per-page cap when streaming activity pages for the bioactivity spill (max 1000).",
+          "format": "string",
+          "isRequired": false,
+          "default": "1000"
+        },
+        {
+          "name": "CHEMBL_DEFAULT_LIMIT",
+          "description": "Default result limit applied when callers omit it.",
+          "format": "string",
+          "isRequired": false,
+          "default": "25"
+        },
+        {
+          "name": "CHEMBL_DATAFRAME_DROP_ENABLED",
+          "description": "Set to 'true' to register the opt-in chembl_dataframe_drop tool (absent from tools/list when off).",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
         {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",

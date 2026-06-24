@@ -1,25 +1,25 @@
 {
   "name": "chembl-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "Drug-discovery data over ChEMBL — connect compounds to protein targets through curated, standardized bioactivity, mechanisms, and indications.",
   "author": {
-    "name": "",
-    "email": "",
-    "url": ""
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/chembl-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/chembl-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "chembl", "drug-discovery", "bioactivity", "cheminformatics"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "chembl-mcp-server",
-    "shortDescription": "",
-    "longDescription": "",
-    "developerName": "",
-    "category": "",
+    "shortDescription": "Drug-discovery data over ChEMBL — connect compounds to protein targets through curated, standardized bioactivity, mechanisms, and indications.",
+    "longDescription": "Expose ChEMBL (EBI) over MCP — the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and clinical indications. Find compounds by name or structure, resolve a UniProt accession to a ChEMBL target, pull the most potent leads against it, look up a drug's mechanism and indications, and SQL large bioactivity sets via a DataCanvas spill.",
+    "developerName": "cyanheads",
+    "category": "data",
     "capabilities": ["Read"],
-    "websiteURL": "",
+    "websiteURL": "https://github.com/cyanheads/chembl-mcp-server",
     "defaultPrompt": []
   }
 }
