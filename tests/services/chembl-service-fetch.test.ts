@@ -79,6 +79,35 @@ describe('ChemblService — request URL construction', () => {
     expect(calledUrl()).toContain('/substructure/c1ccccc1O.json');
   });
 
+  it('surfaces the row when an exact search returns a single molecule object (no list envelope)', async () => {
+    // The exact endpoint (/molecule/{smiles}) returns a single molecule object on
+    // a hit — top-level molecule_chembl_id, no `molecules` key. Without the
+    // single-object branch this was parsed as an empty list and the match dropped.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        molecule_chembl_id: 'CHEMBL25',
+        pref_name: 'ASPIRIN',
+        max_phase: '4.0',
+        molecule_structures: { canonical_smiles: 'CC(=O)Oc1ccccc1C(=O)O' },
+        molecule_properties: { mw_freebase: '180.16' },
+      }),
+    );
+    const page = await new ChemblService(config).structureSearch(
+      {
+        structure: 'CC(=O)Oc1ccccc1C(=O)O',
+        searchType: 'exact',
+        similarityThreshold: 70,
+        limit: 5,
+      },
+      ctx(),
+    );
+    expect(calledUrl()).toContain('/molecule/');
+    expect(page.totalCount).toBe(1);
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]?.molecule_chembl_id).toBe('CHEMBL25');
+    expect(page.items[0]?.max_phase).toBe(4);
+  });
+
   it('builds the target URL with accession + gene-symbol + organism filters', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ targets: [], page_meta: { total_count: 0 } }));
     await new ChemblService(config).searchTargets(

@@ -200,6 +200,13 @@ export class ChemblService {
    * Structure search routed by mode to the matching ChEMBL endpoint:
    * `/molecule/{smiles}` (exact), `/similarity/{smiles}/{threshold}` (similarity),
    * `/substructure/{smiles}` (substructure). The SMILES is path-segment encoded.
+   *
+   * The similarity/substructure endpoints return a `{ molecules, page_meta }`
+   * list envelope. The exact endpoint (`/molecule/{smiles}`) is the by-resource
+   * fetch: on a hit it returns a single molecule object at the top level (no
+   * `molecules` key); on a miss it 404s (the framework classifies that as
+   * NotFound). Detect the single-object shape so an exact match is not silently
+   * dropped.
    */
   async structureSearch(opts: StructureSearchOptions, ctx: Context): Promise<Page<Molecule>> {
     const smiles = encodeURIComponent(opts.structure);
@@ -212,11 +219,17 @@ export class ChemblService {
       resource = `substructure/${smiles}`;
     }
     const url = this.buildUrl(resource, { limit: opts.limit, offset: 0 });
-    const raw = await this.fetchJson<{ molecules?: RawMolecule[]; page_meta?: RawPageMeta }>(
-      url,
-      `ChemblService.structureSearch.${opts.searchType}`,
-      ctx,
-    );
+    const raw = await this.fetchJson<
+      { molecules?: RawMolecule[]; page_meta?: RawPageMeta } & RawMolecule
+    >(url, `ChemblService.structureSearch.${opts.searchType}`, ctx);
+
+    // Exact match returns a single molecule object (top-level molecule_chembl_id),
+    // not a list envelope. Wrap it so the row is surfaced.
+    if (raw.molecules === undefined && raw.molecule_chembl_id !== undefined) {
+      const item = this.normalizeMolecule(raw);
+      return { items: [item], totalCount: 1 };
+    }
+
     const items = (raw.molecules ?? []).map((m) => this.normalizeMolecule(m));
     return { items, totalCount: raw.page_meta?.total_count ?? items.length };
   }
