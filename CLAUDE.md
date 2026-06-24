@@ -11,35 +11,30 @@
 
 ---
 
-## First Session
+## Server surface
 
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
+ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/api/data`) — keyless, read-only. The curated compound ↔ target ↔ bioactivity link, plus drug mechanisms and indications.
 
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
+**Tools** (`src/mcp-server/tools/definitions/`):
 
-1. **Get your bearings.** Take stock of the project tree, the skills in `skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
+| Tool | Purpose |
+|:-----|:--------|
+| `chembl_search_molecules` | Discovery entry point — find compounds by name / ChEMBL ID / InChIKey, or structure search (exact / similarity / substructure) from a SMILES |
+| `chembl_search_targets` | Resolve a protein / gene / UniProt accession to the ChEMBL target ID `chembl_get_bioactivities` needs |
+| `chembl_get_bioactivities` | Flagship compound↔target bridge — bioactivity measurements for a molecule OR a target; large sets spill to a DataCanvas table SQL'd via `chembl_dataframe_query` |
+| `chembl_get_drug_info` | Drug pharmacology — mechanism(s) of action, target(s), first-approval year, clinical indications |
+| `chembl_get_assay` | Assay provenance behind a bioactivity row — type, target, organism, 1–9 confidence score |
+| `chembl_dataframe_query` | Read-only SQL SELECT over the spilled bioactivity rows (canvas) |
+| `chembl_dataframe_describe` | List tables/columns staged on a canvas before querying |
+| `chembl_dataframe_drop` | Drop a staged table early. Opt-in behind `CHEMBL_DATAFRAME_DROP_ENABLED`; conditionally registered, so absent from `tools/list` when off |
 
----
+**Resources** (`src/mcp-server/resources/definitions/`): `chembl://molecule/{chemblId}` and `chembl://target/{chemblId}` — injectable-context mirrors of the per-record fetch.
 
-## What's Next?
+**Service** (`src/services/chembl/chembl-service.ts`): the single upstream client. Builds Django-style filtered `.json` URLs, paginates `page_meta`, coerces string numerics → `number | null` at the boundary (absent → `null`, never `0` — the scientific-fidelity rule), flattens nested upstream structures into the flat domain types in `types.ts`. Every fetch routes through `fetchJson`, which wraps the framework HTTP utility in `withRetry`.
 
-When the user asks what's next or needs direction, suggest options based on the current project state. Common next steps:
+**Security invariant — upstream errors are sanitized at `fetchJson`.** The framework's `fetchWithTimeout` throws a status-mapped `McpError` whose `data` carries raw upstream internals (`statusCode`, `responseBody`, `requestId`, the internal URL), and the framework ships `McpError.data` verbatim to the client. `fetchJson`'s catch calls `sanitizeUpstreamError`, which detects the framework error STRUCTURALLY by `err.code` (never by message string) and re-throws a clean domain error (`notFound` / `validationError` / `timeout` / `rateLimited` / `serviceUnavailable`) whose `data` is leak-free (`reason` + recovery `hint`); the raw error rides as `cause` for server-side logs only. This is the single chokepoint for all eight tools and both resources — never bypass it by calling `fetchWithTimeout` directly from a handler. Regression-tested in `tests/services/chembl-service-fetch.test.ts`.
 
-1. **Re-run the `setup` skill** — ensures CLAUDE.md, skills, structure, and metadata are populated and up to date with the current codebase
-2. **Run the `design-mcp-server` skill** — if the tool/resource surface hasn't been mapped yet, work through domain design
-3. **Add tools/resources/prompts** — scaffold new definitions using the `add-tool`, `add-app-tool`, `add-resource`, `add-prompt` skills
-4. **Add services** — scaffold domain service integrations using the `add-service` skill
-5. **Add tests** — scaffold tests for existing definitions using the `add-test` skill
-6. **Field-test definitions** — exercise tools/resources/prompts with real inputs using the `field-test` skill, get a report of issues and pain points
-7. **Run `devcheck`** — lint, format, typecheck, and security audit
-8. **Run the `security-pass` skill** — audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation
-9. **Run the `polish-docs-meta` skill** — finalize README, CHANGELOG, metadata, and agent protocol for shipping
-10. **Run the `maintenance` skill** — investigate changelogs, adopt upstream changes, and sync skills after `bun update --latest`
-
-Tailor suggestions to what's actually missing or stale — don't recite the full list every time.
+**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table (`bioactivities`) when `CANVAS_PROVIDER_TYPE=duckdb`; otherwise it inlines a preview and the `chembl_dataframe_*` tools return a `canvas_disabled` error. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`.
 
 ---
 
@@ -58,77 +53,66 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ### Tool
 
+Real shape, condensed from `chembl-get-assay.tool.ts` (a keyless read-only tool — no `auth` scope; every field `.describe()`d; numeric fields nullable to honor upstream absence):
+
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { getChemblService } from '@/services/chembl/chembl-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const chemblGetAssay = tool('chembl_get_assay', {
+  title: 'chembl-get-assay',                    // display identity = the hyphenated repo name
+  description: 'Assay provenance behind a bioactivity row: type, target, organism, 1–9 confidence score.',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    assay_chembl_id: z.string().min(1).describe("ChEMBL assay ID, e.g. \"CHEMBL674637\"."),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    assay_chembl_id: z.string().describe('The ChEMBL assay ID queried.'),
+    confidence_score: z.number().nullable().describe('ChEMBL confidence score, 1–9. Null when unscored.'),
+    // …remaining fields
   }),
-  auth: ['inventory:read'],
 
+  // Service throws sanitized domain errors; the handler stays a thin pure call.
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    return await getChemblService().getAssay(input.assay_chembl_id.trim(), ctx);
   },
 
   // format() populates content[] — the markdown twin of structuredContent.
   // Different clients read different surfaces (Claude Code → structuredContent,
   // Claude Desktop → content[]); both must carry the same data.
   // Enforced at lint time: every field in `output` must appear in the rendered text.
-  format: (result) => [{
-    type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
-  }],
+  format: (result) => [{ type: 'text', text: `**${result.assay_chembl_id}** — confidence ${result.confidence_score ?? '—'}` }],
 });
 ```
 
 ### Resource
 
+Real shape — `chembl-molecule.resource.ts`. The handler is a thin pass-through to the service; a 404 surfaces as the sanitized `notFound` from `fetchJson`, so no per-resource error handling is needed:
+
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { getChemblService } from '@/services/chembl/chembl-service.js';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
-  async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
-  },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
+export const chemblMoleculeResource = resource('chembl://molecule/{chemblId}', {
+  name: 'chembl-molecule',
+  title: 'chembl-molecule',
+  description: 'A molecule record by ChEMBL ID — the chembl_search_molecules row shape.',
+  mimeType: 'application/json',
+  params: z.object({
+    chemblId: z.string().regex(/^CHEMBL\d+$/, 'Must be a ChEMBL ID like CHEMBL25.').describe('ChEMBL molecule ID.'),
   }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
+  handler(params, ctx) {
+    return getChemblService().getMolecule(params.chemblId, ctx);
+  },
+  examples: [{ name: 'Aspirin', uri: 'chembl://molecule/CHEMBL25' }],
 });
 ```
+
+This server defines **no prompts**.
 
 ### Server config
+
+Real shape — `src/config/server-config.ts`. ChEMBL is **keyless**, so there is no API-key field and no degraded-without-key mode; the only server-owned env vars are the upstream tuning knobs + the opt-in dataframe-drop toggle (the SQL path is gated by the framework's `CANVAS_PROVIDER_TYPE`, not a server-config field):
 
 ```ts
 // src/config/server-config.ts — lazy-parsed, separate from framework config
@@ -136,23 +120,28 @@ import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
-  verboseLogging: z.stringbool().default(false).describe('Enable verbose logging'),
+  apiBaseUrl: z.string().default('https://www.ebi.ac.uk/chembl/api/data')
+    .describe('Base URL for the ChEMBL REST data API. Override for a private mirror.'),
+  requestTimeoutMs: z.coerce.number().int().positive().default(30_000),
+  maxPageSize: z.coerce.number().int().positive().max(1000).default(1000),
+  defaultLimit: z.coerce.number().int().positive().default(25),
+  dataframeDropEnabled: z.stringbool().default(false),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
-    verboseLogging: 'MY_VERBOSE_LOGGING',
+    apiBaseUrl: 'CHEMBL_API_BASE_URL',
+    requestTimeoutMs: 'CHEMBL_REQUEST_TIMEOUT_MS',
+    maxPageSize: 'CHEMBL_MAX_PAGE_SIZE',
+    defaultLimit: 'CHEMBL_DEFAULT_LIMIT',
+    dataframeDropEnabled: 'CHEMBL_DATAFRAME_DROP_ENABLED',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`MY_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`CHEMBL_REQUEST_TIMEOUT_MS`) not the path (`requestTimeoutMs`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
@@ -160,18 +149,24 @@ For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("
 
 `createApp()` accepts optional identity fields forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`):
 
+Real shape — `src/index.ts`. **`title` is the hyphenated repo name** (`chembl-mcp-server`), never a Title-Case display name — humans and agents both see the machine identity. Don't duplicate `description`/`websiteUrl` beyond what's canonical (`description` derives from `package.json`):
+
 ```ts
 await createApp({
-  name: 'my-mcp-server',
-  title: 'My Server',                         // human-readable display name
-  websiteUrl: 'https://github.com/owner/repo', // canonical homepage URL
-  description: 'One-line description.',        // wins over MCP_SERVER_DESCRIPTION
-  icons: [{ src: 'https://example.com/icon.png', sizes: ['48x48'], mimeType: 'image/png' }],
-  instructions: 'Use shortcut alpha for the most common case.', // session-level context
+  name: 'chembl-mcp-server',
+  title: 'chembl-mcp-server',                              // display identity = repo name
+  websiteUrl: 'https://github.com/cyanheads/chembl-mcp-server',
+  instructions: '…canonical cross-server chains + the pchembl_value-by-standard_type ranking trap + CC BY-SA attribution…',
+  tools,
+  resources: [chemblMoleculeResource, chemblTargetResource],
+  setup(core) {
+    initChemblService(config);
+    setCanvas(core.canvas);
+  },
 });
 ```
 
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Use it for deployment guidance (connection aliases, regional notes, scope hints) instead of repeating the same context across tool descriptions. Client adoption is uneven, but there's no downside when set.
+`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Here it carries the canonical cross-server chains (UniProt → `chembl_search_targets` → `chembl_get_bioactivities`), the ranking trap (`pchembl_value` is comparable only within one `standard_type`), and the ChEMBL CC BY-SA attribution — instead of repeating that context across tool descriptions.
 
 ---
 
@@ -239,21 +234,25 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 
 ```text
 src/
-  index.ts                              # createApp() entry point
+  index.ts                              # createApp() entry point — registers tools + resources, wires service + canvas
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # ChEMBL env vars (Zod schema, keyless)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    canvas-accessor.ts                  # Module holder for the optional DataCanvas
+    chembl/
+      chembl-service.ts                 # Single upstream client + sanitizeUpstreamError (the leak chokepoint)
+      types.ts                          # Flat domain types (Molecule, Activity, Target, DrugInfo, Assay, …)
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+      chembl-search-molecules.tool.ts   # …and 7 more (search-targets, get-bioactivities, get-drug-info,
+      …                                 #   get-assay, dataframe-query, dataframe-describe, dataframe-drop)
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      chembl-molecule.resource.ts       # chembl://molecule/{chemblId}
+      chembl-target.resource.ts         # chembl://target/{chemblId}
+tests/                                  # Vitest — services/, tools/, resources/ (no prompts)
 ```
+
+No `prompts/` directory — this server defines no prompts.
 
 ---
 
