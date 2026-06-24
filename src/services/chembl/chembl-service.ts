@@ -9,6 +9,15 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  rateLimited,
+  serviceUnavailable,
+  timeout,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
 import type {
@@ -50,6 +59,94 @@ function toStringOrNull(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   return trimmed === '' ? null : trimmed;
+}
+
+/**
+ * Re-throw an upstream fetch failure as a clean, leak-free domain error.
+ *
+ * The framework's `fetchWithTimeout` throws a status-mapped {@link McpError} on
+ * any non-2xx / timeout / network failure, and its `data` carries raw upstream
+ * internals — `statusCode`, `statusText`, `responseBody` (up to 500 bytes of the
+ * upstream's error page), the internal `requestId`, the `operation`, and
+ * `errorSource`. The framework ships `McpError.data` verbatim to the client in
+ * `structuredContent.error.data`, so letting that raw error escape leaks those
+ * internals on a public server.
+ *
+ * This maps the framework error to a clean domain error by its `code`
+ * (detected STRUCTURALLY via `err.code`, never by string-matching the drift-prone
+ * message), with `data` reduced to a `reason` + recovery `hint` only. The raw
+ * error rides as `cause` for server-side logs — `cause` is never serialized to
+ * the client.
+ *
+ * Always returns an `McpError` to throw; the caller does `throw sanitize(...)`.
+ */
+export function sanitizeUpstreamError(err: unknown, operation: string): McpError {
+  // Non-McpError shouldn't occur (the framework wraps everything fetch throws),
+  // but this is a trust boundary: never let an unknown error's fields reach the
+  // client. Collapse anything unexpected into a clean ServiceUnavailable.
+  if (!(err instanceof McpError)) {
+    return serviceUnavailable('ChEMBL request failed.', {
+      reason: 'upstream_unavailable',
+      recovery: { hint: 'The ChEMBL API is unreachable. Retry shortly.' },
+    });
+  }
+
+  // `cause: err` is the THIRD factory arg (options), NOT part of `data` — it
+  // lands on native `Error.cause` for server logs and is never serialized to the
+  // client. Putting the raw error in `data` would re-introduce the very leak.
+  switch (err.code) {
+    case JsonRpcErrorCode.NotFound:
+      return notFound(
+        'ChEMBL has no record for that identifier.',
+        {
+          reason: 'not_found',
+          recovery: {
+            hint: 'Verify the ChEMBL ID / SMILES, or discover it via chembl_search_molecules or chembl_search_targets.',
+          },
+        },
+        { cause: err },
+      );
+    case JsonRpcErrorCode.InvalidParams:
+    case JsonRpcErrorCode.ValidationError:
+    case JsonRpcErrorCode.InvalidRequest:
+      return validationError(
+        'ChEMBL rejected the request parameters.',
+        {
+          reason: 'invalid_query',
+          recovery: { hint: 'Check the identifier format and filter values, then retry.' },
+        },
+        { cause: err },
+      );
+    case JsonRpcErrorCode.Timeout:
+      return timeout(
+        'The ChEMBL request timed out.',
+        {
+          reason: 'upstream_timeout',
+          recovery: { hint: 'Retry, or narrow the query with more filters / a lower limit.' },
+        },
+        { cause: err },
+      );
+    case JsonRpcErrorCode.RateLimited:
+      return rateLimited(
+        'ChEMBL rate-limited the request.',
+        {
+          reason: 'rate_limited',
+          recovery: { hint: 'Wait a few seconds and retry.' },
+        },
+        { cause: err },
+      );
+    default:
+      // 5xx, auth (unexpected on a keyless API), network errors — all "the
+      // upstream/connection failed; retry later" from the client's view.
+      return serviceUnavailable(
+        'The ChEMBL API is currently unavailable.',
+        {
+          reason: 'upstream_unavailable',
+          recovery: { hint: `Retry shortly. If it persists, ChEMBL may be down (${operation}).` },
+        },
+        { cause: err },
+      );
+  }
 }
 
 /** Raw upstream molecule record (sparse — every field may be absent). */
@@ -144,7 +241,15 @@ export class ChemblService {
     return url.toString();
   }
 
-  /** Fetch a single JSON resource through the full retry+parse pipeline. */
+  /**
+   * Fetch a single JSON resource through the full retry+parse pipeline.
+   *
+   * Wraps the fetch so any upstream failure is re-thrown as a clean, leak-free
+   * domain error ({@link sanitizeUpstreamError}). Without this catch the raw
+   * framework `McpError` — carrying `statusCode`, `responseBody`, `requestId`,
+   * and the internal URL in its `data` — would propagate to the client on a
+   * public server. This is the single chokepoint for every ChEMBL call.
+   */
   private async fetchJson<T>(url: string, operation: string, ctx: Context): Promise<T> {
     // The framework's network utils take a RequestContext (an open context bag);
     // build one from the handler Context so logs stay correlated to the request.
@@ -152,22 +257,26 @@ export class ChemblService {
       operation,
       parentContext: { requestId: ctx.requestId, traceId: ctx.traceId, tenantId: ctx.tenantId },
     });
-    return await withRetry(
-      async () => {
-        const response = await fetchWithTimeout(url, this.timeoutMs, reqCtx, {
+    try {
+      return await withRetry(
+        async () => {
+          const response = await fetchWithTimeout(url, this.timeoutMs, reqCtx, {
+            signal: ctx.signal,
+            headers: { Accept: 'application/json', 'User-Agent': 'chembl-mcp-server' },
+          });
+          return (await response.json()) as T;
+        },
+        {
+          operation,
+          context: reqCtx,
+          // ChEMBL is generous but unspecified — be a good citizen on 429/5xx.
+          baseDelayMs: 1500,
           signal: ctx.signal,
-          headers: { Accept: 'application/json', 'User-Agent': 'chembl-mcp-server' },
-        });
-        return (await response.json()) as T;
-      },
-      {
-        operation,
-        context: reqCtx,
-        // ChEMBL is generous but unspecified — be a good citizen on 429/5xx.
-        baseDelayMs: 1500,
-        signal: ctx.signal,
-      },
-    );
+        },
+      );
+    } catch (err) {
+      throw sanitizeUpstreamError(err, operation);
+    }
   }
 
   // --- Molecules ---------------------------------------------------------
