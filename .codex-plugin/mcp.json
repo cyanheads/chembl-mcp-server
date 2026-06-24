@@ -1,0 +1,9 @@
+{
+  "chembl-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "chembl-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
