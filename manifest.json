@@ -1,9 +1,15 @@
 {
   "manifest_version": "0.3",
   "name": "chembl-mcp-server",
-  "version": "0.1.0",
-  "description": "Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications.",
+  "version": "0.1.1",
+  "description": "Link compounds to protein targets, rank bioactivity, and look up drug mechanisms and indications.",
   "author": { "name": "cyanheads" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyanheads/chembl-mcp-server"
+  },
+  "homepage": "https://github.com/cyanheads/chembl-mcp-server#readme",
+  "license": "Apache-2.0",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",

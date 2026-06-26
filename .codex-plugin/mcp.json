@@ -1,7 +1,7 @@
 {
   "chembl-mcp-server": {
     "command": "npx",
-    "args": ["-y", "chembl-mcp-server"],
+    "args": ["-y", "@cyanheads/chembl-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
     }

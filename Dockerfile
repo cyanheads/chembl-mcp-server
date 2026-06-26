@@ -39,7 +39,7 @@ ENV NODE_ENV=production
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 ARG APP_VERSION
 LABEL org.opencontainers.image.title="chembl-mcp-server"
-LABEL org.opencontainers.image.description="Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications."
+LABEL org.opencontainers.image.description="Link compounds to protein targets, rank bioactivity (IC50/Ki/EC50), and look up drug mechanisms and indications over ChEMBL via MCP. STDIO or Streamable HTTP."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/chembl-mcp-server"

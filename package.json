@@ -1,7 +1,8 @@
 {
-  "name": "chembl-mcp-server",
-  "version": "0.1.0",
-  "description": "Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications.",
+  "name": "@cyanheads/chembl-mcp-server",
+  "version": "0.1.1",
+  "mcpName": "io.github.cyanheads/chembl-mcp-server",
+  "description": "Link compounds to protein targets, rank bioactivity (IC50/Ki/EC50), and look up drug mechanisms and indications over ChEMBL via MCP. STDIO or Streamable HTTP.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -43,16 +44,40 @@
     "mcp",
     "mcp-server",
     "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
     "chembl",
     "drug-discovery",
     "bioactivity",
-    "cheminformatics"
+    "cheminformatics",
+    "compounds",
+    "protein-targets",
+    "medicinal-chemistry",
+    "ai-agent"
   ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cyanheads/chembl-mcp-server.git"
   },
+  "bugs": {
+    "url": "https://github.com/cyanheads/chembl-mcp-server/issues"
+  },
+  "homepage": "https://github.com/cyanheads/chembl-mcp-server#readme",
+  "author": "cyanheads <casey@caseyjhand.com> (https://github.com/cyanheads/chembl-mcp-server#readme)",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/cyanheads"
+    },
+    {
+      "type": "buy_me_a_coffee",
+      "url": "https://www.buymeacoffee.com/cyanheads"
+    }
+  ],
   "license": "Apache-2.0",
+  "packageManager": "bun@1.3.11",
   "engines": {
     "bun": ">=1.3.0",
     "node": ">=24.0.0"
@@ -68,7 +93,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.0.1",
     "depcheck": "^1.4.7",
     "ignore": "^7.0.5",
     "tsc-alias": "^1.8.17",

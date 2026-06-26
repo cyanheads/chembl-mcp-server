@@ -1,19 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/chembl-mcp-server",
-  "description": "Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications.",
+  "description": "Link compounds to protein targets, rank bioactivity, and look up drug mechanisms and indications.",
   "repository": {
     "url": "https://github.com/cyanheads/chembl-mcp-server",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "chembl-mcp-server",
-      "runtimeHint": "node",
-      "version": "0.1.0",
+      "identifier": "@cyanheads/chembl-mcp-server",
+      "runtimeHint": "bun",
+      "version": "0.1.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -82,9 +82,9 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "chembl-mcp-server",
-      "runtimeHint": "node",
-      "version": "0.1.0",
+      "identifier": "@cyanheads/chembl-mcp-server",
+      "runtimeHint": "bun",
+      "version": "0.1.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -130,6 +130,48 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "CANVAS_PROVIDER_TYPE",
+          "description": "Set to 'duckdb' to enable the bioactivity DataCanvas spill and the chembl_dataframe_* SQL tools. When 'none', large bioactivity sets inline a preview but never spill.",
+          "format": "string",
+          "isRequired": false,
+          "default": "none"
+        },
+        {
+          "name": "CHEMBL_API_BASE_URL",
+          "description": "Base URL for the ChEMBL REST data API. Override for a private mirror or pinned host.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://www.ebi.ac.uk/chembl/api/data"
+        },
+        {
+          "name": "CHEMBL_REQUEST_TIMEOUT_MS",
+          "description": "Per-request timeout in milliseconds for upstream ChEMBL fetches.",
+          "format": "string",
+          "isRequired": false,
+          "default": "30000"
+        },
+        {
+          "name": "CHEMBL_MAX_PAGE_SIZE",
+          "description": "ChEMBL per-page cap when streaming activity pages for the bioactivity spill (max 1000).",
+          "format": "string",
+          "isRequired": false,
+          "default": "1000"
+        },
+        {
+          "name": "CHEMBL_DEFAULT_LIMIT",
+          "description": "Default result limit applied when callers omit it.",
+          "format": "string",
+          "isRequired": false,
+          "default": "25"
+        },
+        {
+          "name": "CHEMBL_DATAFRAME_DROP_ENABLED",
+          "description": "Set to 'true' to register the opt-in chembl_dataframe_drop tool (absent from tools/list when off).",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {

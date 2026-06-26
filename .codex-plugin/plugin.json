@@ -1,7 +1,7 @@
 {
   "name": "chembl-mcp-server",
-  "version": "0.1.0",
-  "description": "Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications.",
+  "version": "0.1.1",
+  "description": "Link compounds to protein targets, rank bioactivity, and look up drug mechanisms and indications.",
   "author": {
     "name": "cyanheads",
     "email": "casey@caseyjhand.com",
@@ -14,10 +14,10 @@
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "chembl-mcp-server",
-    "shortDescription": "Drug-discovery data over ChEMBL — compounds, protein targets, bioactivity, mechanisms, indications.",
+    "shortDescription": "Link compounds to protein targets, rank bioactivity, and look up drug mechanisms and indications.",
     "longDescription": "Expose ChEMBL (EBI) over MCP — the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and clinical indications. Find compounds by name or structure, resolve a UniProt accession to a ChEMBL target, pull the most potent leads against it, look up a drug's mechanism and indications, and SQL large bioactivity sets via a DataCanvas spill.",
     "developerName": "cyanheads",
-    "category": "data",
+    "category": "research",
     "capabilities": ["Read"],
     "websiteURL": "https://github.com/cyanheads/chembl-mcp-server",
     "defaultPrompt": []
