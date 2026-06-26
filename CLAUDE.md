@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** chembl-mcp-server
-**Version:** 0.1.0
+**Version:** 0.1.1
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.9`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -149,13 +149,12 @@ For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("
 
 `createApp()` accepts optional identity fields forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`):
 
-Real shape — `src/index.ts`. **`title` is the hyphenated repo name** (`chembl-mcp-server`), never a Title-Case display name — humans and agents both see the machine identity. Don't duplicate `description`/`websiteUrl` beyond what's canonical (`description` derives from `package.json`):
+Real shape — `src/index.ts`. **`title` is the hyphenated repo name** (`chembl-mcp-server`), never a Title-Case display name — humans and agents both see the machine identity. The identity block is `name` + `title` only — don't add `description` or `websiteUrl` (`description` derives from `package.json`, the canonical source):
 
 ```ts
 await createApp({
   name: 'chembl-mcp-server',
   title: 'chembl-mcp-server',                              // display identity = repo name
-  websiteUrl: 'https://github.com/cyanheads/chembl-mcp-server',
   instructions: '…canonical cross-server chains + the pchembl_value-by-standard_type ranking trap + CC BY-SA attribution…',
   tools,
   resources: [chemblMoleculeResource, chemblTargetResource],

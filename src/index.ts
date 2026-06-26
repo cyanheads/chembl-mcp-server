@@ -41,7 +41,6 @@ const tools = [
 await createApp({
   name: 'chembl-mcp-server',
   title: 'chembl-mcp-server',
-  websiteUrl: 'https://github.com/cyanheads/chembl-mcp-server',
   instructions:
     "Drug-discovery data over ChEMBL (EBI) — the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and indications. Canonical chains: (1) a UniProt accession from the uniprot/protein server → chembl_search_targets → chembl_get_bioactivities for the most potent leads on a target; (2) chembl_search_molecules → chembl_get_drug_info for a drug's mechanism and indications; (3) a molecule's standard_inchi_key → the pubchem server for richer chemistry, an approved drug (max_phase 4) → the openfda server for the FDA label and adverse events. Ranking trap: pchembl_value is comparable only within one standard_type — set the standard_type filter (mixing IC50 and Ki is a scientific error). A popular target carries tens of thousands of measurements; chembl_get_bioactivities spills the full set to a DataCanvas table you SQL with chembl_dataframe_query (requires CANVAS_PROVIDER_TYPE=duckdb). Data from ChEMBL, licensed CC BY-SA 3.0 — attribute ChEMBL (https://www.ebi.ac.uk/chembl/) in downstream use.",
   tools,
