@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-06-24 08:19:42
+Generated on: 2026-06-28 04:37:17
 
 ```text
 chembl-mcp-server/
@@ -19,6 +19,7 @@ chembl-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

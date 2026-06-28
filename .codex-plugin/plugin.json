@@ -1,6 +1,6 @@
 {
   "name": "chembl-mcp-server",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Link compounds to protein targets, rank bioactivity, and look up drug mechanisms and indications.",
   "author": {
     "name": "cyanheads",
