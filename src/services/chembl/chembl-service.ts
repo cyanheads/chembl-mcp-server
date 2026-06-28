@@ -456,12 +456,54 @@ export class ChemblService {
   // --- Activities (bioactivity, the flagship) ---------------------------
 
   /**
+   * Build the shared Django-style filter params for an activity query from the
+   * caller's options. Both {@link streamActivities} (preview/spill) and
+   * {@link countActivities} (honest total) start here; the stream layers on the
+   * ordering + pchembl_value presence filter, the count layers on `limit: 1`.
+   */
+  private activityFilterParams(
+    opts: GetActivitiesOptions,
+  ): Record<string, string | number | undefined> {
+    const params: Record<string, string | number | undefined> = {};
+    if (opts.moleculeChemblId) params.molecule_chembl_id = opts.moleculeChemblId;
+    if (opts.targetChemblId) params.target_chembl_id = opts.targetChemblId;
+    if (opts.standardType) params.standard_type = opts.standardType;
+    if (opts.pchemblValueMin !== undefined) params.pchembl_value__gte = opts.pchemblValueMin;
+    if (opts.assayType) params.assay_type = opts.assayType;
+    if (opts.organism) params.target_organism__iexact = opts.organism;
+    return params;
+  }
+
+  /**
+   * Count measurements matching the caller's filters via `page_meta.total_count`,
+   * WITHOUT the pchembl_value presence filter {@link streamActivities} applies — so
+   * the result is the honest full total (measurements with AND without a derivable
+   * pchembl_value). One `limit: 1` request; only `page_meta` is read. The handler
+   * reports this as `totalCount`, so the preview's potency filter never silently
+   * redefines what the total represents.
+   */
+  async countActivities(opts: GetActivitiesOptions, ctx: Context): Promise<number> {
+    const url = this.buildUrl('activity', {
+      ...this.activityFilterParams(opts),
+      limit: 1,
+      offset: 0,
+    });
+    const raw = await this.fetchJson<{ page_meta?: RawPageMeta }>(
+      url,
+      'ChemblService.countActivities',
+      ctx,
+    );
+    return raw.page_meta?.total_count ?? 0;
+  }
+
+  /**
    * Stream bioactivity rows as an async iterable, paginating `page_meta.next`
    * until exhausted (or the source is cancelled). Designed to feed `spillover()`:
    * the preview drain pulls only what fits the budget, and the spill drain
    * registers the full set. The first page's `page_meta.total_count` is reported
-   * via the `onTotal` callback so the handler can surface the true total without
-   * a separate count request.
+   * via the `onTotal` callback — this is the count of the *potency-filtered* set
+   * (rows with a derivable pchembl_value), not the full match count; the handler
+   * sources the honest total from {@link countActivities}.
    */
   async *streamActivities(
     opts: GetActivitiesOptions,
@@ -469,17 +511,18 @@ export class ChemblService {
     onTotal?: (total: number) => void,
   ): AsyncGenerator<Activity> {
     const params: Record<string, string | number | undefined> = {
+      ...this.activityFilterParams(opts),
       limit: Math.min(this.maxPageSize, 1000),
       offset: 0,
-      // Rank field — order by pchembl_value descending so the inline preview is the most potent.
+      // Rank field — order by pchembl_value descending so the inline preview leads
+      // with the most potent measurements.
       order_by: '-pchembl_value',
+      // ChEMBL sorts NULLs first for a descending sort, so an unfiltered preview is
+      // dominated by measurements with no derivable pchembl_value. Exclude them so the
+      // potency-ranked preview is meaningful; the honest full count (which includes
+      // them) is recovered separately by countActivities, leaving totalCount intact.
+      pchembl_value__isnull: 'false',
     };
-    if (opts.moleculeChemblId) params.molecule_chembl_id = opts.moleculeChemblId;
-    if (opts.targetChemblId) params.target_chembl_id = opts.targetChemblId;
-    if (opts.standardType) params.standard_type = opts.standardType;
-    if (opts.pchemblValueMin !== undefined) params.pchembl_value__gte = opts.pchemblValueMin;
-    if (opts.assayType) params.assay_type = opts.assayType;
-    if (opts.organism) params.target_organism__iexact = opts.organism;
 
     let nextUrl: string | null = this.buildUrl('activity', params);
     let reportedTotal = false;

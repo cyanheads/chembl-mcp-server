@@ -13,7 +13,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas-accessor.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
-import type { Activity } from '@/services/chembl/types.js';
+import type { Activity, GetActivitiesOptions } from '@/services/chembl/types.js';
 
 const ActivitySchema = z
   .object({
@@ -75,10 +75,54 @@ const ActivitySchema = z
   })
   .describe('One bioactivity measurement linking a compound, target, and assay.');
 
+/**
+ * Compose the agent-facing notice for a bioactivities result. Discloses the
+ * potency-ranked preview when measurements without a pchembl_value were excluded
+ * (so the honest totalCount and the ranked view do not appear to contradict each
+ * other), plus the spill / canvas-disabled / empty-result context. Returns
+ * undefined when there is nothing worth saying (canvas enabled, fit inline,
+ * nothing filtered out).
+ */
+function buildNotice(args: {
+  previewCount: number;
+  totalCount: number;
+  potentTotal: number;
+  limit: number;
+  spilled: boolean;
+  canvasDisabled: boolean;
+  canvasId?: string;
+}): string | undefined {
+  const { previewCount, totalCount, potentTotal, limit, spilled, canvasDisabled, canvasId } = args;
+
+  if (previewCount === 0) {
+    return totalCount === 0
+      ? 'No measurements matched. Broaden the filters (drop standard_type or lower pchembl_value_min), or check the ID.'
+      : `All ${totalCount} matching measurements lack a derivable pchembl_value, so none appear in this potency-ranked view — the measurements exist but report no comparable potency. Inspect the raw value/type fields, or drop the potency expectation.`;
+  }
+
+  // Disclose the potency filter only when it actually narrowed the set — null-potency
+  // rows were present and not already excluded by a pchembl_value_min floor.
+  const potency =
+    potentTotal < totalCount
+      ? ` Ranked by potency: this view holds the ${potentTotal} measurements with a pchembl_value; ${totalCount} match in total (the rest report none).`
+      : '';
+
+  if (spilled) {
+    return `${potentTotal} measurements staged as table "bioactivities" on canvas ${canvasId}. SQL the staged set with chembl_dataframe_query — e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities GROUP BY 1 ORDER BY 2 DESC.${potency}`;
+  }
+
+  if (canvasDisabled) {
+    return `Canvas disabled (CANVAS_PROVIDER_TYPE != duckdb): showing up to ${limit} of ${potentTotal} rows with no spill. Set CANVAS_PROVIDER_TYPE=duckdb to SQL the staged set.${potency}`;
+  }
+
+  // Canvas enabled, everything fit inline — only worth a note if potency narrowed.
+  return potency ? potency.trimStart() : undefined;
+}
+
 export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
   title: 'chembl-get-bioactivities',
   description:
-    'The flagship compound↔target bioactivity bridge: measurements for a molecule (target deconvolution / selectivity) OR a target (lead finding). Supply exactly one of molecule_chembl_id (from chembl_search_molecules) or target_chembl_id (from chembl_search_targets) — both or neither is an error. Filter by standard_type (IC50/Ki/EC50/…), minimum potency pchembl_value_min, assay_type, and organism; rows are ranked on pchembl_value. Mixing measurement types (IC50 vs Ki) is a scientific error — set standard_type to compare like with like. A popular target carries tens of thousands of rows: results spill to a DataCanvas table (bioactivities) you SQL with chembl_dataframe_query for honest aggregates across the full set, while an inline preview answers the immediate question. Spilling requires CANVAS_PROVIDER_TYPE=duckdb; otherwise the preview is the full inlined set.',
+    'The flagship compound↔target bioactivity bridge: measurements for a molecule (target deconvolution / selectivity) OR a target (lead finding). Supply exactly one of molecule_chembl_id (from chembl_search_molecules) or target_chembl_id (from chembl_search_targets) — both or neither is an error. Filter by standard_type (IC50/Ki/EC50/…), minimum potency pchembl_value_min, assay_type, and organism. Rows are ranked by potency: the preview surfaces measurements with a derivable pchembl_value (ChEMBL sorts the null-potency rows first otherwise), while totalCount stays the honest full match count including measurements without one. Mixing measurement types (IC50 vs Ki) is a scientific error — set standard_type to compare like with like. A popular target carries tens of thousands of rows: results spill to a DataCanvas table (bioactivities) you SQL with chembl_dataframe_query for honest aggregates across the staged set, while an inline preview answers the immediate question. Spilling requires CANVAS_PROVIDER_TYPE=duckdb; otherwise the inline rows are capped at limit (a preview, not the full set).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     molecule_chembl_id: z
@@ -137,9 +181,13 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
     activities: z
       .array(ActivitySchema)
       .describe(
-        'Bioactivity rows — the inline preview, or the full set when it fit without spilling.',
+        'Bioactivity rows — the potency-ranked inline preview, or the full ranked set when it fit without spilling.',
       ),
-    totalFound: z.number().describe('Total matching measurements upstream before any preview cap.'),
+    totalCount: z
+      .number()
+      .describe(
+        'Total matching measurements upstream — the honest full count including measurements without a derivable pchembl_value, before any preview cap. The staged/preview rows are the potency-ranked subset of this.',
+      ),
     spilled: z
       .boolean()
       .describe('True when the full set exceeded the preview and was staged on the canvas.'),
@@ -153,21 +201,15 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       .string()
       .nullable()
       .describe(
-        'Canvas table name holding the full rowset (always "bioactivities" when spilled). Null when not spilled.',
-      ),
-  }),
-  enrichment: {
-    totalCount: z
-      .number()
-      .describe(
-        'Total matching measurements upstream — the full set when spilled, vs the capped inline preview.',
+        'Canvas table name holding the staged rowset (always "bioactivities" when spilled). Null when not spilled.',
       ),
     canvasDisabled: z
       .boolean()
-      .optional()
       .describe(
-        'True when CANVAS_PROVIDER_TYPE is not duckdb, so large sets could not spill — the preview is all that is reachable.',
+        'True when CANVAS_PROVIDER_TYPE is not duckdb, so large sets could not spill — the inline rows are a capped preview, not the full set.',
       ),
+  }),
+  enrichment: {
     appliedFilters: z
       .object({
         scope: z.string().describe('Whether the query was by molecule or target, with the ID.'),
@@ -226,22 +268,26 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       },
     });
 
-    let totalFound = 0;
-    const activityStream = service.streamActivities(
-      {
-        moleculeChemblId: moleculeId,
-        targetChemblId: targetId,
-        standardType,
-        pchemblValueMin: input.pchembl_value_min,
-        assayType,
-        organism,
-        limit,
-      },
-      ctx,
-      (total) => {
-        totalFound = total;
-      },
-    );
+    const filters: GetActivitiesOptions = {
+      moleculeChemblId: moleculeId,
+      targetChemblId: targetId,
+      standardType,
+      pchemblValueMin: input.pchembl_value_min,
+      assayType,
+      organism,
+      limit,
+    };
+
+    // Two-phase (#3): totalCount is the honest full match count from a separate
+    // count call (no pchembl_value presence filter); the preview/spill stream
+    // excludes null-pchembl rows so the potency-ranked preview leads with potent
+    // measurements. potentTotal is the count of that filtered subset — equal to
+    // totalCount when nothing was excluded (e.g. a pchembl_value_min floor was set).
+    const totalCount = await service.countActivities(filters, ctx);
+    let potentTotal = 0;
+    const activityStream = service.streamActivities(filters, ctx, (total) => {
+      potentTotal = total;
+    });
 
     const canvas = getCanvas();
 
@@ -257,18 +303,23 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
         preview.push(row);
         if (preview.length >= limit) break;
       }
-      ctx.enrich({ canvasDisabled: true });
-      ctx.enrich.total(totalFound);
-      if (preview.length === 0) {
-        ctx.enrich.notice(
-          'No measurements matched. Broaden the filters (drop standard_type or lower pchembl_value_min), or check the ID.',
-        );
-      } else {
-        ctx.enrich.notice(
-          `Canvas disabled (CANVAS_PROVIDER_TYPE != duckdb): showing up to ${limit} of ${totalFound} rows with no spill. Set CANVAS_PROVIDER_TYPE=duckdb to SQL the full set.`,
-        );
-      }
-      return { activities: preview, totalFound, spilled: false, canvas_id: null, table_name: null };
+      const notice = buildNotice({
+        previewCount: preview.length,
+        totalCount,
+        potentTotal,
+        limit,
+        spilled: false,
+        canvasDisabled: true,
+      });
+      if (notice) ctx.enrich.notice(notice);
+      return {
+        activities: preview,
+        totalCount,
+        spilled: false,
+        canvas_id: null,
+        table_name: null,
+        canvasDisabled: true,
+      };
     }
 
     const instance = await canvas.acquire(input.canvas_id, ctx);
@@ -282,41 +333,57 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       signal: ctx.signal,
     });
 
-    ctx.enrich.total(totalFound);
     if (result.spilled) {
-      ctx.enrich.notice(
-        `${totalFound} measurements; the full set is staged as table "bioactivities" on canvas ${instance.canvasId}. SQL it with chembl_dataframe_query — e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities GROUP BY 1 ORDER BY 2 DESC.`,
-      );
+      const notice = buildNotice({
+        previewCount: result.previewRows.length,
+        totalCount,
+        potentTotal,
+        limit,
+        spilled: true,
+        canvasDisabled: false,
+        canvasId: instance.canvasId,
+      });
+      if (notice) ctx.enrich.notice(notice);
       return {
-        // The full set is on the canvas; cap the inline preview to the requested
+        // The staged set is on the canvas; cap the inline preview to the requested
         // limit (spillover sizes the preview by character budget, not row count).
         activities: result.previewRows.slice(0, limit),
-        totalFound,
+        totalCount,
         spilled: true,
         canvas_id: instance.canvasId,
         table_name: result.handle.tableName,
+        canvasDisabled: false,
       };
     }
 
-    if (result.previewRows.length === 0) {
-      ctx.enrich.notice(
-        'No measurements matched. Broaden the filters (drop standard_type or lower pchembl_value_min), or check the ID.',
-      );
-    }
+    const notice = buildNotice({
+      previewCount: result.previewRows.length,
+      totalCount,
+      potentTotal,
+      limit,
+      spilled: false,
+      canvasDisabled: false,
+    });
+    if (notice) ctx.enrich.notice(notice);
     return {
       activities: result.previewRows,
-      totalFound,
+      totalCount,
       spilled: false,
       canvas_id: null,
       table_name: null,
+      canvasDisabled: false,
     };
   },
 
   format: (result) => {
     const spillNote = result.spilled
-      ? `spilled: yes — full set staged on canvas \`${result.canvas_id}\` as table \`${result.table_name}\` (query with chembl_dataframe_query)`
-      : 'spilled: no (preview is the full set)';
-    const header = `**${result.totalFound}** measurements total — ${spillNote}.`;
+      ? `spilled: yes — staged on canvas \`${result.canvas_id}\` as table \`${result.table_name}\` (query with chembl_dataframe_query)`
+      : result.canvasDisabled
+        ? 'spilled: no — canvas disabled; these rows are a capped preview, not the complete set'
+        : result.activities.length === result.totalCount
+          ? 'spilled: no (preview is the full set)'
+          : `spilled: no — showing ${result.activities.length} of ${result.totalCount} matching measurements (potency-ranked preview)`;
+    const header = `**${result.totalCount}** measurements total — ${spillNote}.`;
     if (result.activities.length === 0) {
       return [{ type: 'text', text: `${header}\n\nNo rows in preview.` }];
     }
