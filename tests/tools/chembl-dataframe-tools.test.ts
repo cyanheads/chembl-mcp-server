@@ -91,6 +91,65 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     expect(result.row_count).toBe(2);
   });
 
+  it('coerces BIGINT-string aggregates to numbers but preserves VARCHAR columns (#2)', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    // Seed so describe() reports column types: value is VARCHAR (raw passthrough),
+    // activity_id is BIGINT. DuckDB-Node serializes BIGINT/COUNT/SUM as JSON strings.
+    const canvasId = await seedCanvas(fake, [
+      { molecule_chembl_id: 'CHEMBL1', value: '500000', activity_id: 32770, pchembl_value: 7.4 },
+    ]);
+    fake.nextQuery = {
+      rows: [
+        {
+          molecule_chembl_id: 'CHEMBL176582',
+          n: '5',
+          total_id: '65540',
+          value: '500000',
+          avg_p: 7.4,
+        },
+      ],
+      truncated: false,
+    };
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: canvasId,
+      sql: 'SELECT molecule_chembl_id, COUNT(*) AS n, SUM(activity_id) AS total_id, value FROM bioactivities GROUP BY 1, value',
+    });
+    const result = await chemblDataframeQuery.handler(input, ctx);
+    const row = result.rows[0] as Record<string, unknown>;
+    // Aggregate projections (no base-table entry) coerce string → number.
+    expect(row.n).toBe(5);
+    expect(row.total_id).toBe(65540);
+    // DOUBLE already arrives as a number — untouched.
+    expect(row.avg_p).toBe(7.4);
+    // VARCHAR base column with an integer-looking string is preserved as a string.
+    expect(row.value).toBe('500000');
+    // A real ChEMBL ID is not an integer string — untouched.
+    expect(row.molecule_chembl_id).toBe('CHEMBL176582');
+  });
+
+  it('keeps an out-of-safe-range integer string as a string to preserve precision (#2)', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ a: 1 }]);
+    fake.nextQuery = {
+      rows: [{ big: '99999999999999999999', n: '7' }],
+      truncated: false,
+    };
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: canvasId,
+      sql: 'SELECT 99999999999999999999 AS big, 7 AS n',
+    });
+    const result = await chemblDataframeQuery.handler(input, ctx);
+    const row = result.rows[0] as Record<string, unknown>;
+    // Beyond Number.MAX_SAFE_INTEGER → preserved as a string (no silent precision loss).
+    expect(row.big).toBe('99999999999999999999');
+    // A safe integer alongside it still coerces.
+    expect(row.n).toBe(7);
+  });
+
   it('bubbles an unknown-canvas error from the canvas primitive (not re-wrapped)', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());

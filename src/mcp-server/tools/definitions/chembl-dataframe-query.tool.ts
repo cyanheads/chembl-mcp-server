@@ -11,6 +11,46 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor.js';
 
+/** A DuckDB column type tag (sniffed or explicit) is integer-family — INTEGER, BIGINT, HUGEINT, … */
+function isIntegerColumnType(type: string): boolean {
+  return type.toUpperCase().includes('INT');
+}
+
+/**
+ * Coerce integer-valued strings in DuckDB query rows back to JS numbers.
+ *
+ * DuckDB-Node serializes BIGINT/large-integer columns — COUNT(*), SUM over integer
+ * columns, the native activity_id — as JSON STRINGS to dodge JavaScript's 53-bit
+ * precision limit, so an agent sorting or comparing aggregate counts receives "1"
+ * instead of 1 (DOUBLE columns already arrive as numbers). This re-numbers them, but
+ * only where it is safe and correct:
+ *   - A value is coerced only when it is a canonical integer string (/^-?\d+$/) AND
+ *     `Number.isSafeInteger` holds — a value beyond 2^53 stays a string so precision
+ *     is never silently lost (the documented boundary).
+ *   - Genuine non-integer base columns are protected via the engine's column types
+ *     (from describe()): the raw `value` passthrough is VARCHAR and can hold
+ *     integer-looking strings, so it is left untouched. Derived/aggregate projections
+ *     (COUNT/SUM results) have no base-table entry, so the integer-string + safe test
+ *     governs them — exactly the columns the bug is about.
+ */
+function coerceIntegerStrings(
+  rows: Record<string, unknown>[],
+  protectedColumns: Set<string>,
+): Record<string, unknown>[] {
+  return rows.map((row) => {
+    let mutated: Record<string, unknown> | undefined;
+    for (const [col, val] of Object.entries(row)) {
+      if (protectedColumns.has(col)) continue; // known non-integer column (e.g. VARCHAR value)
+      if (typeof val !== 'string' || !/^-?\d+$/.test(val)) continue;
+      const num = Number(val);
+      if (!Number.isSafeInteger(num)) continue; // beyond 2^53 — keep the string, never lose precision
+      if (!mutated) mutated = { ...row };
+      mutated[col] = num;
+    }
+    return mutated ?? row;
+  });
+}
+
 export const chemblDataframeQuery = tool('chembl_dataframe_query', {
   title: 'chembl-dataframe-query',
   description:
@@ -53,10 +93,25 @@ export const chemblDataframeQuery = tool('chembl_dataframe_query', {
     // Canvas-resolution failures (unknown id, missing table, invalid SQL) are
     // thrown by the DataCanvas primitive with structured data.reason — bubble them.
     const instance = await canvas.acquire(input.canvas_id, ctx);
+
+    // Column types from the staged tables guard the integer-coercion pass below:
+    // protect genuine non-integer columns (VARCHAR — e.g. the raw `value` passthrough)
+    // so their integer-looking strings survive, while true integer columns and
+    // aggregate projections get re-numbered. describe() is a cheap in-process call
+    // against the local DuckDB instance.
+    const tables = await instance.describe();
+    const protectedColumns = new Set<string>();
+    for (const table of tables) {
+      for (const col of table.columns) {
+        if (!isIntegerColumnType(col.type)) protectedColumns.add(col.name);
+      }
+    }
+
     const result = await instance.query(input.sql, { signal: ctx.signal });
+    const rows = coerceIntegerStrings(result.rows, protectedColumns);
     return {
-      rows: result.rows,
-      row_count: result.rows.length,
+      rows,
+      row_count: rows.length,
       truncated: result.truncated ?? false,
     };
   },
