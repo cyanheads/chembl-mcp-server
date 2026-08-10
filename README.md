@@ -19,6 +19,12 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://chembl.caseyjhand.com/mcp](https://chembl.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Tools
@@ -140,6 +146,23 @@ Agent-friendly output:
 - Never fabricates — normalization and `format()` preserve `null` potency / units; a missing measurement renders as "not reported", never `0`
 
 ## Getting started
+
+### Public Hosted Instance
+
+A public instance is available at `https://chembl.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "chembl-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://chembl.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
 
 ChEMBL is keyless — no API key or account is required.
 
