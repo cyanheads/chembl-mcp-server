@@ -3,12 +3,13 @@
  * compounds by name / ChEMBL ID / InChIKey (search_type=name), or runs a
  * structure search (exact | similarity | substructure) from a SMILES. Surfaces
  * max_phase on every row as the cheap druggability signal, and the Tanimoto
- * similarity percent on structure-search results.
+ * similarity percent on search_type=similarity results.
  * @module mcp-server/tools/definitions/chembl-search-molecules
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { decodeCursor, encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 import type { Molecule, SearchType } from '@/services/chembl/types.js';
@@ -69,7 +70,7 @@ const MoleculeSchema = z
       .nullable()
       .optional()
       .describe(
-        'Tanimoto similarity percent (0–100) to the query structure. Present only on similarity/substructure search.',
+        'Tanimoto similarity percent (0–100) to the query structure. Present only on search_type=similarity results; on every other search_type the key is absent, not null.',
       ),
   })
   .describe('A compound matched by the search.');
@@ -77,7 +78,7 @@ const MoleculeSchema = z
 export const chemblSearchMolecules = tool('chembl_search_molecules', {
   title: 'chembl-search-molecules',
   description:
-    'Discovery entry point for compounds. Find by name / ChEMBL ID / InChIKey with the default search_type=name (supply query), or run a structure search with search_type exact | similarity | substructure (supply structure as a SMILES). At least one of query or structure is required, and structure is required for the three structure modes. Returns ChEMBL ID, preferred name, canonical SMILES, formula, MW, AlogP, Lipinski violations, QED, and max clinical phase on every row; structure searches also carry a Tanimoto similarity percent. Chain molecule_chembl_id into chembl_get_bioactivities or chembl_get_drug_info.',
+    'Discovery entry point for compounds. Find by name / ChEMBL ID / InChIKey with the default search_type=name (supply query), or run a structure search with search_type exact | similarity | substructure (supply structure as a SMILES). At least one of query or structure is required, and structure is required for the three structure modes. Returns ChEMBL ID, preferred name, canonical SMILES, formula, MW, AlogP, Lipinski violations, QED, and max clinical phase on every row; only search_type=similarity adds a Tanimoto similarity percent. Chain molecule_chembl_id into chembl_get_bioactivities or chembl_get_drug_info. A capped result carries nextCursor — pass it back as cursor with the same filters to read the next page.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     query: z
@@ -123,9 +124,21 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
       .max(100)
       .optional()
       .describe('Maximum molecules to return. Defaults to the server default (25) when omitted.'),
+    cursor: z
+      .string()
+      .optional()
+      .describe(
+        "Opaque continuation token from a previous call's nextCursor — resumes where that page ended. Omit for the first page. Re-send the same query/structure/filters that minted it (only limit may change; it sets this page's size); redeeming it against different filters walks a different result set.",
+      ),
   }),
   output: z.object({
     molecules: z.array(MoleculeSchema).describe('Matching compounds (up to the limit).'),
+    nextCursor: z
+      .string()
+      .optional()
+      .describe(
+        'Opaque token for the next page — pass it back as cursor with the same filters. Absent when this page is the last one.',
+      ),
   }),
   enrichment: {
     totalCount: z.number().describe('Total compounds matching before the limit was applied.'),
@@ -152,6 +165,15 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
     const structure = input.structure?.trim() || undefined;
     const searchType: SearchType = input.search_type;
     const limit = input.limit ?? getServerConfig().defaultLimit;
+    /**
+     * Decoding here is the boundary check: ChEMBL substitutes 0 for an offset it
+     * dislikes and answers 200, so a corrupted cursor forwarded unchecked would
+     * return page one dressed as a later page. `decodeCursor` throws InvalidParams
+     * (-32602) — the code the MCP pagination spec mandates — and that propagates
+     * unwrapped. Only the offset is read back: `limit` stays this call's, so a
+     * client never has to re-send the page size to keep paging.
+     */
+    const offset = input.cursor ? decodeCursor(input.cursor, ctx).offset : 0;
     const service = getChemblService();
 
     // Validate the input/mode pairing at the handler level, then fetch within the
@@ -163,7 +185,10 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
           ...ctx.recoveryFor('missing_input'),
         });
       }
-      page = await service.searchMolecules({ query, maxPhaseMin: input.max_phase_min, limit }, ctx);
+      page = await service.searchMolecules(
+        { query, maxPhaseMin: input.max_phase_min, limit, offset },
+        ctx,
+      );
     } else {
       if (!structure) {
         throw ctx.fail(
@@ -175,13 +200,21 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
         );
       }
       page = await service.structureSearch(
-        { structure, searchType, similarityThreshold: input.similarity_threshold, limit },
+        { structure, searchType, similarityThreshold: input.similarity_threshold, limit, offset },
         ctx,
       );
     }
 
+    const nextOffset = offset + page.items.length;
+    const hasMore = page.items.length > 0 && nextOffset < page.totalCount;
+
     ctx.enrich.total(page.totalCount);
-    if (page.items.length >= limit && page.totalCount > page.items.length) {
+    /**
+     * `hasMore` keeps the cap disclosure honest across a walk: at offset 0 it
+     * reduces to the pre-pagination test, and on the last page it stops claiming a
+     * cap that withholds nothing — which would contradict the absent nextCursor.
+     */
+    if (page.items.length >= limit && hasMore) {
       ctx.enrich.truncated({ shown: page.items.length, cap: limit });
     } else {
       ctx.enrich({ truncated: false, shown: page.items.length, cap: limit });
@@ -189,12 +222,26 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
     if (page.items.length === 0) {
       const what =
         searchType === 'name' ? `query "${query}"` : `${searchType} structure "${structure}"`;
+      /**
+       * A paged call that runs off the end matched fine — saying otherwise would
+       * send the caller chasing a spelling problem that isn't there.
+       */
       ctx.enrich.notice(
-        `No compound matched ${what}. Check spelling/SMILES, lower the similarity threshold, or try a broader name.`,
+        offset > 0 && page.totalCount > 0
+          ? `That cursor starts past the end of the ${page.totalCount} compounds matching ${what} — the walk is complete.`
+          : `No compound matched ${what}. Check spelling/SMILES, lower the similarity threshold, or try a broader name.`,
       );
     }
 
-    return { molecules: page.items };
+    /**
+     * Omitted — never `null` or `''` — on the last page, per the MCP pagination
+     * contract. An empty page never mints one either: a cursor at the same offset
+     * would not advance.
+     */
+    return {
+      molecules: page.items,
+      ...(hasMore && { nextCursor: encodeCursor({ offset: nextOffset, limit }) }),
+    };
   },
 
   format: (result) => {
@@ -212,6 +259,15 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
       if (m.similarity != null) parts.push(`Similarity: ${m.similarity}%`);
       return parts.join('\n');
     });
+    /**
+     * Content-only clients read this surface, not structuredContent — without the
+     * line they cannot tell a capped page from the whole result set.
+     */
+    if (result.nextCursor) {
+      lines.push(
+        `More compounds remain — re-call with cursor="${result.nextCursor}" and the same filters for the next page.`,
+      );
+    }
     return [{ type: 'text', text: lines.join('\n\n') }];
   },
 });

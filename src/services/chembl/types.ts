@@ -36,7 +36,7 @@ export interface Molecule {
   pref_name: string | null;
   /** QED weighted drug-likeness score, 0–1. */
   qed_weighted: number | null;
-  /** Tanimoto similarity percent — present only on similarity/substructure search. */
+  /** Tanimoto similarity percent — present only on `search_type=similarity` results. */
   similarity?: number | null;
   /** Standard InChIKey — chain to pubchem for richer chemistry. */
   standard_inchi_key: string | null;
@@ -196,12 +196,16 @@ export interface Page<T> {
 export interface SearchMoleculesOptions {
   limit: number;
   maxPhaseMin?: number | undefined;
+  /** Zero-based row to start the upstream window at. Defaults to 0. */
+  offset?: number | undefined;
   query: string;
 }
 
 /** Options for `structureSearch` (exact / similarity / substructure). */
 export interface StructureSearchOptions {
   limit: number;
+  /** Zero-based row to start the upstream window at. Defaults to 0. */
+  offset?: number | undefined;
   searchType: Extract<SearchType, 'exact' | 'similarity' | 'substructure'>;
   similarityThreshold: number;
   structure: string;
@@ -212,6 +216,8 @@ export interface SearchTargetsOptions {
   accession?: string | undefined;
   geneSymbol?: string | undefined;
   limit: number;
+  /** Zero-based row to start the upstream window at. Defaults to 0. */
+  offset?: number | undefined;
   organism?: string | undefined;
   query?: string | undefined;
   targetType?: string | undefined;

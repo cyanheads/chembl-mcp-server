@@ -150,7 +150,7 @@ interface Molecule {
   qed_weighted: number | null;       // 0.55  drug-likeness
   max_phase: number | null;          // 4 = marketed, 0/null = research — the cheap "druggability" signal
   molecule_type: string | null;      // "Small molecule"
-  similarity?: number | null;        // present only on similarity/substructure search (percent)
+  similarity?: number | null;        // percent — present only on search_type=similarity
 }
 
 /** One bioactivity measurement — the compound↔target↔assay link. standard_* is the normalized view; raw carried alongside. */

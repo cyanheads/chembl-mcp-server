@@ -63,6 +63,15 @@ function toStringOrNull(value: unknown): string | null {
 }
 
 /**
+ * A search query that is itself a unique identifier: a ChEMBL ID ("CHEMBL25") or
+ * a standard InChIKey ("BSYNRYMUTXBXSQ-UHFFFAOYSA-N" — uppercase 14-10-1 blocks).
+ * ChEMBL resolves both through the same by-resource lookup, so one test covers
+ * both shapes. Anything else — including a lowercase or truncated variant — is
+ * left to the fuzzy endpoint, which matches it case-insensitively.
+ */
+const EXACT_MOLECULE_IDENTIFIER = /^(?:CHEMBL\d+|[A-Z]{14}-[A-Z]{10}-[A-Z])$/;
+
+/**
  * Re-throw an upstream fetch failure as a clean, leak-free domain error.
  *
  * The framework's `fetchWithTimeout` throws a status-mapped {@link McpError} on
@@ -283,15 +292,35 @@ export class ChemblService {
   // --- Molecules ---------------------------------------------------------
 
   /**
-   * Name / ChEMBL ID / InChIKey full-text search via `/molecule/search`. The
-   * ChEMBL Elasticsearch-backed `search` endpoint matches names, synonyms, and
-   * IDs in one query. `max_phase_min` filters to drug-like compounds.
+   * Name / ChEMBL ID / InChIKey search, routed by the shape of the query.
+   *
+   * A query that IS a unique identifier ({@link EXACT_MOLECULE_IDENTIFIER}) goes
+   * to {@link lookupMoleculeByIdentifier}. Everything else goes to the ChEMBL
+   * Elasticsearch-backed `/molecule/search` endpoint, which matches names,
+   * synonyms, and IDs in one query. Routing identifiers away from it is what
+   * makes the count honest: an InChIKey there ranks its one real hit first and
+   * then pads with unrelated compounds, reporting the 10000 `max_result_window`
+   * as the total.
+   *
+   * `max_phase_min` keeps even an exact-shaped query on the fuzzy path. The
+   * filter belongs to the search endpoint; the by-resource lookup is a fetch, and
+   * routing a filtered query there would stake the filter on undocumented
+   * behavior of that route — silently returning an unfiltered record if it ever
+   * stopped applying it. Dropping a caller's filter is the failure to avoid.
+   *
+   * `opts.offset` is the caller's window into the match set — the tool derives it
+   * from a redeemed pagination cursor. Validate it before it gets here: ChEMBL
+   * answers 200 with page one for an offset it rejects rather than erroring, so a
+   * bad offset would return page one labelled as some later page.
    */
   async searchMolecules(opts: SearchMoleculesOptions, ctx: Context): Promise<Page<Molecule>> {
+    if (opts.maxPhaseMin === undefined && EXACT_MOLECULE_IDENTIFIER.test(opts.query)) {
+      return await this.lookupMoleculeByIdentifier(opts, ctx);
+    }
     const params: Record<string, string | number | undefined> = {
       q: opts.query,
       limit: opts.limit,
-      offset: 0,
+      offset: opts.offset ?? 0,
     };
     if (opts.maxPhaseMin !== undefined) {
       params.max_phase__gte = opts.maxPhaseMin;
@@ -307,9 +336,44 @@ export class ChemblService {
   }
 
   /**
+   * Resolve a query that is itself an identifier through `/molecule/{id}.json` —
+   * the by-resource lookup ChEMBL serves for a ChEMBL ID and an InChIKey alike,
+   * both answering with the same single molecule object, so {@link getMolecule}
+   * covers the fetch and the parse for either shape.
+   *
+   * A well-formed identifier ChEMBL does not hold 404s, which `fetchJson` raises
+   * as a sanitized `notFound`. A search reports "nothing matched" as an empty
+   * page rather than a failed call, so the miss is absorbed into that shape and
+   * the tool's empty-result notice fires exactly as it does for a fuzzy search
+   * with no hits. Any other failure is a real one and still propagates.
+   *
+   * The hit is the entire result set, so the caller's window is applied to a
+   * one-row list: the record at offset 0, an empty page over a total of 1 past
+   * it. That reads as an exhausted walk instead of serving the same record again
+   * under a later offset — the answer a redeemed cursor cannot be misled by.
+   */
+  private async lookupMoleculeByIdentifier(
+    opts: SearchMoleculesOptions,
+    ctx: Context,
+  ): Promise<Page<Molecule>> {
+    const offset = opts.offset ?? 0;
+    try {
+      const molecule = await this.getMolecule(opts.query, ctx);
+      return { items: [molecule].slice(offset, offset + opts.limit), totalCount: 1 };
+    } catch (err) {
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        return { items: [], totalCount: 0 };
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Structure search routed by mode to the matching ChEMBL endpoint:
    * `/molecule/{smiles}` (exact), `/similarity/{smiles}/{threshold}` (similarity),
    * `/substructure/{smiles}` (substructure). The SMILES is path-segment encoded.
+   * `opts.offset` windows the similarity/substructure list the same way it does in
+   * {@link searchMolecules}, and carries the same caller-validates constraint.
    *
    * The similarity/substructure endpoints return a `{ molecules, page_meta }`
    * list envelope. The exact endpoint (`/molecule/{smiles}`) is the by-resource
@@ -328,7 +392,7 @@ export class ChemblService {
     } else {
       resource = `substructure/${smiles}`;
     }
-    const url = this.buildUrl(resource, { limit: opts.limit, offset: 0 });
+    const url = this.buildUrl(resource, { limit: opts.limit, offset: opts.offset ?? 0 });
     const raw = await this.fetchJson<
       { molecules?: RawMolecule[]; page_meta?: RawPageMeta } & RawMolecule
     >(url, `ChemblService.structureSearch.${opts.searchType}`, ctx);
@@ -389,7 +453,8 @@ export class ChemblService {
       max_phase: toNumberOrNull(raw.max_phase),
       molecule_type: toStringOrNull(raw.molecule_type),
     };
-    // similarity is present only on similarity/substructure search results.
+    // Only the similarity endpoint supplies a Tanimoto percent; every other
+    // search mode omits the key, so absent stays absent rather than becoming null.
     if (raw.similarity != null) {
       molecule.similarity = toNumberOrNull(raw.similarity);
     }
@@ -401,12 +466,13 @@ export class ChemblService {
   /**
    * Resolve a protein/gene/UniProt accession → ChEMBL target. Accession and
    * gene-symbol filters traverse the nested `target_components`; free-text `query`
-   * matches `pref_name`.
+   * matches `pref_name`. `opts.offset` windows the match set as in
+   * {@link searchMolecules}, and carries the same caller-validates constraint.
    */
   async searchTargets(opts: SearchTargetsOptions, ctx: Context): Promise<Page<Target>> {
     const params: Record<string, string | number | undefined> = {
       limit: opts.limit,
-      offset: 0,
+      offset: opts.offset ?? 0,
     };
     if (opts.accession) params.target_components__accession = opts.accession;
     if (opts.geneSymbol) {
