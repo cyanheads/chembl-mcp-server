@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-08-13
+
+chembl_search_molecules and chembl_search_targets gain cursor pagination past the row cap; chembl_search_molecules also routes exact ChEMBL-ID/InChIKey queries to an honest single-record lookup instead of a fuzzy-search count.
+
 ## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-08-12
 
 chembl_get_drug_info now discloses truncated and failed mechanism/indication lists instead of an ambiguous empty array; chembl_dataframe_query's content output is bounded by a character budget instead of a fixed 50-row cut, and struct/list cells render as JSON.

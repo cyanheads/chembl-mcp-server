@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -47,10 +47,12 @@ Eight tools — five for the ChEMBL compound/target/bioactivity surface, plus th
 The discovery entry point for compounds.
 
 - Default `search_type=name` matches drug names, synonyms, ChEMBL IDs, and InChIKeys in one query
+- A `query` that is exactly a ChEMBL ID or an InChIKey is routed to ChEMBL's single-record lookup rather than the fuzzy text index, so it returns `totalCount: 1` instead of a full-text relevance count. Adding `max_phase_min` returns the query to the text index, since that filter belongs to the search endpoint
 - Structure search via `search_type`: `exact` (exact match), `similarity` (Tanimoto ≥ threshold), or `substructure` (contains the query structure) — supply `structure` as a SMILES
 - `similarity_threshold` is an integer 40–100 (default 70; ChEMBL rejects values below 40)
 - `max_phase_min` restricts name searches to compounds at or above a max clinical phase (e.g. `4` for marketed drugs only)
-- Every row carries `max_phase` — the cheap druggability signal (4 = marketed, 0 = research) — plus MW, AlogP, Lipinski rule-of-five violations, and QED; structure searches also return a Tanimoto similarity percent
+- Every row carries `max_phase` — the cheap druggability signal (4 = marketed, 0 = research) — plus MW, AlogP, Lipinski rule-of-five violations, and QED. Only `search_type=similarity` carries a Tanimoto `similarity` percent; `exact` and `substructure` results omit the field entirely, because ChEMBL supplies a score for similarity search alone
+- Results past `limit` are reachable: when more remain, the response carries a `nextCursor`, and passing it back as `cursor` returns the following page. It is omitted — not null — on the last page. Redeem a cursor with the same filters that minted it
 - Chain `molecule_chembl_id` into `chembl_get_bioactivities` or `chembl_get_drug_info`
 
 ---
@@ -78,6 +80,7 @@ Resolve a protein into the ChEMBL target ID downstream tools need.
 - Supply at least one of `accession` (UniProt, e.g. `P00533`), `gene_symbol` (e.g. `EGFR`), or `query` (free-text name); narrow further with `organism` and `target_type`
 - A UniProt accession is the most precise input — chain it from a `uniprot` / `protein` server
 - Each row carries the target type, organism, and component UniProt accessions + gene symbols (flattened from ChEMBL's nested component synonyms)
+- Results past `limit` are reachable the same way `chembl_search_molecules` does it — a `nextCursor` when more remain, passed back as `cursor`, omitted on the last page
 - Chain `target_chembl_id` into `chembl_get_bioactivities`
 
 ---
