@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/chembl-mcp-server",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/chembl-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -67,6 +67,13 @@
           "default": "25"
         },
         {
+          "name": "CHEMBL_MAX_SPILL_ROWS",
+          "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page drain behind it. Over the cap the response reports truncated: true.",
+          "format": "string",
+          "isRequired": false,
+          "default": "50000"
+        },
+        {
           "name": "CHEMBL_DATAFRAME_DROP_ENABLED",
           "description": "Set to 'true' to register the opt-in chembl_dataframe_drop tool (absent from tools/list when off).",
           "format": "string",
@@ -90,7 +97,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/chembl-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "packageArguments": [
         {
           "type": "positional",
@@ -171,6 +178,13 @@
           "format": "string",
           "isRequired": false,
           "default": "25"
+        },
+        {
+          "name": "CHEMBL_MAX_SPILL_ROWS",
+          "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page drain behind it. Over the cap the response reports truncated: true.",
+          "format": "string",
+          "isRequired": false,
+          "default": "50000"
         },
         {
           "name": "CHEMBL_DATAFRAME_DROP_ENABLED",

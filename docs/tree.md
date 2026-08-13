@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-06-28 04:37:17
+Generated on: 2026-08-13 04:38:33
 
 ```text
 chembl-mcp-server/
@@ -10,10 +10,14 @@ chembl-mcp-server/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -160,6 +164,8 @@ chembl-mcp-server/
 │   │   ├── chembl-service-fetch.test.ts
 │   │   └── chembl-service.test.ts
 │   ├── tools/
+│   │   ├── chembl-bioactivities-preview-limit.test.ts
+│   │   ├── chembl-bioactivities-spill-cap.test.ts
 │   │   ├── chembl-dataframe-tools.test.ts
 │   │   ├── chembl-get-assay.tool.test.ts
 │   │   ├── chembl-get-bioactivities.tool.test.ts
@@ -171,6 +177,7 @@ chembl-mcp-server/
 │   └── _fake-canvas.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md
@@ -178,6 +185,7 @@ chembl-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

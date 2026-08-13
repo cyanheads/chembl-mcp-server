@@ -49,7 +49,7 @@ describe('chembl://molecule/{chemblId}', () => {
         molecule_properties: { mw_freebase: '180.16' },
       }),
     );
-    const params = chemblMoleculeResource.params.parse({ chemblId: 'CHEMBL25' });
+    const params = chemblMoleculeResource.params!.parse({ chemblId: 'CHEMBL25' });
     const result = await chemblMoleculeResource.handler(params, ctx());
     expect(result).toMatchObject({
       molecule_chembl_id: 'CHEMBL25',
@@ -59,8 +59,8 @@ describe('chembl://molecule/{chemblId}', () => {
   });
 
   it('rejects a malformed ChEMBL ID at the param schema (no fetch)', () => {
-    expect(() => chemblMoleculeResource.params.parse({ chemblId: 'not-an-id' })).toThrow();
-    expect(() => chemblMoleculeResource.params.parse({ chemblId: 'CHEMBL' })).toThrow();
+    expect(() => chemblMoleculeResource.params!.parse({ chemblId: 'not-an-id' })).toThrow();
+    expect(() => chemblMoleculeResource.params!.parse({ chemblId: 'CHEMBL' })).toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
@@ -81,17 +81,20 @@ describe('chembl://target/{chemblId}', () => {
         ],
       }),
     );
-    const params = chemblTargetResource.params.parse({ chemblId: 'CHEMBL203' });
+    const params = chemblTargetResource.params!.parse({ chemblId: 'CHEMBL203' });
     const result = await chemblTargetResource.handler(
       params,
       createMockContext({ tenantId: 'default', uri: new URL('chembl://target/CHEMBL203') }),
     );
-    expect(result).toMatchObject({ target_chembl_id: 'CHEMBL203', target_type: 'SINGLE PROTEIN' });
-    expect(result.components[0]?.gene_symbols).toEqual(['EGFR']);
+    expect(result).toMatchObject({
+      target_chembl_id: 'CHEMBL203',
+      target_type: 'SINGLE PROTEIN',
+      components: [{ gene_symbols: ['EGFR'] }],
+    });
   });
 
   it('rejects a lowercase/malformed ChEMBL ID at the param schema', () => {
-    expect(() => chemblTargetResource.params.parse({ chemblId: 'chembl203' })).toThrow();
-    expect(() => chemblTargetResource.params.parse({ chemblId: 'CHEMBL203x' })).toThrow();
+    expect(() => chemblTargetResource.params!.parse({ chemblId: 'chembl203' })).toThrow();
+    expect(() => chemblTargetResource.params!.parse({ chemblId: 'CHEMBL203x' })).toThrow();
   });
 });

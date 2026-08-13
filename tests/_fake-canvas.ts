@@ -11,6 +11,8 @@
 
 import type {
   CanvasInstance,
+  ColumnSchema,
+  ColumnType,
   QueryResult,
   RegisterRows,
   RegisterTableResult,
@@ -20,7 +22,7 @@ import { notFound } from '@cyanheads/mcp-ts-core/errors';
 
 /** A staged table: the rows registered plus the column order. */
 interface FakeTable {
-  columns: { name: string; type: string }[];
+  columns: ColumnSchema[];
   rows: Record<string, unknown>[];
 }
 
@@ -173,7 +175,7 @@ async function materialize(rows: RegisterRows): Promise<Record<string, unknown>[
   return out;
 }
 
-function inferType(value: unknown): string {
+function inferType(value: unknown): ColumnType {
   if (typeof value === 'number') return Number.isInteger(value) ? 'BIGINT' : 'DOUBLE';
   return 'VARCHAR';
 }

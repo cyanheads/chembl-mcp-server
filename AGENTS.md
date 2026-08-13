@@ -1,10 +1,10 @@
 # Developer Protocol
 
 **Server:** chembl-mcp-server
-**Version:** 0.2.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.9`
+**Version:** 0.2.1
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.5`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
+**MCP SDK:** `@modelcontextprotocol/sdk` ^1.30.0
 **Zod:** ^4.4.3
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -21,12 +21,12 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 |:-----|:--------|
 | `chembl_search_molecules` | Discovery entry point — find compounds by name / ChEMBL ID / InChIKey, or structure search (exact / similarity / substructure) from a SMILES |
 | `chembl_search_targets` | Resolve a protein / gene / UniProt accession to the ChEMBL target ID `chembl_get_bioactivities` needs |
-| `chembl_get_bioactivities` | Flagship compound↔target bridge — bioactivity measurements for a molecule OR a target; large sets spill to a DataCanvas table SQL'd via `chembl_dataframe_query` |
+| `chembl_get_bioactivities` | Flagship compound↔target bridge — bioactivity measurements for a molecule, a target, or both (which narrows to that compound–target pair); `potency_view` picks the measurements with a derivable `pchembl_value` (default) or exactly those without one; large sets spill to a per-view DataCanvas table SQL'd via `chembl_dataframe_query` |
 | `chembl_get_drug_info` | Drug pharmacology — mechanism(s) of action, target(s), first-approval year, clinical indications |
 | `chembl_get_assay` | Assay provenance behind a bioactivity row — type, target, organism, 1–9 confidence score |
 | `chembl_dataframe_query` | Read-only SQL SELECT over the spilled bioactivity rows (canvas) |
 | `chembl_dataframe_describe` | List tables/columns staged on a canvas before querying |
-| `chembl_dataframe_drop` | Drop a staged table early. Opt-in behind `CHEMBL_DATAFRAME_DROP_ENABLED`; conditionally registered, so absent from `tools/list` when off |
+| `chembl_dataframe_drop` | Drop a staged table early. Opt-in behind `CHEMBL_DATAFRAME_DROP_ENABLED`; wrapped in `disabledTool()` when off, so it carries the enable hint in the manifest while staying absent from `tools/list` |
 
 **Resources** (`src/mcp-server/resources/definitions/`): `chembl://molecule/{chemblId}` and `chembl://target/{chemblId}` — injectable-context mirrors of the per-record fetch.
 
@@ -34,7 +34,7 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 
 **Security invariant — upstream errors are sanitized at `fetchJson`.** The framework's `fetchWithTimeout` throws a status-mapped `McpError` whose `data` carries raw upstream internals (`statusCode`, `responseBody`, `requestId`, the internal URL), and the framework ships `McpError.data` verbatim to the client. `fetchJson`'s catch calls `sanitizeUpstreamError`, which detects the framework error STRUCTURALLY by `err.code` (never by message string) and re-throws a clean domain error (`notFound` / `validationError` / `timeout` / `rateLimited` / `serviceUnavailable`) whose `data` is leak-free (`reason` + recovery `hint`); the raw error rides as `cause` for server-side logs only. This is the single chokepoint for all eight tools and both resources — never bypass it by calling `fetchWithTimeout` directly from a handler. Regression-tested in `tests/services/chembl-service-fetch.test.ts`.
 
-**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table (`bioactivities`) when `CANVAS_PROVIDER_TYPE=duckdb`; otherwise it inlines a preview and the `chembl_dataframe_*` tools return a `canvas_disabled` error. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`.
+**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table when `CANVAS_PROVIDER_TYPE=duckdb` — one per `potency_view` (`bioactivities` / `bioactivities_null_potency`), so both can coexist on one canvas and `UNION ALL` back into the honest full set; otherwise it inlines a preview and the `chembl_dataframe_*` tools return a `canvas_disabled` error. The spill passes `caps: { maxRows: config.maxSpillRows }`, which bounds the upstream page walk behind the lazy stream — a capped table reports `truncated: true` + `staged_row_count` on both response surfaces rather than passing itself off as complete. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`.
 
 ---
 
@@ -125,6 +125,7 @@ const ServerConfigSchema = z.object({
   requestTimeoutMs: z.coerce.number().int().positive().default(30_000),
   maxPageSize: z.coerce.number().int().positive().max(1000).default(1000),
   defaultLimit: z.coerce.number().int().positive().default(25),
+  maxSpillRows: z.coerce.number().int().positive().default(50_000),
   dataframeDropEnabled: z.stringbool().default(false),
 });
 
@@ -135,6 +136,7 @@ export function getServerConfig() {
     requestTimeoutMs: 'CHEMBL_REQUEST_TIMEOUT_MS',
     maxPageSize: 'CHEMBL_MAX_PAGE_SIZE',
     defaultLimit: 'CHEMBL_DEFAULT_LIMIT',
+    maxSpillRows: 'CHEMBL_MAX_SPILL_ROWS',
     dataframeDropEnabled: 'CHEMBL_DATAFRAME_DROP_ENABLED',
   });
   return _config;
@@ -288,7 +290,6 @@ Available skills:
 | `tool-defs-analysis` | Read-only audit of MCP definition language across the surface — voice, leaks, defaults, recovery hints, output descriptions |
 | `security-pass` | Audit server for MCP-flavored security gaps: output injection, scope blast radius, input sinks, tenant isolation |
 | `code-simplifier` | Post-session cleanup against `git diff` — modernize syntax, consolidate duplication, align with the codebase |
-| `devcheck` | Lint, format, typecheck, audit |
 | `polish-docs-meta` | Finalize docs, README, metadata, and agent protocol for shipping |
 | `git-wrapup` | Land working-tree changes as a versioned commit + annotated tag — version bump, changelog, verify, tag. Local only. |
 | `release-and-publish` | Push + npm + MCP Registry + GH Release + Docker. Picks up from `git-wrapup` |
@@ -296,12 +297,14 @@ Available skills:
 | `orchestrations` | Chain task skills into a gated multi-phase pipeline — build-out, QA-fix, update-ship — when you can spawn sub-agents |
 | `report-issue-framework` | File a bug or feature request against `@cyanheads/mcp-ts-core` via `gh` CLI |
 | `report-issue-local` | File a bug or feature request against this server's own repo via `gh` CLI |
+| `techniques` | Catalog of response/data-shaping techniques — overflow handling, payload shaping, retrieval patterns |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
 | `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper for big result sets — Tier 3 opt-in |
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, logger, state, progress |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |
 | `api-linter` | Definition linter rule catalog — invoked by `bun run lint:mcp` and `devcheck` |
+| `api-mirror` | MirrorService: persistent self-refreshing local mirror (embedded SQLite + FTS5) of a bulk upstream dataset — Tier 3 opt-in |
 | `api-services` | LLM, Speech, Graph services |
 | `api-testing` | createMockContext, test patterns |
 | `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
@@ -320,26 +323,29 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 | Command | Purpose |
 |:--------|:--------|
-| `npm run build` | Compile TypeScript |
-| `npm run rebuild` | Clean + build |
-| `npm run clean` | Remove build artifacts |
-| `npm run devcheck` | Lint + format + typecheck + security + changelog sync |
+| `bun run build` | Compile TypeScript |
+| `bun run rebuild` | Clean + build |
+| `bun run clean` | Remove build artifacts |
+| `bun run devcheck` | Lint + format + typecheck + security + changelog sync |
 | `bun run audit:refresh` | Delete `bun.lock`, reinstall, and re-run `bun audit`. Use when `devcheck` flags a transitive advisory — Bun's `update` is sticky on transitive resolutions, so the advisory may be a stale-lockfile false positive. If it survives the refresh, it's real. |
-| `npm run tree` | Generate directory structure doc |
-| `npm run format` | Auto-fix formatting (safe fixes only) |
-| `npm run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
-| `npm test` | Run tests |
-| `npm run start:stdio` | Production mode (stdio) |
-| `npm run start:http` | Production mode (HTTP) |
-| `npm run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
-| `npm run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
-| `npm run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
+| `bun run lint:mcp` | Run the MCP definition linter standalone (rule catalog: `api-linter` skill) |
+| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
+| `bun run list-skills` | Print the skill registry |
+| `bun run tree` | Generate directory structure doc |
+| `bun run format` | Auto-fix formatting (safe fixes only) |
+| `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
+| `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run start:stdio` | Production mode (stdio) |
+| `bun run start:http` | Production mode (HTTP) |
+| `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
+| `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
+| `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 
 ---
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips dependency-shipped agent docs (`node_modules/**` `skills/`, `.claude/`, `.agents/`, `SKILL.md`) that root-anchored `.mcpbignore` patterns cannot reach. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. This server uses DataCanvas, so it ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so the `chembl_dataframe_*` tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match.
 

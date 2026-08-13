@@ -13,6 +13,11 @@ auto = "fallback"
 # Set to 'true' in CI/prod to ensure exact dependency versions are installed.
 frozenLockfile = false
 
+[install.security]
+# Socket scans every package before install (malware, typosquats, CVEs).
+# Note: configuring a scanner disables Bun's auto-install.
+scanner = "@socketsecurity/bun-security-scanner"
+
 [run]
 # When true, scripts running 'node' (e.g., from a dependency) will transparently use 'bun' instead.
 # Set to false if you need to enforce a strict Node.js runtime for a specific script.

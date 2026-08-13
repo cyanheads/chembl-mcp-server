@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-08-12
+
+chembl_get_bioactivities gains a null-potency view and accepts molecule and target together; the canvas spill is now capped and discloses truncation. Framework bump to mcp-ts-core 0.11.5 plus repo hygiene additions.
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-06-27 · ⚠️ Breaking
 
 Breaking: chembl_get_bioactivities renames the totalFound output field to totalCount. Default preview is now potency-ranked (null-pchembl rows no longer lead, while totalCount stays the honest match count), the canvas-disabled preview text no longer claims capped rows are complete, and chembl_dataframe_query returns BIGINT aggregates as numbers.

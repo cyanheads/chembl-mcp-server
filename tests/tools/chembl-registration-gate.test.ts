@@ -1,15 +1,17 @@
 /**
- * @fileoverview Tests for the chembl_dataframe_drop conditional-registration gate.
- * The drop tool is opt-in behind CHEMBL_DATAFRAME_DROP_ENABLED (z.stringbool, so
- * "=false" actually disables) and conditionally registered — absent from
- * tools/list when off. Two layers are verified: the env-var → boolean parse
- * (including the stringbool semantics), and the registration predicate
- * index.ts uses (`config.dataframeDropEnabled ? [drop] : []`) — drop appears iff
- * the flag is on, while the seven always-on tools are always present.
+ * @fileoverview Tests for the chembl_dataframe_drop registration gate. The drop
+ * tool is opt-in behind CHEMBL_DATAFRAME_DROP_ENABLED (z.stringbool, so
+ * "=false" actually disables). When the flag is off it is wrapped with
+ * disabledTool(), which keeps it in the server manifest with the enable hint
+ * while the registry skips it — so it stays absent from tools/list. Two layers
+ * are verified: the env-var → boolean parse (including the stringbool
+ * semantics), and the gate index.ts applies — the raw definition when the flag
+ * is on, the wrapped one when off, with the eight-tool manifest constant either
+ * way and the seven always-on tools untouched.
  * @module tests/tools/chembl-registration-gate
  */
 
-import { z } from '@cyanheads/mcp-ts-core';
+import { disabledTool, z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chemblDataframeDescribe } from '@/mcp-server/tools/definitions/chembl-dataframe-describe.tool.js';
@@ -43,9 +45,17 @@ const ALWAYS_ON = [
   chemblDataframeDescribe,
 ];
 
-/** The conditional-registration predicate index.ts applies. */
+/** The registration gate index.ts applies. */
 function registeredTools(dataframeDropEnabled: boolean) {
-  return [...ALWAYS_ON, ...(dataframeDropEnabled ? [chemblDataframeDrop] : [])];
+  return [
+    ...ALWAYS_ON,
+    dataframeDropEnabled
+      ? chemblDataframeDrop
+      : disabledTool(chemblDataframeDrop, {
+          reason: 'Dropping staged canvas tables is turned off in this deployment.',
+          hint: 'CHEMBL_DATAFRAME_DROP_ENABLED=true',
+        }),
+  ];
 }
 
 describe('CHEMBL_DATAFRAME_DROP_ENABLED — stringbool parse', () => {
@@ -69,17 +79,28 @@ describe('CHEMBL_DATAFRAME_DROP_ENABLED — stringbool parse', () => {
   });
 });
 
-describe('chembl_dataframe_drop — conditional registration', () => {
-  it('omits the drop tool from tools/list when the flag is off', () => {
-    const names = registeredTools(false).map((t) => t.name);
-    expect(names).not.toContain('chembl_dataframe_drop');
-    expect(names).toHaveLength(7);
+describe('chembl_dataframe_drop — registration gate', () => {
+  it('hands the registry the disabledTool() wrapper when the flag is off', () => {
+    const tools = registeredTools(false);
+    const drop = tools.find((t) => t.name === 'chembl_dataframe_drop');
+    // disabledTool() returns a copy carrying the marker the registry reads to
+    // skip registration, so a wrapped tool is never the raw definition.
+    expect(drop).toBeDefined();
+    expect(drop).not.toBe(chemblDataframeDrop);
+    expect(tools).toHaveLength(8);
   });
 
-  it('includes the drop tool when the flag is on', () => {
-    const names = registeredTools(true).map((t) => t.name);
-    expect(names).toContain('chembl_dataframe_drop');
-    expect(names).toHaveLength(8);
+  it('hands the registry the raw definition when the flag is on', () => {
+    const tools = registeredTools(true);
+    expect(tools.find((t) => t.name === 'chembl_dataframe_drop')).toBe(chemblDataframeDrop);
+    expect(tools).toHaveLength(8);
+  });
+
+  it('preserves the definition through the wrapper', () => {
+    const drop = registeredTools(false).find((t) => t.name === 'chembl_dataframe_drop');
+    expect(drop?.description).toBe(chemblDataframeDrop.description);
+    expect(drop?.annotations).toEqual(chemblDataframeDrop.annotations);
+    expect(drop?.handler).toBe(chemblDataframeDrop.handler);
   });
 
   it('always registers the seven core tools regardless of the flag', () => {
