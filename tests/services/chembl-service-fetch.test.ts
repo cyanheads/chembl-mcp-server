@@ -2,10 +2,12 @@
  * @fileoverview Tests for ChemblService request building and error-path behavior
  * against a stubbed `fetch` (no live ChEMBL call): the Django-style URL each
  * method builds, leak-free upstream-error sanitization (the pre-public security
- * fix), getDrugInfo's Promise.allSettled degradation (missing mechanisms/
- * indications → empty arrays, but a failed molecule fetch tanks the call),
- * getAssay/getTarget normalization, empty-page handling, and the not-initialized
- * accessor guard.
+ * fix), getDrugInfo's Promise.allSettled composition (a rejected mechanism or
+ * indication list degrades to a per-list `failed` state with an unknown count
+ * rather than an authoritative empty array, while a failed molecule fetch still
+ * tanks the call), the mechanism/indication page envelope and its truncation
+ * signal, getAssay/getTarget normalization, empty-page handling, and the
+ * not-initialized accessor guard.
  * @module tests/services/chembl-service-fetch
  */
 
@@ -360,13 +362,14 @@ describe('ChemblService.getTarget — single fetch + flattening', () => {
 });
 
 describe('ChemblService.getDrugInfo — Promise.allSettled composition', () => {
-  it('returns empty mechanism/indication arrays when those endpoints fail', async () => {
-    // 1st fetch = molecule approval (ok); 2nd = mechanisms (500); 3rd = indications (500).
+  it('degrades both secondary lists to an explicit failed state when they fail', async () => {
+    // 1st fetch = molecule approval (ok); every later one = 500. A fresh Response per
+    // call: a shared one has its body consumed by the first read.
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ pref_name: 'GEFITINIB', max_phase: '4', first_approval: 2003 }),
       )
-      .mockResolvedValue(jsonResponse({ error_message: 'boom' }, 500));
+      .mockImplementation(() => Promise.resolve(jsonResponse({ error_message: 'boom' }, 500)));
     const info = await new ChemblService(config).getDrugInfo('CHEMBL939', ctx());
     expect(info).toMatchObject({
       molecule_chembl_id: 'CHEMBL939',
@@ -374,9 +377,14 @@ describe('ChemblService.getDrugInfo — Promise.allSettled composition', () => {
       max_phase: 4,
       first_approval: 2003,
     });
-    // A failed mechanism/indication list degrades to [] rather than tanking the call.
+    // A failed list degrades rather than tanking the call — but it is reported as
+    // failed with an unknown count, never as an authoritative empty result.
     expect(info.mechanisms).toEqual([]);
     expect(info.indications).toEqual([]);
+    expect(info.mechanisms_status).toBe('failed');
+    expect(info.indications_status).toBe('failed');
+    expect(info.mechanisms_total_count).toBeNull();
+    expect(info.indications_total_count).toBeNull();
   });
 
   it('joins mechanisms + indications when all three calls succeed', async () => {
@@ -422,6 +430,108 @@ describe('ChemblService.getDrugInfo — Promise.allSettled composition', () => {
     // handler re-throws (mechanisms/indications would have degraded to []).
     fetchMock.mockResolvedValue(jsonResponse({ error_message: 'not found' }, 404));
     await expect(new ChemblService(config).getDrugInfo('CHEMBL000', ctx())).rejects.toThrow();
+  });
+});
+
+describe('ChemblService.getMechanisms / getIndications — page envelope (#6)', () => {
+  it('requests the full page size and carries page_meta.total_count forward', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        drug_indications: Array.from({ length: 100 }, (_, i) => ({ mesh_heading: `C${i}` })),
+        page_meta: { total_count: 167 },
+      }),
+    );
+    const page = await new ChemblService(config).getIndications('CHEMBL25', ctx());
+    // The upstream row count is bounded by what `limit` asks for: at limit=100 ChEMBL
+    // returns 100 of 167 rows and a page_meta.next; at the configured page size it
+    // returns all 167 and next: null. Read the param rather than substring-matching
+    // the URL — "limit=1000" contains "limit=100".
+    expect(new URL(calledUrl()).searchParams.get('limit')).toBe(String(config.maxPageSize));
+    expect(page.items).toHaveLength(100);
+    expect(page.totalCount).toBe(167);
+  });
+
+  it('returns a mechanism page carrying the upstream total', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        mechanisms: [{ target_chembl_id: 'CHEMBL221', mechanism_of_action: 'COX inhibitor' }],
+        page_meta: { total_count: 1 },
+      }),
+    );
+    const page = await new ChemblService(config).getMechanisms('CHEMBL25', ctx());
+    expect(new URL(calledUrl()).searchParams.get('limit')).toBe(String(config.maxPageSize));
+    expect(page.items).toHaveLength(1);
+    expect(page.totalCount).toBe(1);
+  });
+
+  it('falls back totalCount to the row count when page_meta is absent', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ mechanisms: [{ action_type: 'INHIBITOR' }] }));
+    const page = await new ChemblService(config).getMechanisms('CHEMBL25', ctx());
+    expect(page.totalCount).toBe(1);
+  });
+});
+
+describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
+  /** Route by URL so a retry cannot scramble a call-order queue. */
+  function route(mechanisms: () => Response, indications: () => Response): void {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = typeof input === 'string' ? input : String((input as Request).url);
+      if (url.includes('/mechanism.json')) return Promise.resolve(mechanisms());
+      if (url.includes('/drug_indication.json')) return Promise.resolve(indications());
+      return Promise.resolve(jsonResponse({ pref_name: 'ASPIRIN', max_phase: '4' }));
+    });
+  }
+
+  it('reports a rejected list as failed with an unknown count, not as empty', async () => {
+    route(
+      () => jsonResponse({ error_message: 'boom' }, 500),
+      () =>
+        jsonResponse({
+          drug_indications: [{ mesh_heading: 'Pain' }],
+          page_meta: { total_count: 1 },
+        }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL25', ctx());
+    expect(info.mechanisms).toEqual([]);
+    expect(info.mechanisms_status).toBe('failed');
+    // Unknown, never 0 — the same fidelity rule the numeric coercion follows.
+    expect(info.mechanisms_total_count).toBeNull();
+    expect(info.indications_status).toBe('complete');
+    expect(info.indications_total_count).toBe(1);
+  });
+
+  it('marks a list truncated when the upstream total exceeds the rows returned', async () => {
+    route(
+      () => jsonResponse({ mechanisms: [], page_meta: { total_count: 0 } }),
+      () =>
+        jsonResponse({
+          drug_indications: Array.from({ length: 100 }, (_, i) => ({ mesh_heading: `C${i}` })),
+          page_meta: { total_count: 167 },
+        }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL25', ctx());
+    expect(info.indications_status).toBe('truncated');
+    expect(info.indications_total_count).toBe(167);
+    expect(info.mechanisms_status).toBe('complete');
+    expect(info.mechanisms_total_count).toBe(0);
+  });
+
+  it('marks a list complete when the upstream total equals the rows returned', async () => {
+    route(
+      () =>
+        jsonResponse({
+          mechanisms: [{ mechanism_of_action: 'COX inhibitor' }],
+          page_meta: { total_count: 1 },
+        }),
+      () =>
+        jsonResponse({
+          drug_indications: [{ mesh_heading: 'Pain' }],
+          page_meta: { total_count: 1 },
+        }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL25', ctx());
+    expect(info.mechanisms_status).toBe('complete');
+    expect(info.indications_status).toBe('complete');
   });
 });
 

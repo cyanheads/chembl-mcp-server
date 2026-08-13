@@ -26,6 +26,7 @@ import type {
   DrugInfo,
   GetActivitiesOptions,
   Indication,
+  ListStatus,
   Mechanism,
   Molecule,
   Page,
@@ -588,28 +589,46 @@ export class ChemblService {
 
   // --- Drug pharmacology -------------------------------------------------
 
-  /** Fetch mechanism-of-action rows for a molecule. */
-  async getMechanisms(moleculeChemblId: string, ctx: Context): Promise<Mechanism[]> {
-    const url = this.buildUrl('mechanism', { molecule_chembl_id: moleculeChemblId, limit: 100 });
+  /**
+   * Fetch mechanism-of-action rows for a molecule. One request at the configured
+   * page size — see {@link getIndications} for why that is enough here.
+   */
+  async getMechanisms(moleculeChemblId: string, ctx: Context): Promise<Page<Mechanism>> {
+    const url = this.buildUrl('mechanism', {
+      molecule_chembl_id: moleculeChemblId,
+      limit: this.maxPageSize,
+    });
     const raw = await this.fetchJson<{
       mechanisms?: Array<{
         target_chembl_id?: string | null;
         mechanism_of_action?: string | null;
         action_type?: string | null;
       }>;
+      page_meta?: RawPageMeta;
     }>(url, 'ChemblService.getMechanisms', ctx);
-    return (raw.mechanisms ?? []).map((m) => ({
+    const items = (raw.mechanisms ?? []).map((m) => ({
       target_chembl_id: toStringOrNull(m.target_chembl_id),
       mechanism_of_action: toStringOrNull(m.mechanism_of_action),
       action_type: toStringOrNull(m.action_type),
     }));
+    return { items, totalCount: raw.page_meta?.total_count ?? items.length };
   }
 
-  /** Fetch clinical-indication rows for a molecule. */
-  async getIndications(moleculeChemblId: string, ctx: Context): Promise<Indication[]> {
+  /**
+   * Fetch clinical-indication rows for a molecule.
+   *
+   * One request at the configured page size, not a `page_meta.next` walk: an
+   * indication list runs to the low hundreds at the extreme (167 for aspirin, the
+   * largest observed), two to three orders of magnitude under the activity sets
+   * {@link streamActivities} paginates. The page size covers that whole range in a
+   * single round trip, and `page_meta.total_count` rides back so a list that still
+   * overflows it is reported as truncated instead of passing itself off as
+   * complete.
+   */
+  async getIndications(moleculeChemblId: string, ctx: Context): Promise<Page<Indication>> {
     const url = this.buildUrl('drug_indication', {
       molecule_chembl_id: moleculeChemblId,
-      limit: 100,
+      limit: this.maxPageSize,
     });
     const raw = await this.fetchJson<{
       drug_indications?: Array<{
@@ -617,18 +636,44 @@ export class ChemblService {
         efo_term?: string | null;
         max_phase_for_ind?: string | null;
       }>;
+      page_meta?: RawPageMeta;
     }>(url, 'ChemblService.getIndications', ctx);
-    return (raw.drug_indications ?? []).map((i) => ({
+    const items = (raw.drug_indications ?? []).map((i) => ({
       mesh_heading: toStringOrNull(i.mesh_heading),
       efo_term: toStringOrNull(i.efo_term),
       max_phase_for_ind: toNumberOrNull(i.max_phase_for_ind),
     }));
+    return { items, totalCount: raw.page_meta?.total_count ?? items.length };
+  }
+
+  /**
+   * Resolve one settled secondary list into the three states a caller has to tell
+   * apart. A rejection is a partial result, never an authoritative empty one: the
+   * array stays empty, but the status says `failed` and the count stays `null` —
+   * unknown, never 0, the same fidelity rule {@link toNumberOrNull} follows. The
+   * sanitized reason is logged rather than discarded; it carries no upstream
+   * internals ({@link sanitizeUpstreamError}) and no client-facing recovery beyond
+   * "re-call to retry", which the tool's notice already states.
+   */
+  private settleList<T>(
+    settled: PromiseSettledResult<Page<T>>,
+    operation: string,
+    ctx: Context,
+  ): { items: T[]; status: ListStatus; totalCount: number | null } {
+    if (settled.status === 'rejected') {
+      ctx.log.warning(`${operation} failed — reporting the list as failed, not empty.`, {
+        reason: settled.reason instanceof McpError ? settled.reason.data : undefined,
+      });
+      return { items: [], status: 'failed', totalCount: null };
+    }
+    const { items, totalCount } = settled.value;
+    return { items, status: totalCount > items.length ? 'truncated' : 'complete', totalCount };
   }
 
   /**
    * Compose drug pharmacology from molecule approval + mechanisms + indications.
-   * `Promise.allSettled` so a missing mechanism or indication list degrades to an
-   * empty array rather than tanking the whole call.
+   * `Promise.allSettled` so a rejected mechanism or indication list degrades to a
+   * disclosed partial result rather than tanking the whole call.
    */
   async getDrugInfo(moleculeChemblId: string, ctx: Context): Promise<DrugInfo> {
     const [approval, mechanisms, indications] = await Promise.allSettled([
@@ -640,13 +685,20 @@ export class ChemblService {
     // The molecule fetch is the anchor — if it failed (e.g. 404), surface that.
     if (approval.status === 'rejected') throw approval.reason;
 
+    const mechanismList = this.settleList(mechanisms, 'ChemblService.getMechanisms', ctx);
+    const indicationList = this.settleList(indications, 'ChemblService.getIndications', ctx);
+
     return {
       molecule_chembl_id: moleculeChemblId,
       pref_name: approval.value.pref_name,
       max_phase: approval.value.max_phase,
       first_approval: approval.value.first_approval,
-      mechanisms: mechanisms.status === 'fulfilled' ? mechanisms.value : [],
-      indications: indications.status === 'fulfilled' ? indications.value : [],
+      mechanisms: mechanismList.items,
+      mechanisms_status: mechanismList.status,
+      mechanisms_total_count: mechanismList.totalCount,
+      indications: indicationList.items,
+      indications_status: indicationList.status,
+      indications_total_count: indicationList.totalCount,
     };
   }
 

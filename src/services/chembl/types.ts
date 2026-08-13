@@ -127,16 +127,37 @@ export interface Indication {
   mesh_heading: string | null;
 }
 
+/**
+ * Retrieval state of one secondary list on a composed {@link DrugInfo}. The three
+ * states a caller must be able to tell apart:
+ *
+ * - `complete` — every row ChEMBL records is present. An empty array here is a
+ *   fact about the molecule.
+ * - `truncated` — the single-request page cap bounded the list, so the array is a
+ *   prefix of `*_total_count` rows.
+ * - `failed` — the upstream request was rejected, so the empty array is unknown
+ *   data, NOT evidence that no rows exist.
+ */
+export type ListStatus = 'complete' | 'truncated' | 'failed';
+
 /** Drug pharmacology — mechanisms + indications joined for one molecule. */
 export interface DrugInfo {
   /** Year of first approval, from the molecule record. `null` if unapproved/unknown. */
   first_approval: number | null;
-  /** Clinical indication(s). */
+  /** Clinical indication(s). Empty is authoritative only when `indications_status` is `complete`. */
   indications: Indication[];
+  /** Retrieval state of `indications`. */
+  indications_status: ListStatus;
+  /** Upstream indication total. `null` when the fetch failed — unknown, never 0. */
+  indications_total_count: number | null;
   /** Max clinical phase across all indications. */
   max_phase: number | null;
-  /** Mechanism(s) of action. */
+  /** Mechanism(s) of action. Empty is authoritative only when `mechanisms_status` is `complete`. */
   mechanisms: Mechanism[];
+  /** Retrieval state of `mechanisms`. */
+  mechanisms_status: ListStatus;
+  /** Upstream mechanism total. `null` when the fetch failed — unknown, never 0. */
+  mechanisms_total_count: number | null;
   /** ChEMBL molecule ID. */
   molecule_chembl_id: string;
   /** Preferred name. */
