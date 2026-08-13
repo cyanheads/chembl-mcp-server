@@ -182,6 +182,184 @@ describe('chembl_dataframe_query — happy + boundary', () => {
   });
 });
 
+/** Narrow two-column rows — 200 of these still sit far under the render budget. */
+function narrowRows(n: number): Record<string, unknown>[] {
+  return Array.from({ length: n }, (_, i) => ({
+    activity_id: 1000 + i,
+    molecule_chembl_id: `CHEMBL${i}`,
+  }));
+}
+
+/** ~1 KB of assay text per row — a few dozen of these exhaust the render budget. */
+function wideRows(n: number): Record<string, unknown>[] {
+  return Array.from({ length: n }, (_, i) => ({
+    activity_id: 2000 + i,
+    assay_description: `Inhibition of EGFR ${'x'.repeat(1000)}`,
+  }));
+}
+
+/** Data lines of the markdown table format() rendered — header and separator excluded. */
+function tableDataLines(text: string): string[] {
+  const lines = text.split('\n');
+  const sep = lines.findIndex((line) => line.startsWith('| ---'));
+  return lines.slice(sep + 1).filter((line) => line.startsWith('|'));
+}
+
+/** Render one query result and return the single text block's text. */
+function renderQuery(
+  result: Parameters<NonNullable<typeof chemblDataframeQuery.format>>[0],
+): string {
+  return (chemblDataframeQuery.format!(result)[0] as { text: string }).text;
+}
+
+describe('chembl_dataframe_query — content[] render budget (#10)', () => {
+  it('renders every row of an under-budget result, past the old 50-row cut', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ activity_id: 1000, molecule_chembl_id: 'CHEMBL0' }]);
+    fake.nextQuery = { rows: narrowRows(60), truncated: false };
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: canvasId,
+      sql: 'SELECT activity_id, molecule_chembl_id FROM bioactivities ORDER BY activity_id LIMIT 60',
+    });
+    const result = await chemblDataframeQuery.handler(input, ctx);
+    expect(result.row_count).toBe(60);
+    expect(result.rendered_rows).toBe(60);
+    expect(result.truncated).toBe(false);
+
+    const text = renderQuery(result);
+    expect(tableDataLines(text)).toHaveLength(60);
+    // The rows the fixed 50-row slice used to drop.
+    expect(text).toContain('CHEMBL50');
+    expect(text).toContain('CHEMBL59');
+    expect(text).not.toContain('more rows');
+  });
+
+  it('bounds a large result by the character budget and names the LIMIT/OFFSET path', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
+    fake.nextQuery = { rows: wideRows(200), truncated: false };
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: canvasId,
+      sql: 'SELECT activity_id, assay_description FROM bioactivities',
+    });
+    const result = await chemblDataframeQuery.handler(input, ctx);
+    expect(result.row_count).toBe(200);
+    expect(result.rendered_rows).toBeGreaterThan(0);
+    expect(result.rendered_rows).toBeLessThan(200);
+    // The renderer's budget, not the engine's row cap — the two are independent.
+    expect(result.truncated).toBe(false);
+
+    const text = renderQuery(result);
+    const dataLines = tableDataLines(text);
+    expect(dataLines).toHaveLength(result.rendered_rows);
+    expect(dataLines.join('\n').length).toBeLessThanOrEqual(40_000);
+    expect(text).toContain(`rendered_rows: ${result.rendered_rows} of 200`);
+    expect(text).toContain('LIMIT');
+    expect(text).toContain('OFFSET');
+    // The canvas-cap disclosure must not fire for a render-budget cap.
+    expect(text).not.toContain('canvas row cap');
+  });
+
+  it('discloses the canvas row cap without a render note when the table fits', () => {
+    const text = renderQuery({
+      rows: narrowRows(60),
+      row_count: 60,
+      rendered_rows: 60,
+      truncated: true,
+    });
+    expect(tableDataLines(text)).toHaveLength(60);
+    expect(text).toContain('truncated at the canvas row cap');
+    expect(text).not.toContain('render budget');
+  });
+
+  it('discloses both caps independently when the engine and the renderer each capped', () => {
+    const text = renderQuery({
+      rows: narrowRows(200),
+      row_count: 200,
+      rendered_rows: 12,
+      truncated: true,
+    });
+    expect(tableDataLines(text)).toHaveLength(12);
+    expect(text).toContain('rendered_rows: 12 of 200');
+    expect(text).toContain('render budget');
+    expect(text).toContain('truncated at the canvas row cap');
+  });
+
+  it('returns an empty result when OFFSET runs past the end of the table', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ activity_id: 1000 }]);
+    fake.nextQuery = { rows: [], truncated: false };
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: canvasId,
+      sql: 'SELECT activity_id FROM bioactivities ORDER BY activity_id LIMIT 10 OFFSET 999999',
+    });
+    const result = await chemblDataframeQuery.handler(input, ctx);
+    expect(result.row_count).toBe(0);
+    expect(result.rendered_rows).toBe(0);
+    expect(result.truncated).toBe(false);
+    expect(renderQuery(result)).toContain('Query returned no rows.');
+  });
+
+  it('carries a nested cell into content[] as JSON and leaves it uncoerced (#2 boundary)', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ molecule_chembl_id: 'CHEMBL1', n: 5 }]);
+    fake.nextQuery = {
+      rows: [
+        {
+          molecule_chembl_id: 'CHEMBL1',
+          nested: { assay: { count: '5' } },
+          ids: ['CHEMBL2', 'CHEMBL3'],
+          n: '5',
+        },
+      ],
+      truncated: false,
+    };
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: canvasId,
+      sql: "SELECT molecule_chembl_id, {'assay': {'count': '5'}} AS nested, ['CHEMBL2','CHEMBL3'] AS ids, COUNT(*) AS n FROM bioactivities GROUP BY 1",
+    });
+    const result = await chemblDataframeQuery.handler(input, ctx);
+    const row = result.rows[0] as Record<string, unknown>;
+    // Coercion is top-level only — the integer string two levels down is untouched.
+    expect(row.nested).toEqual({ assay: { count: '5' } });
+    // …while the top-level aggregate still coerces (#2).
+    expect(row.n).toBe(5);
+
+    const text = renderQuery(result);
+    expect(text).toContain('{"assay":{"count":"5"}}');
+    expect(text).toContain('CHEMBL3');
+    expect(text).not.toContain('[object Object]');
+  });
+
+  it('keeps a pipe or newline inside a cell from breaking the table', () => {
+    const text = renderQuery({
+      rows: [{ assay_description: 'Inhibition of EGFR | mutant\nsecond line' }],
+      row_count: 1,
+      rendered_rows: 1,
+      truncated: false,
+    });
+    expect(tableDataLines(text)).toHaveLength(1);
+    expect(text).toContain('Inhibition of EGFR \\| mutant second line');
+  });
+
+  it('carries the declared recovery hint on canvas_disabled', async () => {
+    setCanvas(undefined);
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const input = chemblDataframeQuery.input.parse({ canvas_id: 'x', sql: 'SELECT 1' });
+    await expect(chemblDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
+      data: { recovery: { hint: expect.stringContaining('CANVAS_PROVIDER_TYPE=duckdb') } },
+    });
+  });
+});
+
 describe('chembl_dataframe_describe — happy path', () => {
   it('lists the staged bioactivities table with its columns', async () => {
     const fake = new FakeDataCanvas();
@@ -233,6 +411,7 @@ describe('dataframe tools — format()', () => {
     const blocks = chemblDataframeQuery.format!({
       rows: [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }],
       row_count: 1,
+      rendered_rows: 1,
       truncated: false,
     });
     const text = (blocks[0] as { text: string }).text;
@@ -245,13 +424,19 @@ describe('dataframe tools — format()', () => {
     const blocks = chemblDataframeQuery.format!({
       rows: [{ a: 1 }],
       row_count: 1,
+      rendered_rows: 1,
       truncated: true,
     });
     expect((blocks[0] as { text: string }).text).toContain('truncated at the canvas row cap');
   });
 
   it('query renders the empty marker for no rows', () => {
-    const blocks = chemblDataframeQuery.format!({ rows: [], row_count: 0, truncated: false });
+    const blocks = chemblDataframeQuery.format!({
+      rows: [],
+      row_count: 0,
+      rendered_rows: 0,
+      truncated: false,
+    });
     expect((blocks[0] as { text: string }).text).toContain('no rows');
   });
 
