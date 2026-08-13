@@ -15,6 +15,7 @@ const config = {
   requestTimeoutMs: 5000,
   maxPageSize: 1000,
   defaultLimit: 25,
+  maxSpillRows: 50_000,
   dataframeDropEnabled: false,
 };
 
@@ -131,6 +132,105 @@ describe('ChemblService.searchTargets — gene-symbol flattening', () => {
     expect(page.items[0]?.components[0]?.accession).toBe('P00533');
     // Only GENE_SYMBOL* synonyms — not EC_NUMBER / UNIPROT.
     expect(page.items[0]?.components[0]?.gene_symbols).toEqual(['EGFR', 'ERBB1']);
+  });
+});
+
+describe('ChemblService.streamActivities — potency view selects the isnull filter', () => {
+  /** Drain one scripted page and hand back the stream URL the service built. */
+  async function streamUrlFor(potencyView?: 'potency_ranked' | 'null_potency'): Promise<string> {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ activities: [], page_meta: { total_count: 0, next: null } }),
+    );
+    const svc = new ChemblService(config);
+    for await (const _row of svc.streamActivities(
+      { moleculeChemblId: 'CHEMBL25', limit: 25, ...(potencyView && { potencyView }) },
+      createMockContext({ tenantId: 'default' }),
+    )) {
+      // drain
+    }
+    return String(fetchMock.mock.calls[0]?.[0]);
+  }
+
+  it('sends pchembl_value__isnull=false ranked on -pchembl_value by default (#3)', async () => {
+    const url = await streamUrlFor();
+    expect(url).toContain('pchembl_value__isnull=false');
+    expect(url).toContain('order_by=-pchembl_value');
+  });
+
+  it('sends pchembl_value__isnull=true on the null-potency view (#9)', async () => {
+    const url = await streamUrlFor('null_potency');
+    expect(url).toContain('pchembl_value__isnull=true');
+    // Ranking on a column that is null for every row is meaningless; the null view
+    // walks pages on the stable primary key instead so pagination cannot skip rows.
+    expect(url).toContain('order_by=activity_id');
+    expect(url).not.toContain('order_by=-pchembl_value');
+  });
+
+  it('keeps the isnull filter off the honest count call in either view', async () => {
+    for (const potencyView of ['potency_ranked', 'null_potency'] as const) {
+      fetchMock.mockClear();
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ activities: [], page_meta: { total_count: 4087 } }),
+      );
+      const svc = new ChemblService(config);
+      const total = await svc.countActivities(
+        { moleculeChemblId: 'CHEMBL25', limit: 25, potencyView },
+        createMockContext({ tenantId: 'default' }),
+      );
+      expect(total).toBe(4087);
+      expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('pchembl_value__isnull');
+    }
+  });
+});
+
+describe('ChemblService — molecule × target pair filters', () => {
+  /** Answer one scripted page and hand back the URL the service built. */
+  async function urlForStream(opts: {
+    potencyView?: 'potency_ranked' | 'null_potency';
+  }): Promise<string> {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ activities: [], page_meta: { total_count: 116, next: null } }),
+    );
+    const svc = new ChemblService(config);
+    for await (const _row of svc.streamActivities(
+      {
+        moleculeChemblId: 'CHEMBL941',
+        targetChemblId: 'CHEMBL385',
+        limit: 25,
+        ...(opts.potencyView && { potencyView: opts.potencyView }),
+      },
+      createMockContext({ tenantId: 'default' }),
+    )) {
+      // drain
+    }
+    return String(fetchMock.mock.calls[0]?.[0]);
+  }
+
+  it('ANDs both ids onto the stream URL', async () => {
+    const url = await urlForStream({});
+    expect(url).toContain('molecule_chembl_id=CHEMBL941');
+    expect(url).toContain('target_chembl_id=CHEMBL385');
+    expect(url).toContain('pchembl_value__isnull=false');
+  });
+
+  it('ANDs both ids onto the null-potency stream URL too', async () => {
+    const url = await urlForStream({ potencyView: 'null_potency' });
+    expect(url).toContain('molecule_chembl_id=CHEMBL941');
+    expect(url).toContain('target_chembl_id=CHEMBL385');
+    expect(url).toContain('pchembl_value__isnull=true');
+  });
+
+  it('ANDs both ids onto the honest count URL', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ page_meta: { total_count: 116 } }));
+    const svc = new ChemblService(config);
+    const total = await svc.countActivities(
+      { moleculeChemblId: 'CHEMBL941', targetChemblId: 'CHEMBL385', limit: 25 },
+      createMockContext({ tenantId: 'default' }),
+    );
+    const url = String(fetchMock.mock.calls[0]?.[0]);
+    expect(url).toContain('molecule_chembl_id=CHEMBL941');
+    expect(url).toContain('target_chembl_id=CHEMBL385');
+    expect(total).toBe(116);
   });
 });
 

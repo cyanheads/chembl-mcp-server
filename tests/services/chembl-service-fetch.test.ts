@@ -19,6 +19,7 @@ const config = {
   requestTimeoutMs: 5000,
   maxPageSize: 1000,
   defaultLimit: 25,
+  maxSpillRows: 50_000,
   dataframeDropEnabled: false,
 };
 

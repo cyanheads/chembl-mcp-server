@@ -54,7 +54,7 @@ function coerceIntegerStrings(
 export const chemblDataframeQuery = tool('chembl_dataframe_query', {
   title: 'chembl-dataframe-query',
   description:
-    "Run a read-only SQL SELECT over the bioactivity rows chembl_get_bioactivities spilled to a canvas — rank, group, dedupe, and aggregate across the FULL set, not the inline preview. Reference the staged table by the name chembl_get_bioactivities returned (bioactivities); discover columns with chembl_dataframe_describe. Compute honest aggregates here (e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities WHERE standard_type = 'IC50' GROUP BY 1 ORDER BY 2 DESC). Returns up to the canvas row cap; truncated is true when the SQL result exceeds that cap. Requires CANVAS_PROVIDER_TYPE=duckdb.",
+    "Run a read-only SQL SELECT over the bioactivity rows chembl_get_bioactivities spilled to a canvas — rank, group, dedupe, and aggregate across the FULL set, not the inline preview. Reference each staged table by the name chembl_get_bioactivities returned — bioactivities for its potency_ranked view, bioactivities_null_potency for null_potency; discover the staged tables and their columns with chembl_dataframe_describe. Compute honest aggregates here (e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities WHERE standard_type = 'IC50' GROUP BY 1 ORDER BY 2 DESC). Returns up to the canvas row cap; truncated is true when the SQL result exceeds that cap. Requires CANVAS_PROVIDER_TYPE=duckdb.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     canvas_id: z

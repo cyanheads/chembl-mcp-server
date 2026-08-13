@@ -196,13 +196,33 @@ export interface SearchTargetsOptions {
   targetType?: string | undefined;
 }
 
-/** Options for `streamActivities` — exactly one of molecule/target id is set by the caller. */
+/**
+ * Which side of the `pchembl_value` presence split a bioactivity query retrieves.
+ * The two views partition the same match set exactly and are never combined:
+ * ChEMBL sorts null-`pchembl_value` rows FIRST under a descending
+ * `order_by=-pchembl_value`, so a merged stream would lead with the unrankable
+ * rows and defeat the potency ranking.
+ *
+ * - `potency_ranked` — measurements with a derivable `pchembl_value`
+ *   (`pchembl_value__isnull=false`), ordered most-potent-first. The default.
+ * - `null_potency` — measurements with no derivable `pchembl_value`
+ *   (`pchembl_value__isnull=true`), reachable only by asking for them.
+ */
+export type PotencyView = 'potency_ranked' | 'null_potency';
+
+/**
+ * Options for `streamActivities` — at least one of molecule/target id is set by the
+ * caller. Both together is legal and ANDs upstream, narrowing the query to the
+ * measurements of that one compound against that one target.
+ */
 export interface GetActivitiesOptions {
   assayType?: string | undefined;
   limit: number;
   moleculeChemblId?: string | undefined;
   organism?: string | undefined;
   pchemblValueMin?: number | undefined;
+  /** Defaults to `potency_ranked` when omitted. */
+  potencyView?: PotencyView | undefined;
   standardType?: string | undefined;
   targetChemblId?: string | undefined;
 }

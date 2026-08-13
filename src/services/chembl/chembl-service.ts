@@ -500,28 +500,43 @@ export class ChemblService {
    * Stream bioactivity rows as an async iterable, paginating `page_meta.next`
    * until exhausted (or the source is cancelled). Designed to feed `spillover()`:
    * the preview drain pulls only what fits the budget, and the spill drain
-   * registers the full set. The first page's `page_meta.total_count` is reported
-   * via the `onTotal` callback — this is the count of the *potency-filtered* set
-   * (rows with a derivable pchembl_value), not the full match count; the handler
-   * sources the honest total from {@link countActivities}.
+   * registers rows up to the caller's `caps.maxRows`. The stream itself is
+   * unbounded by design — it is lazy, so it advances only as far as the consumer
+   * pulls, and bounding the drain is the consumer's call.
+   *
+   * `opts.potencyView` selects which side of the `pchembl_value` presence split
+   * is streamed; the two views partition the match set exactly and are never
+   * merged (see {@link PotencyView}). The first page's `page_meta.total_count` is
+   * reported via the `onTotal` callback — this is the count of the *selected
+   * view*, not the full match count; the handler sources the honest total from
+   * {@link countActivities}.
    */
   async *streamActivities(
     opts: GetActivitiesOptions,
     ctx: Context,
     onTotal?: (total: number) => void,
   ): AsyncGenerator<Activity> {
+    const nullPotency = opts.potencyView === 'null_potency';
     const params: Record<string, string | number | undefined> = {
       ...this.activityFilterParams(opts),
       limit: Math.min(this.maxPageSize, 1000),
       offset: 0,
-      // Rank field — order by pchembl_value descending so the inline preview leads
-      // with the most potent measurements.
-      order_by: '-pchembl_value',
-      // ChEMBL sorts NULLs first for a descending sort, so an unfiltered preview is
-      // dominated by measurements with no derivable pchembl_value. Exclude them so the
-      // potency-ranked preview is meaningful; the honest full count (which includes
-      // them) is recovered separately by countActivities, leaving totalCount intact.
-      pchembl_value__isnull: 'false',
+      /**
+       * Potency-ranked view: order by pchembl_value descending so the preview leads
+       * with the most potent measurements. Null-potency view: every row's
+       * pchembl_value is null, so that ordering is meaningless — walk the stable
+       * primary key instead, which keeps the page sequence deterministic.
+       */
+      order_by: nullPotency ? 'activity_id' : '-pchembl_value',
+      /**
+       * ChEMBL sorts NULLs first for a descending sort, so an unfiltered preview is
+       * dominated by measurements with no derivable pchembl_value. The default view
+       * excludes them so the potency ranking is meaningful; the null-potency view is
+       * the explicit, opt-in way to reach exactly those excluded rows. The honest
+       * full count (which spans both) is recovered separately by countActivities,
+       * leaving totalCount intact either way.
+       */
+      pchembl_value__isnull: nullPotency ? 'true' : 'false',
     };
 
     let nextUrl: string | null = this.buildUrl('activity', params);

@@ -124,8 +124,9 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
   ],
 
   async handler(input, ctx) {
-    // Zod marks all three optional for form-client compatibility; XOR-style gate
-    // here. Guard for empty strings (form clients send "" not undefined).
+    // Zod marks all three optional for form-client compatibility; the at-least-one
+    // gate lives here. Any combination is valid — the three AND upstream, so extra
+    // ones narrow. Guard for empty strings (form clients send "" not undefined).
     const query = input.query?.trim() || undefined;
     const accession = input.accession?.trim() || undefined;
     const geneSymbol = input.gene_symbol?.trim() || undefined;

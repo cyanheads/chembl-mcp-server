@@ -43,6 +43,14 @@ const ServerConfigSchema = z.object({
     .positive()
     .default(25)
     .describe('Default `limit` applied when callers omit it; keeps inline preview sizes sane.'),
+  maxSpillRows: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(50_000)
+    .describe(
+      'Hard ceiling on rows staged to a DataCanvas table by chembl_get_bioactivities, and so on the upstream page drain behind it (at 1000 rows/page, 50000 bounds one call to 50 sequential ChEMBL fetches). Covers the largest real single-protein targets uncapped while bounding the catch-all ones; a capped result is reported as truncated rather than passed off as complete.',
+    ),
   dataframeDropEnabled: z
     .stringbool()
     .default(false)
@@ -65,6 +73,7 @@ export function getServerConfig(): ServerConfig {
     requestTimeoutMs: 'CHEMBL_REQUEST_TIMEOUT_MS',
     maxPageSize: 'CHEMBL_MAX_PAGE_SIZE',
     defaultLimit: 'CHEMBL_DEFAULT_LIMIT',
+    maxSpillRows: 'CHEMBL_MAX_SPILL_ROWS',
     dataframeDropEnabled: 'CHEMBL_DATAFRAME_DROP_ENABLED',
   });
   return _config;

@@ -16,7 +16,7 @@ Display identity is the hyphenated repo name **`chembl-mcp-server`** on every su
 | Tool | Summary | readOnlyHint | openWorldHint | Key inputs | Output shape |
 |---|---|---|---|---|---|
 | `chembl_search_molecules` | Discovery entry point. Find compounds by name / ChEMBL ID / InChIKey, or run a structure search (exact \| similarity \| substructure) from a SMILES/InChI. `search_type` defaults to `name`; `structure` is required when `search_type` is `exact`, `similarity`, or `substructure`. At least one of `query` or `structure` must be supplied. | `true` | `true` | `query?`, `structure?`, `search_type` (default `name`), `similarity_threshold?` (integer 40–100, default 70), `max_phase_min?`, `limit` | `{ molecules[] }` — ChEMBL ID, pref_name, canonical SMILES, formula, MW, AlogP, RO5 violations, QED, max_phase, (similarity score 0–100 when structure search); `totalCount`/`truncated`/`shown`/`cap` via enrichment |
-| `chembl_get_bioactivities` | **Flagship.** Bioactivity measurements for a molecule **or** a target (the compound↔target↔assay bridge). Exactly one of `molecule_chembl_id` or `target_chembl_id` is required — supplying both or neither is a `missing_filter` error. Filters by standard_type, potency, assay type, organism. Rows are ranked by potency: the preview/canvas holds only measurements with a derivable `pchembl_value` (`pchembl_value__isnull=false`), while `totalCount` is the honest full match count (separate `limit:1` call, no isnull filter). Large sets spill to DataCanvas. | `true` | `true` | `molecule_chembl_id?` XOR `target_chembl_id?`, `standard_type?`, `pchembl_value_min?`, `assay_type?`, `organism?`, `limit`, `canvas_id?` | `{ activities[], totalCount, spilled, canvas_id, table_name, canvasDisabled }` per-measurement: molecule, target, assay, standard_type/value/units, pchembl_value, assay confidence |
+| `chembl_get_bioactivities` | **Flagship.** Bioactivity measurements for a molecule, a target, or **both** (the compound↔target↔assay bridge). At least one of `molecule_chembl_id` or `target_chembl_id` is required — both together ANDs upstream and narrows to that compound–target pair, neither is a `missing_filter` error. Filters by standard_type, potency, assay type, organism. `potency_view` selects which side of the `pchembl_value` presence split is retrieved: `potency_ranked` (default, `pchembl_value__isnull=false`, ranked most-potent-first) or `null_potency` (`pchembl_value__isnull=true`, the rows the ranked view excludes). `totalCount` spans both (separate `limit:1` call, no isnull filter). Large sets spill to DataCanvas, one table per view, capped at `CHEMBL_MAX_SPILL_ROWS`. | `true` | `true` | at least one of `molecule_chembl_id?` / `target_chembl_id?`, `standard_type?`, `pchembl_value_min?`, `assay_type?`, `organism?`, `potency_view` (default `potency_ranked`), `limit`, `canvas_id?` | `{ activities[], totalCount, potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, canvasDisabled }` per-measurement: molecule, target, assay, standard_type/value/units, pchembl_value, assay confidence |
 | `chembl_search_targets` | Resolve a protein/gene/UniProt accession → ChEMBL target ID that `get_bioactivities` needs. At least one of `query`, `accession`, or `gene_symbol` must be supplied; omitting all returns a `ValidationError`. | `true` | `true` | `query?`, `accession?`, `gene_symbol?`, `organism?`, `target_type?`, `limit` | `{ targets[] }` — target_chembl_id, pref_name, target_type, organism, component accessions + gene symbols; `totalCount`/`truncated`/`shown`/`cap` via enrichment |
 | `chembl_get_drug_info` | Pharmacology for a drug (molecule): mechanism(s) of action, molecular target(s), action type, first-approval year, indications + max phase. `molecule_chembl_id` comes from `chembl_search_molecules`. | `true` | `true` | `molecule_chembl_id` (from `chembl_search_molecules`) | `{ molecule_chembl_id, pref_name, max_phase, first_approval?, mechanisms[], indications[] }` |
 | `chembl_get_assay` | Assay detail by assay ChEMBL ID — provenance behind a bioactivity row (type, target, organism, confidence). `assay_chembl_id` comes from a bioactivity row's `assay_chembl_id` field. | `true` | `true` | `assay_chembl_id` (from a bioactivity row) | `{ assay_chembl_id, description, assay_type, target_chembl_id?, organism?, confidence_score?, confidence_description? }` — confidence_score is ChEMBL's 1–9 scale (9 = direct assay on protein target) |
@@ -80,8 +80,9 @@ Primary agent workflows:
    (`chembl_search_molecules` with `search_type`).
 
 `chembl_get_bioactivities` is the 80% tool and the reason the server exists: a target like a kinase
-carries tens of thousands of measurements (confirmed: EGFR `CHEMBL203` had 3,920 IC50 rows alone), so
-it pairs an inline preview with a DataCanvas spill that the agent SQLs via `chembl_dataframe_query`.
+carries tens of thousands of measurements (confirmed: EGFR `CHEMBL203` has 58,847 in total, 26,600 of
+them IC50), so it pairs an inline preview with a DataCanvas spill that the agent SQLs via
+`chembl_dataframe_query`.
 
 ## Requirements
 
@@ -206,9 +207,12 @@ interface DrugInfo {
 }
 ```
 
-**Canvas table — `bioactivities`.** When `chembl_get_bioactivities` spills, the staged table holds the
-full flat `Activity` rows (coerced numerics) so SQL aggregates are honest. The spill registers every
-field the handler yields — all **18 columns** available for SQL:
+**Canvas tables — `bioactivities` and `bioactivities_null_potency`.** When `chembl_get_bioactivities`
+spills, the staged table holds flat `Activity` rows (coerced numerics) so SQL aggregates are honest.
+Each `potency_view` stages its own table, and the two partition the match set exactly — run both
+against one `canvas_id` and `UNION ALL` over the pair rebuilds the honest full rowset in SQL, without
+ever putting the unrankable rows at the head of a potency-ranked stream. Both tables carry the same
+schema: the spill registers every field the handler yields — all **18 columns** available for SQL:
 `activity_id`, `molecule_chembl_id`, `molecule_pref_name`, `target_chembl_id`, `target_pref_name`,
 `target_organism`, `assay_chembl_id`, `assay_type`, `assay_description`, `standard_type`,
 `standard_relation`, `standard_value` (DOUBLE), `standard_units`, `pchembl_value` (DOUBLE),
@@ -224,12 +228,14 @@ raw `type`/`value`/`units`/`relation` (those are present for audit but are not n
 | `ChemblService` (`src/services/chembl/chembl-service.ts`) | The single upstream client. Wraps `https://www.ebi.ac.uk/chembl/api/data/`; builds Django-style filtered URLs, fetches `.json`, paginates `page_meta`, **coerces string numerics → number/null at the boundary**, flattens nested structures (`molecule_structures`, `molecule_properties`, `target_components`) into the flat domain types above. Each method wraps its full fetch+parse in `withRetry`. | `searchMolecules(opts)`, `structureSearch(opts)`, `streamActivities(opts)` (returns an async-iterable page stream for spillover), `searchTargets(opts)`, `getMolecule(id)`, `getMechanisms(molId)`, `getIndications(molId)`, `getDrugInfo(molId)`, `getAssay(id)` |
 | `canvas-accessor` (`src/services/canvas-accessor.ts`) | Module-level holder for the optional `DataCanvas` wired in `createApp({ setup })`. `getCanvas()` returns `undefined` when canvas is disabled. | `setCanvas(core.canvas)`, `getCanvas()` |
 
-`chembl_get_bioactivities` uses `spillover({ canvas, source: chembl.streamActivities(...), previewChars, tableName: 'bioactivities', signal })`
-(with `previewChars = max(40_000, limit * 600)`) — preview rows inline, full set staged as the
-`bioactivities` table. The optional `canvas_id` input lets callers reuse an existing canvas, but the
-table is always re-registered under the fixed name `bioactivities`, so a second query **replaces
-(overwrites)** the prior rows on that canvas rather than appending to them; omit `canvas_id` to mint a
-fresh canvas. `chembl_get_drug_info` composes `getMolecule` + `getMechanisms` +
+`chembl_get_bioactivities` uses `spillover({ canvas, source: chembl.streamActivities(...), previewChars, tableName: <the view's table>, caps: { maxRows: CHEMBL_MAX_SPILL_ROWS }, signal })`
+(with `previewChars = max(40_000, limit * 600)`) — preview rows inline, the selected `potency_view`
+staged as its own table. `previewChars` is a character budget on the drain buffer, not a row cap, so the
+handler slices the returned rows to `limit` afterwards (see *Output Design Notes*). The optional
+`canvas_id` input lets callers reuse an existing canvas, but a
+view is always re-registered under its own fixed table name, so a second query of the **same** view
+**replaces (overwrites)** its prior rows rather than appending to them, while the other view's table is
+left intact; omit `canvas_id` to mint a fresh canvas. `chembl_get_drug_info` composes `getMolecule` + `getMechanisms` +
 `getIndications` with `Promise.allSettled` so a missing mechanism or indication degrades to an empty
 array rather than tanking the call. `chembl_search_targets` validates at least one of `query`,
 `accession`, or `gene_symbol` is non-empty at the handler level — Zod marks all three optional for
@@ -249,6 +255,7 @@ name the variable, not the path.
 | `CHEMBL_REQUEST_TIMEOUT_MS` | `requestTimeoutMs` | no | `30000` | Per-request timeout for upstream fetches. |
 | `CHEMBL_MAX_PAGE_SIZE` | `maxPageSize` | no | `1000` | ChEMBL's per-page cap when streaming activity pages for spill. |
 | `CHEMBL_DEFAULT_LIMIT` | `defaultLimit` | no | `25` | Default `limit` applied when callers omit it; keeps preview sizes sane. |
+| `CHEMBL_MAX_SPILL_ROWS` | `maxSpillRows` | no | `50000` | Hard ceiling on rows staged to a canvas table, and so on the upstream page drain behind it (50,000 rows = 50 sequential ChEMBL fetches at the 1,000-row page cap). Over the cap the response reports `truncated: true`. Deployment-shaped — a shared hosted instance tightens it, a local stdio session can raise it. |
 | `CANVAS_PROVIDER_TYPE` | (framework) | no | `none` | Set to `duckdb` to enable the bioactivity spill + SQL path. When `none`, `chembl_get_bioactivities` still inlines a preview but never spills; `chembl_dataframe_*` return a "canvas disabled" error. |
 | `CHEMBL_DATAFRAME_DROP_ENABLED` | `dataframeDropEnabled` | no | `false` | Opt-in toggle for the `chembl_dataframe_drop` tool. Off by default — per-table/canvas TTL already reclaims staged tables, so the explicit drop is unnecessary in the common case. Set `true` only when agents need to free a large staged table early within a long session; the tool is conditionally registered, so it is absent from `tools/list` when this is off. `z.stringbool()` so `=false` actually disables. |
 
@@ -275,8 +282,8 @@ Each step is independently buildable + testable.
    Accession / gene-symbol / name / organism filters; flatten components + gene symbols.
 4. **`chembl_search_molecules`** — name/ID/InChIKey search + the three structure modes via
    `search_type`. Coerce + surface `max_phase` on every row.
-5. **`chembl_get_bioactivities`** — the flagship. molecule-or-target XOR input gate; standard_type /
-   pchembl / assay_type / organism filters; `spillover()` to the `bioactivities` table; inline preview;
+5. **`chembl_get_bioactivities`** — the flagship. molecule/target at-least-one input gate; standard_type /
+   pchembl / assay_type / organism filters; `spillover()` to the `potency_view`'s table; inline preview;
    `enrichment` truncation/total + spill notice.
 6. **`chembl_dataframe_query` + `chembl_dataframe_describe` + `chembl_dataframe_drop`** — the
    standardized 3-tool canvas surface (query + describe mandatory once step 5 emits a `canvas_id`; drop
@@ -297,7 +304,7 @@ states which tool emits the ID) so a weaker model chains correctly.
 | # | Call | Why / what it emits |
 |---|---|---|
 | 1 | `chembl_search_targets({ accession: 'P00533' })` or `({ gene_symbol: 'EGFR', organism: 'Homo sapiens' })` | Resolves the protein → `target_chembl_id` (e.g. `CHEMBL203`). The accession comes from the `uniprot`/`protein` server. |
-| 2 | `chembl_get_bioactivities({ target_chembl_id: 'CHEMBL203', standard_type: 'IC50', pchembl_value_min: 7 })` | Bioactivity rows for that target. ~3,920 IC50 rows for EGFR → **spills**; returns `canvas_id` + `bioactivities` table + inline top-N preview. |
+| 2 | `chembl_get_bioactivities({ target_chembl_id: 'CHEMBL203', standard_type: 'IC50', pchembl_value_min: 7 })` | Bioactivity rows for that target. 10,618 EGFR IC50 rows at pChEMBL ≥ 7 (of 26,600 IC50 measurements, 19,378 of which carry a `pchembl_value`) → **spills**; returns `canvas_id` + `bioactivities` table + inline top-N preview. |
 | 3 | `chembl_dataframe_describe({ canvas_id })` then `chembl_dataframe_query({ canvas_id, sql })` | SQL the full set: `SELECT molecule_chembl_id, MEDIAN(pchembl_value) … GROUP BY molecule_chembl_id ORDER BY 2 DESC` — honest aggregate over all rows, not the preview. |
 
 > **Correctness trap surfaced here:** mixing IC50 and Ki is invalid. The `standard_type` filter is
@@ -330,8 +337,8 @@ target `CHEMBL203`) + indications (non-small-cell lung carcinoma, max phase 4). 
   distinct endpoints (`/molecule` for name/ID/InChIKey, `/molecule/{smiles}` for exact, `/similarity/{smiles}/{threshold}` for similarity, `/substructure/{smiles}` for substructure); the handler routes by `search_type`. Default is `name`. `structure` (SMILES string) is required for `exact`/`similarity`/`substructure`; `query` is required for `name`. `similarity_threshold` is an integer 40–100 (ChEMBL rejects values below 40); default 70. Keeps the discovery surface one tool. Handler validates at least one of `query`/`structure` is present and that `structure` accompanies structure-mode `search_type` values — throws `missing_input` otherwise.
 - **`chembl_get_bioactivities` is one bidirectional tool, not `get_compound_activities` +
   `get_target_activities`.** The molecule↔target bridge is symmetric and shares all filters; an
-  XOR input gate (`molecule_chembl_id` *or* `target_chembl_id`, exactly one) keeps the surface tight.
-  The gate is enforced at the handler level (not Zod — Zod can't XOR two optionals cleanly): both absent or both present → `ctx.fail('missing_filter', …)`. This is the tool the server exists for, so it gets the prominent `standard_type` filter and the spill.
+  at-least-one input gate (`molecule_chembl_id`, `target_chembl_id`, or both) keeps the surface tight.
+  The gate is enforced at the handler level (not Zod — Zod can't express a cross-field requirement over two optionals): both absent → `ctx.fail('missing_filter', …)`. Both present is a legitimate query — ChEMBL ANDs the two filters, so the pair resolves to that one compound against that one target. This is the tool the server exists for, so it gets the prominent `standard_type` filter and the spill.
 - **DataCanvas spill — bioactivities only.** It clears both gates: the data is *analytical* (agents run
   `GROUP BY` / `MEDIAN` over potency across thousands of rows) and *too big to inline* (a single target
   = thousands of measurements). Search/target/drug/assay results are discovery or single-record — they
@@ -372,7 +379,7 @@ Two tools have a domain failure worth declaring:
 
 | Tool | `reason` | code | When | Recovery |
 |---|---|---|---|---|
-| `chembl_get_bioactivities` | `missing_filter` | `InvalidParams` | Neither `molecule_chembl_id` nor `target_chembl_id` supplied, or both are supplied. | Supply exactly one of `molecule_chembl_id` (from `chembl_search_molecules`) or `target_chembl_id` (from `chembl_search_targets`), not both and not neither. |
+| `chembl_get_bioactivities` | `missing_filter` | `InvalidParams` | Neither `molecule_chembl_id` nor `target_chembl_id` supplied, so the query had nothing to scope to. | Supply `molecule_chembl_id` (from `chembl_search_molecules`), `target_chembl_id` (from `chembl_search_targets`), or both to narrow to one compound–target pair. |
 | `chembl_search_molecules` | `missing_input` | `InvalidParams` | Neither `query` nor `structure` supplied. | Supply `query` for name/ID/InChIKey search, or `structure` (SMILES) with an appropriate `search_type` for structure search. |
 | `chembl_search_targets` | `missing_input` | `InvalidParams` | None of `query`, `accession`, or `gene_symbol` supplied. | Supply at least one: `accession` (UniProt, e.g. `P00533`), `gene_symbol` (e.g. `EGFR`), or `query` (free-text name). |
 | `chembl_dataframe_query` / `chembl_dataframe_describe` / `chembl_dataframe_drop` | `canvas_disabled` | `InvalidParams` | Called while `CANVAS_PROVIDER_TYPE` is `none` (no canvas). (`chembl_dataframe_drop` reaches this only when registered, i.e. `CHEMBL_DATAFRAME_DROP_ENABLED=true` but canvas is still off.) | Set `CANVAS_PROVIDER_TYPE=duckdb` to enable the SQL path; otherwise read the inline preview from `chembl_get_bioactivities`. |
@@ -383,15 +390,31 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 
 ## Output Design Notes
 
-- **Spill envelope.** `chembl_get_bioactivities` returns `{ activities: <preview>, totalCount, spilled,
-  canvas_id, table_name, canvasDisabled }`. `totalCount` is the honest full match count (including
-  measurements without a derivable `pchembl_value`), sourced from a separate `limit:1` count request
-  that does NOT apply the `pchembl_value__isnull=false` filter the stream uses. The preview/canvas holds
-  only the potency-ranked potent subset; `canvasDisabled` is `true` when `CANVAS_PROVIDER_TYPE` is not
-  `duckdb` (so no spill is possible and the inline rows are a capped preview, not the full set). When
-  `spilled: false` and `canvasDisabled: false`, the preview is the full potent set. Surface the spill +
-  the `standard_type`/filters-as-parsed via `ctx.enrich(...)` so both client surfaces (Claude Code
-  `structuredContent`, Claude Desktop `content[]`) see them.
+- **Spill envelope.** `chembl_get_bioactivities` returns `{ activities: <preview>, totalCount,
+  potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, canvasDisabled }`.
+  `totalCount` is the honest full match count spanning both potency views, sourced from a separate
+  `limit:1` count request that does NOT apply the `pchembl_value__isnull` filter the stream uses. The
+  preview/canvas holds only the selected `potency_view`, echoed back on the output so the agent knows
+  which half it has and can re-call for the other. `canvasDisabled` is `true` when
+  `CANVAS_PROVIDER_TYPE` is not `duckdb` (so no spill is possible and the inline rows are a capped
+  preview, not the full set). Surface the spill + the `standard_type`/filters-as-parsed via
+  `ctx.enrich(...)` so both client surfaces (Claude Code `structuredContent`, Claude Desktop
+  `content[]`) see them.
+- **`limit` bounds the inline rows on all three branches.** Spilled, fit inline, or canvas disabled,
+  `activities` never exceeds `limit` — that is the field's advertised contract ("Maximum rows in the
+  inline preview"). `spillover()` sizes its buffer by `previewChars`, a character budget whose 40,000
+  floor holds ~65 rows no matter how small `limit` is, so bounding the rows by shrinking that budget is
+  not an option: the budget is what decides fit-vs-spill and feeds the overflow sentinel. The handler
+  therefore slices the returned rows on both canvas branches, and the canvas-disabled drain breaks at
+  `limit`. What differs is where the remainder lives — on a spill it is on the staged table (SQL it via
+  `chembl_dataframe_query`); with the view fit inline or the canvas off nothing is staged, so the rows
+  past `limit` are simply not returned and the notice reports how many of the view's rows came back.
+- **A capped spill says so.** The spill drain is bounded by `caps: { maxRows: CHEMBL_MAX_SPILL_ROWS }`,
+  which also bounds the upstream page walk behind the lazy stream. `staged_row_count` reports the rows
+  actually registered, and `truncated: true` says the cap was hit before upstream ran out — the table is
+  a bounded slice, not the complete view, so aggregates over it are a sample. Both fields are rendered
+  by `format()` as well as carried in `structuredContent`; a cap without that disclosure is the same
+  "capped rows read as complete" trap the canvas-disabled preview already avoids.
 - **Capped lists disclose truncation.** Every search tool takes a `limit` and returns an array → use
   `ctx.enrich.truncated({ shown, cap })` + `ctx.enrich.total(totalCount)` (from ChEMBL `page_meta.total_count`)
   so the agent never treats a capped page as complete.
@@ -410,11 +433,20 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 - **Activity sets are huge.** A popular target carries 10⁴–10⁵ measurements; without
   `CANVAS_PROVIDER_TYPE=duckdb` the flagship degrades to preview-only and cross-set aggregation is
   unavailable. Hosting must enable canvas for the flagship to fully deliver.
+- **The spill is bounded, so the largest sets are sampled.** `CHEMBL_MAX_SPILL_ROWS` (default 50,000)
+  caps the staged table and the upstream page walk behind it. Real single-protein targets fit under it
+  (EGFR `CHEMBL203` has 21,342 measurements carrying a `pchembl_value`), but ChEMBL's catch-all targets
+  do not — `CHEMBL612545` ("Unchecked") alone has 405,219, which uncapped would be 406 sequential
+  upstream page fetches in one tool call. Over the cap the response reports `truncated: true`; narrowing
+  with `standard_type` / `pchembl_value_min` is what brings a view back under it.
 - **`pchembl_value` sparsity.** Not every activity row has a derivable `pchembl_value` (non-standard
-  types, censored relations); those are excluded from the potency-ranked preview and canvas via
+  types, censored relations). The default `potency_ranked` view excludes them via
   `pchembl_value__isnull=false` on the stream, while the honest `totalCount` (a separate `limit:1` count
-  request without the isnull filter) includes them. They surface as `null` in raw rows — inspect via the
-  `value`/`type` raw fields.
+  request without the isnull filter) counts them. They are retrieved by re-calling with
+  `potency_view: 'null_potency'`, which stages them as their own `bioactivities_null_potency` table —
+  a separate call, not a merged stream, because ChEMBL sorts null-`pchembl_value` rows FIRST under the
+  descending `order_by=-pchembl_value` and merging would put them back at the head of the ranked view.
+  On these rows potency lives only in the raw `value`/`type`/`relation` fields.
 - **Mixed measurement types.** ChEMBL aggregates IC50, Ki, EC50, etc.; comparing across types is a
   scientific error the server can warn about (prominent `standard_type` filter) but not prevent.
 - **In-memory canvas.** Spilled tables are per-session and dropped on restart (DataCanvas v1) — re-fetch
@@ -454,11 +486,15 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 | Structure search = `search_type` enum on `chembl_search_molecules` | Three ChEMBL endpoints, one agent action ("find molecules") — consolidate, don't fan out. |
 | `search_type` defaults to `name` | The most common case is name/ID/InChIKey lookup; callers opt in to structure modes explicitly. |
 | `similarity_threshold` typed as integer 40–100 | ChEMBL's `/similarity` endpoint rejects thresholds below 40; exposing the validated range in the schema prevents silent 400 errors from the upstream. |
-| XOR gates enforced in handler, not Zod | Zod can't cleanly XOR two `.optional()` fields. Runtime check with `ctx.fail('missing_filter'/'missing_input', …)` keeps the schema simple for form clients and produces a typed, recoverable error for agents. |
+| Cross-field input gates enforced in handler, not Zod | Zod can't cleanly express a requirement spanning two `.optional()` fields. Runtime check with `ctx.fail('missing_filter'/'missing_input', …)` keeps the schema simple for form clients and produces a typed, recoverable error for agents. |
 | Raw upstream fields named `type`/`value`/`units`/`relation` in `Activity` | Carried alongside `standard_*` for auditability and staged to the canvas with the rest of the row (the full `Activity` spills); analytical queries should still rank on the normalized `standard_*` / `pchembl_value` columns, not the raw ones. |
 | `bioactivities` canvas table column list is explicit | Agents writing SQL against the canvas need the exact column names; prose-only was a gap that would cause repeated `invalid_sql` errors. |
 | `CHEMBL_DEFAULT_LIMIT` config field | The same default (25) applies to all search tools; centralizing it in config avoids scattered magic numbers and lets operators tune for slower connections. |
-| Bidirectional `chembl_get_bioactivities` with XOR input | The compound↔target bridge is symmetric; one tool with a molecule-or-target gate beats two near-duplicates. |
+| Bidirectional `chembl_get_bioactivities` with an at-least-one input gate | The compound↔target bridge is symmetric; one tool with a molecule/target gate beats two near-duplicates, and accepting both together reaches the compound×target pair that neither single-sided tool could express. |
 | Numerics coerced once in the service | ChEMBL ships numbers as strings; coercing at the boundary keeps schemas clean and absent→`null` honors scientific-data fidelity (never `0`). |
 | Canvas only for bioactivities | Only that result is both analytical and oversized; search/drug/assay inline. |
+| `potency_view` selects one view per call, never a merged stream | ChEMBL sorts null-`pchembl_value` rows FIRST under `order_by=-pchembl_value`, so any stream carrying both leads with the unrankable rows — the exact defect the potency filter was added to fix. Two calls staging two tables keeps the ranked view honest while making the excluded rows reachable, and a `UNION ALL` across the pair reconstructs the full set in SQL where arrival order does not matter. |
+| The null-potency view paginates on `order_by=activity_id` | Every row in that view has a null `pchembl_value`, so ranking on it is meaningless and leaves the page sequence undefined. The primary key is stable, so the page walk cannot skip or repeat rows. |
+| A potency floor on the null-potency view is an error, not an empty result | `pchembl_value__gte` and `pchembl_value__isnull=true` can only ever match zero rows. Returning empty would read as "ChEMBL has no such measurements"; silently dropping one filter would mask the caller's mistake. `contradictory_potency_filter` names the conflict and both ways out. |
+| The spill cap is config (`CHEMBL_MAX_SPILL_ROWS`), not a hardcoded constant | The right ceiling is deployment-shaped: a shared hosted instance wants a tighter bound on per-request upstream fanout than a local stdio session doing bulk analysis. It sits alongside `maxPageSize`/`defaultLimit`, the other upstream-tuning knobs, and has a default that needs no attention. |
 | No auth / no scopes | Public keyless data over stdio — scopes would be empty ceremony. |

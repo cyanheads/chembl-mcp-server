@@ -1,13 +1,15 @@
 /**
  * @fileoverview Tests for the handler-level input gates that Zod can't express:
- * the bioactivity molecule-XOR-target gate and the search "at least one input"
- * gates. These fire before any upstream call, so no network is involved.
+ * the bioactivity at-least-one molecule/target gate and the search "at least one
+ * input" gates. Every rejecting case fires before any upstream call, so no network
+ * is involved. The one accepting case — both bioactivity IDs together — has to run
+ * past the gate to prove it was let through, so it stubs `fetch`.
  * @module tests/tools/chembl-input-gates
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import { chemblGetBioactivities } from '@/mcp-server/tools/definitions/chembl-get-bioactivities.tool.js';
 import { chemblSearchMolecules } from '@/mcp-server/tools/definitions/chembl-search-molecules.tool.js';
@@ -18,13 +20,24 @@ beforeAll(() => {
   initChemblService(getServerConfig());
 });
 
-/** Assert a handler call rejects with the given McpError code + data.reason. */
-async function expectFail(promise: Promise<unknown>, code: number, reason: string) {
-  await expect(promise).rejects.toMatchObject({ code, data: { reason } });
-  await expect(promise).rejects.toBeInstanceOf(McpError);
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/**
+ * Assert a handler call rejects with the given McpError code + data.reason.
+ * `ToolDefinition.handler` is typed to allow a sync return, so its result is
+ * `T | Promise<T>`; normalizing through `Promise.resolve` keeps a sync return
+ * assertable — it settles fulfilled and the `.rejects` assertion fails, which
+ * is the correct verdict for a gate that was supposed to throw.
+ */
+async function expectFail(result: unknown, code: number, reason: string) {
+  const settled = Promise.resolve(result);
+  await expect(settled).rejects.toMatchObject({ code, data: { reason } });
+  await expect(settled).rejects.toBeInstanceOf(McpError);
 }
 
-describe('chembl_get_bioactivities — molecule XOR target gate', () => {
+describe('chembl_get_bioactivities — molecule/target filter gate', () => {
   it('rejects when neither id is supplied', async () => {
     const ctx = createMockContext({ tenantId: 'default', errors: chemblGetBioactivities.errors });
     const input = chemblGetBioactivities.input.parse({});
@@ -35,17 +48,27 @@ describe('chembl_get_bioactivities — molecule XOR target gate', () => {
     );
   });
 
-  it('rejects when both ids are supplied', async () => {
+  it('lets both ids through — a compound × target pair is a query, not a gate failure', async () => {
+    // A fresh Response per call — the handler makes two (honest count, then the
+    // view stream), and a Response body can only be read once.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({ activities: [], page_meta: { total_count: 0, next: null } }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+        ),
+      ),
+    );
     const ctx = createMockContext({ tenantId: 'default', errors: chemblGetBioactivities.errors });
     const input = chemblGetBioactivities.input.parse({
       molecule_chembl_id: 'CHEMBL25',
       target_chembl_id: 'CHEMBL203',
     });
-    await expectFail(
-      chemblGetBioactivities.handler(input, ctx),
-      JsonRpcErrorCode.InvalidParams,
-      'missing_filter',
-    );
+    const result = await chemblGetBioactivities.handler(input, ctx);
+    expect(result.totalCount).toBe(0);
   });
 
   it('treats blank-string ids as absent (form-client guard)', async () => {
