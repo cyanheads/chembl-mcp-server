@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-08-12
+
+chembl_get_drug_info now discloses truncated and failed mechanism/indication lists instead of an ambiguous empty array; chembl_dataframe_query's content output is bounded by a character budget instead of a fixed 50-row cut, and struct/list cells render as JSON.
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-08-12
 
 chembl_get_bioactivities gains a null-potency view and accepts molecule and target together; the canvas spill is now capped and discloses truncation. Framework bump to mcp-ts-core 0.11.5 plus repo hygiene additions.

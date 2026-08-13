@@ -18,9 +18,9 @@ Display identity is the hyphenated repo name **`chembl-mcp-server`** on every su
 | `chembl_search_molecules` | Discovery entry point. Find compounds by name / ChEMBL ID / InChIKey, or run a structure search (exact \| similarity \| substructure) from a SMILES/InChI. `search_type` defaults to `name`; `structure` is required when `search_type` is `exact`, `similarity`, or `substructure`. At least one of `query` or `structure` must be supplied. | `true` | `true` | `query?`, `structure?`, `search_type` (default `name`), `similarity_threshold?` (integer 40–100, default 70), `max_phase_min?`, `limit` | `{ molecules[] }` — ChEMBL ID, pref_name, canonical SMILES, formula, MW, AlogP, RO5 violations, QED, max_phase, (similarity score 0–100 when structure search); `totalCount`/`truncated`/`shown`/`cap` via enrichment |
 | `chembl_get_bioactivities` | **Flagship.** Bioactivity measurements for a molecule, a target, or **both** (the compound↔target↔assay bridge). At least one of `molecule_chembl_id` or `target_chembl_id` is required — both together ANDs upstream and narrows to that compound–target pair, neither is a `missing_filter` error. Filters by standard_type, potency, assay type, organism. `potency_view` selects which side of the `pchembl_value` presence split is retrieved: `potency_ranked` (default, `pchembl_value__isnull=false`, ranked most-potent-first) or `null_potency` (`pchembl_value__isnull=true`, the rows the ranked view excludes). `totalCount` spans both (separate `limit:1` call, no isnull filter). Large sets spill to DataCanvas, one table per view, capped at `CHEMBL_MAX_SPILL_ROWS`. | `true` | `true` | at least one of `molecule_chembl_id?` / `target_chembl_id?`, `standard_type?`, `pchembl_value_min?`, `assay_type?`, `organism?`, `potency_view` (default `potency_ranked`), `limit`, `canvas_id?` | `{ activities[], totalCount, potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, canvasDisabled }` per-measurement: molecule, target, assay, standard_type/value/units, pchembl_value, assay confidence |
 | `chembl_search_targets` | Resolve a protein/gene/UniProt accession → ChEMBL target ID that `get_bioactivities` needs. At least one of `query`, `accession`, or `gene_symbol` must be supplied; omitting all returns a `ValidationError`. | `true` | `true` | `query?`, `accession?`, `gene_symbol?`, `organism?`, `target_type?`, `limit` | `{ targets[] }` — target_chembl_id, pref_name, target_type, organism, component accessions + gene symbols; `totalCount`/`truncated`/`shown`/`cap` via enrichment |
-| `chembl_get_drug_info` | Pharmacology for a drug (molecule): mechanism(s) of action, molecular target(s), action type, first-approval year, indications + max phase. `molecule_chembl_id` comes from `chembl_search_molecules`. | `true` | `true` | `molecule_chembl_id` (from `chembl_search_molecules`) | `{ molecule_chembl_id, pref_name, max_phase, first_approval?, mechanisms[], indications[] }` |
+| `chembl_get_drug_info` | Pharmacology for a drug (molecule): mechanism(s) of action, molecular target(s), action type, first-approval year, indications + max phase. `molecule_chembl_id` comes from `chembl_search_molecules`. | `true` | `true` | `molecule_chembl_id` (from `chembl_search_molecules`) | `{ molecule_chembl_id, pref_name, max_phase, first_approval, mechanisms[], mechanisms_status, mechanisms_total_count, indications[], indications_status, indications_total_count }` — each secondary list carries its own `complete`\|`truncated`\|`failed` state + upstream total, so an empty array is never ambiguous |
 | `chembl_get_assay` | Assay detail by assay ChEMBL ID — provenance behind a bioactivity row (type, target, organism, confidence). `assay_chembl_id` comes from a bioactivity row's `assay_chembl_id` field. | `true` | `true` | `assay_chembl_id` (from a bioactivity row) | `{ assay_chembl_id, description, assay_type, target_chembl_id?, organism?, confidence_score?, confidence_description? }` — confidence_score is ChEMBL's 1–9 scale (9 = direct assay on protein target) |
-| `chembl_dataframe_query` | Run read-only SQL `SELECT` over the bioactivity rows `chembl_get_bioactivities` spilled to a canvas (rank, group, dedupe, aggregate across the **full** set). Returns up to the canvas row limit; `truncated: true` when the result exceeds that cap. | `true` | `false` | `canvas_id`, `sql` | `{ rows[], row_count, truncated }` — `truncated` signals the SQL result was row-capped by the canvas, not the spill |
+| `chembl_dataframe_query` | Run read-only SQL `SELECT` over the bioactivity rows `chembl_get_bioactivities` spilled to a canvas (rank, group, dedupe, aggregate across the **full** set). Two independent bounds, each on its own field: the canvas row limit caps the result set (`truncated`), and a character budget caps the markdown table rendered into `content[]` (`rendered_rows`). SQL `LIMIT`/`OFFSET` pages past both. | `true` | `false` | `canvas_id`, `sql` | `{ rows[], row_count, rendered_rows, truncated }` — `truncated` signals the SQL result was row-capped by the canvas (not the spill); `rendered_rows` signals the rendered table was budget-capped (not the data) |
 | `chembl_dataframe_describe` | List tables + columns staged on a canvas, so the agent can write correct SQL before calling `chembl_dataframe_query`. | `true` | `false` | `canvas_id` | `{ tables[] }` — name, kind (`table`\|`view`), row_count, columns (name + type) |
 | `chembl_dataframe_drop` | Drop a named staged table from a canvas (`instance.drop`). **Opt-in** behind `CHEMBL_DATAFRAME_DROP_ENABLED=true` (default off) and **conditionally registered** — absent from `tools/list` when the flag is off. Off by default because per-table/canvas TTL already reclaims staged tables; the tool only matters when an agent wants to free a large table early within a long session. | `false` | `false` | `canvas_id`, `table_name` | `{ dropped }` — `true` if the table existed and was dropped, `false` if it was already gone |
 
@@ -188,24 +188,41 @@ interface Target {
   }>;
 }
 
+/** Retrieval state of one secondary list on a composed DrugInfo. */
+type ListStatus = 'complete' | 'truncated' | 'failed';
+
 /** Drug pharmacology — mechanisms + indications joined for one molecule. */
 interface DrugInfo {
   molecule_chembl_id: string;
   pref_name: string | null;
   max_phase: number | null;
-  first_approval: number | null;     // year, from the molecule record
+  first_approval: number | null;         // year, from the molecule record
   mechanisms: Array<{
     target_chembl_id: string | null;
-    mechanism_of_action: string | null; // "Epidermal growth factor receptor erbB1 inhibitor"
-    action_type: string | null;         // "INHIBITOR" | "AGONIST" | …
+    mechanism_of_action: string | null;  // "Epidermal growth factor receptor erbB1 inhibitor"
+    action_type: string | null;          // "INHIBITOR" | "AGONIST" | …
   }>;
+  mechanisms_status: ListStatus;         // empty [] is authoritative only when 'complete'
+  mechanisms_total_count: number | null; // upstream total; null when the fetch failed — never 0
   indications: Array<{
-    mesh_heading: string | null;        // "Carcinoma, Non-Small-Cell Lung"
-    efo_term: string | null;            // "non-small cell lung carcinoma"
-    max_phase_for_ind: number | null;   // phase reached for THIS indication
+    mesh_heading: string | null;         // "Carcinoma, Non-Small-Cell Lung"
+    efo_term: string | null;             // "non-small cell lung carcinoma"
+    max_phase_for_ind: number | null;    // phase reached for THIS indication
   }>;
+  indications_status: ListStatus;
+  indications_total_count: number | null;
 }
 ```
+
+**The two secondary lists carry their own retrieval state.** `mechanisms` and `indications` are
+fetched independently of the molecule record, so an empty array has three possible causes an agent must
+be able to tell apart: ChEMBL records none (`complete`), the single-request page cap bounded the list
+(`truncated`, so the array is a prefix of `*_total_count` rows), or the fetch failed (`failed`, count
+`null` — unknown, never `0`, the same fidelity rule the numeric coercion follows). Each list is one
+request at `CHEMBL_MAX_PAGE_SIZE` rather than a `page_meta.next` walk: indication lists run to the low
+hundreds at the extreme (167 for aspirin, the largest observed), which one round trip covers, and
+`page_meta.total_count` rides back so a list that still overflows reports itself truncated instead of
+passing itself off as complete.
 
 **Canvas tables — `bioactivities` and `bioactivities_null_potency`.** When `chembl_get_bioactivities`
 spills, the staged table holds flat `Activity` rows (coerced numerics) so SQL aggregates are honest.
@@ -236,8 +253,11 @@ handler slices the returned rows to `limit` afterwards (see *Output Design Notes
 view is always re-registered under its own fixed table name, so a second query of the **same** view
 **replaces (overwrites)** its prior rows rather than appending to them, while the other view's table is
 left intact; omit `canvas_id` to mint a fresh canvas. `chembl_get_drug_info` composes `getMolecule` + `getMechanisms` +
-`getIndications` with `Promise.allSettled` so a missing mechanism or indication degrades to an empty
-array rather than tanking the call. `chembl_search_targets` validates at least one of `query`,
+`getIndications` with `Promise.allSettled`, so one secondary list failing degrades that list rather than
+tanking the call — but it degrades to `status: 'failed'` with a `null` count, never to a bare empty
+array that would read as "ChEMBL records none". `getMechanisms` / `getIndications` return `Page<T>`
+(rows + upstream `total_count`), which is what lets the composer classify each list `complete` /
+`truncated` / `failed`. `chembl_search_targets` validates at least one of `query`,
 `accession`, or `gene_symbol` is non-empty at the handler level — Zod marks all three optional for
 form-client compatibility, but the handler throws `missing_input` when all are absent/blank.
 
@@ -415,6 +435,20 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
   a bounded slice, not the complete view, so aggregates over it are a sample. Both fields are rendered
   by `format()` as well as carried in `structuredContent`; a cap without that disclosure is the same
   "capped rows read as complete" trap the canvas-disabled preview already avoids.
+- **The rendered table has its own budget, disclosed separately.** `chembl_dataframe_query` returns
+  every materialized row on `structuredContent.rows`, but `format()` can only put so much of that into
+  `content[]` before it becomes a context-destroying wall of text. The bound is a **character budget**
+  (`RENDER_CHAR_BUDGET`, 40,000 ≈ 10k tokens — the `api-canvas` preview tier the bioactivity spill is
+  already sized against), measured on the markdown lines `format()` actually emits, so a small result
+  renders in full and only a genuinely large one is capped. A row cap would be a leaky proxy: two ID
+  columns and a column of assay prose differ by an order of magnitude at the same row count.
+  `rendered_rows` reports how many rows the table holds and is a **distinct field from `truncated`** —
+  that one means the canvas engine hit `CANVAS_DEFAULT_ROW_LIMIT` on the SQL result itself. The two are
+  independent in both directions: a response can be `truncated: false` and still render fewer rows than
+  `row_count`, or `truncated: true` with every returned row rendered. When the budget caps the table,
+  `format()` says so above it (never below — a note under a 40,000-character table is the first thing a
+  reader loses) and names the retrieval action: re-run the same SQL with `LIMIT`/`OFFSET`, which already
+  reaches rows past the canvas row cap too, so no tool-level pagination parameter is needed.
 - **Capped lists disclose truncation.** Every search tool takes a `limit` and returns an array → use
   `ctx.enrich.truncated({ shown, cap })` + `ctx.enrich.total(totalCount)` (from ChEMBL `page_meta.total_count`)
   so the agent never treats a capped page as complete.
@@ -498,3 +532,7 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 | A potency floor on the null-potency view is an error, not an empty result | `pchembl_value__gte` and `pchembl_value__isnull=true` can only ever match zero rows. Returning empty would read as "ChEMBL has no such measurements"; silently dropping one filter would mask the caller's mistake. `contradictory_potency_filter` names the conflict and both ways out. |
 | The spill cap is config (`CHEMBL_MAX_SPILL_ROWS`), not a hardcoded constant | The right ceiling is deployment-shaped: a shared hosted instance wants a tighter bound on per-request upstream fanout than a local stdio session doing bulk analysis. It sits alongside `maxPageSize`/`defaultLimit`, the other upstream-tuning knobs, and has a default that needs no attention. |
 | No auth / no scopes | Public keyless data over stdio — scopes would be empty ceremony. |
+| `chembl_dataframe_query` renders `content[]` against a character budget, not a row cap | A fixed row cut is wrong in both directions: it truncated a 60-row result nobody needed truncated, and it left a wide result over budget anyway. Characters are the quantity that actually bounds context; rows are a proxy that varies by an order of magnitude with column width. |
+| `rendered_rows` is a separate field from `truncated`, not an overload of it | They report different bounds — the renderer's budget vs. the canvas engine's `CANVAS_DEFAULT_ROW_LIMIT` on the SQL result — and either can fire without the other. Collapsing them would make a `truncated: false` response that under-renders `content[]` undetectable from `structuredContent` alone. |
+| SQL `LIMIT`/`OFFSET` is the retrieval path past both bounds — no tool-level pagination parameter | Offsets already reach rows beyond the canvas row cap (verified: `LIMIT 2000 OFFSET 10000` against a 19,378-row staged table returns exactly those 2,000). A second, tool-level knob would duplicate a mechanism the caller's own SQL already has. |
+| Non-primitive cells render as JSON, pipes escaped and newlines folded | `String()` flattens a DuckDB STRUCT/LIST to `[object Object]`, which drops from `content[]` a value `structuredContent` carries in full — the same parity gap the row cap caused. Escaping keeps one cell from breaking the table row it sits in. |

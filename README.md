@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -88,7 +88,8 @@ Drug pharmacology for a molecule — distinct from the `openfda` server's label 
 
 - Supply `molecule_chembl_id` (from `chembl_search_molecules`)
 - Returns mechanism(s) of action, the molecular target(s), action type (inhibitor / agonist / …), first-approval year, and clinical indications with the max phase reached for each
-- Composed from molecule + mechanisms + indications with `Promise.allSettled`, so a missing mechanism or indication list degrades to an empty array rather than failing the call
+- Composed from molecule + mechanisms + indications with `Promise.allSettled`, so a rejected mechanism or indication list degrades to a disclosed partial result rather than failing the call
+- Each list carries its own retrieval state — `mechanisms_status` / `indications_status` (`complete` / `truncated` / `failed`) next to `mechanisms_total_count` / `indications_total_count`, so an empty array is authoritative only when the status is `complete`
 - A mechanism's `target_chembl_id` chains into `chembl_get_bioactivities` for compounds hitting the same target
 
 ---
@@ -108,6 +109,7 @@ In-conversation SQL analytics over the bioactivity tables that `chembl_get_bioac
 
 - **Read-only.** `chembl_dataframe_query` accepts a single `SELECT`; writes, DDL, and non-SELECT statements are rejected by the framework SQL gate. Reference each staged table by the name `chembl_get_bioactivities` returned (`bioactivities` for the `potency_ranked` view, `bioactivities_null_potency` for `null_potency`), and discover its columns with `chembl_dataframe_describe` first.
 - Each spilled table holds the **full** `Activity` row — the same 18 columns including the normalized `standard_*` / `pchembl_value` fields (rank on these) and the raw upstream `type` / `value` / `units` / `relation` (audit only). Compute aggregates here, never over the inline preview.
+- **Two independent bounds, both disclosed.** `truncated` means the canvas engine's own query-result cap was hit. `rendered_rows` reports how many rows the markdown table in `content[]` actually carried — that table is bounded by a character budget rather than a row count, so wide and narrow rows differ several-fold at the same byte cost. Either bound can trip without the other. `structuredContent.rows` always carries the full materialized result; to reach rows past either bound, page with SQL `LIMIT` / `OFFSET`.
 - `chembl_dataframe_drop` is the only destructive tool and is **opt-in** (`CHEMBL_DATAFRAME_DROP_ENABLED=true`) — absent from `tools/list` when off, because per-table and per-canvas TTL already reclaim staged tables. It still appears in the server manifest and landing page while off, carrying the flag needed to enable it. Reach for it only to free a large table early in a long session.
 - All three require `CANVAS_PROVIDER_TYPE=duckdb`; without it they return a `canvas_disabled` error and `chembl_get_bioactivities` degrades to a preview-only response.
 

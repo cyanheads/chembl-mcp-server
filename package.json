@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/chembl-mcp-server",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "mcpName": "io.github.cyanheads/chembl-mcp-server",
   "description": "Link compounds to protein targets, rank bioactivity (IC50/Ki/EC50), and look up drug mechanisms and indications over ChEMBL via MCP. STDIO or Streamable HTTP.",
   "type": "module",
