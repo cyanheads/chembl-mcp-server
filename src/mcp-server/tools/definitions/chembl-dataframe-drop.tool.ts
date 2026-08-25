@@ -43,7 +43,7 @@ export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
   async handler(input, ctx) {
     const canvas = getCanvas();
     if (!canvas) {
-      throw ctx.fail('canvas_disabled', undefined, { ...ctx.recoveryFor('canvas_disabled') });
+      throw ctx.fail('canvas_disabled', undefined, ctx.recoveryFor('canvas_disabled'));
     }
     const instance = await canvas.acquire(input.canvas_id, ctx);
     const dropped = await instance.drop(input.table_name);

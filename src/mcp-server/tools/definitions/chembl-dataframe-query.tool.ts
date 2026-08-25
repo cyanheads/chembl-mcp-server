@@ -145,7 +145,7 @@ export const chemblDataframeQuery = tool('chembl_dataframe_query', {
   async handler(input, ctx) {
     const canvas = getCanvas();
     if (!canvas) {
-      throw ctx.fail('canvas_disabled', undefined, { ...ctx.recoveryFor('canvas_disabled') });
+      throw ctx.fail('canvas_disabled', undefined, ctx.recoveryFor('canvas_disabled'));
     }
     // Canvas-resolution failures (unknown id, missing table, invalid SQL) are
     // thrown by the DataCanvas primitive with structured data.reason — bubble them.

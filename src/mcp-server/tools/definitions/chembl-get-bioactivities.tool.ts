@@ -356,7 +356,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
      * pair resolves to the measurements of that one compound against that one target.
      */
     if (!moleculeId && !targetId) {
-      throw ctx.fail('missing_filter', undefined, { ...ctx.recoveryFor('missing_filter') });
+      throw ctx.fail('missing_filter', undefined, ctx.recoveryFor('missing_filter'));
     }
 
     const view: PotencyView = input.potency_view;
@@ -367,9 +367,11 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
      * measurements" — and rather than silently dropping one of the two filters.
      */
     if (view === 'null_potency' && input.pchembl_value_min !== undefined) {
-      throw ctx.fail('contradictory_potency_filter', undefined, {
-        ...ctx.recoveryFor('contradictory_potency_filter'),
-      });
+      throw ctx.fail(
+        'contradictory_potency_filter',
+        undefined,
+        ctx.recoveryFor('contradictory_potency_filter'),
+      );
     }
 
     const config = getServerConfig();

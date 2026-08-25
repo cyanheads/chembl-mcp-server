@@ -60,7 +60,7 @@ export const chemblDataframeDescribe = tool('chembl_dataframe_describe', {
   async handler(input, ctx) {
     const canvas = getCanvas();
     if (!canvas) {
-      throw ctx.fail('canvas_disabled', undefined, { ...ctx.recoveryFor('canvas_disabled') });
+      throw ctx.fail('canvas_disabled', undefined, ctx.recoveryFor('canvas_disabled'));
     }
     const instance = await canvas.acquire(input.canvas_id, ctx);
     const tables = await instance.describe();

@@ -261,11 +261,17 @@ export class ChemblService {
    * public server. This is the single chokepoint for every ChEMBL call.
    */
   private async fetchJson<T>(url: string, operation: string, ctx: Context): Promise<T> {
-    // The framework's network utils take a RequestContext (an open context bag);
-    // build one from the handler Context so logs stay correlated to the request.
+    /**
+     * `Context extends RequestContext`, so the handler ctx is the parent directly —
+     * a hand-copied field list would silently drop `sessionId` and the `extra`
+     * correlation bag as the shape grows. The derived context exists only to label
+     * `operation` for this fetch; the framework's log and error sinks project any
+     * context down to the declared `RequestContext` fields before serializing, so
+     * no handler machinery rides along.
+     */
     const reqCtx = requestContextService.createRequestContext({
       operation,
-      parentContext: { requestId: ctx.requestId, traceId: ctx.traceId, tenantId: ctx.tenantId },
+      parentContext: ctx,
     });
     try {
       return await withRetry(

@@ -144,7 +144,7 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
     const accession = input.accession?.trim() || undefined;
     const geneSymbol = input.gene_symbol?.trim() || undefined;
     if (!query && !accession && !geneSymbol) {
-      throw ctx.fail('missing_input', undefined, { ...ctx.recoveryFor('missing_input') });
+      throw ctx.fail('missing_input', undefined, ctx.recoveryFor('missing_input'));
     }
 
     const limit = input.limit ?? getServerConfig().defaultLimit;
