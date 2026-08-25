@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-08-25
+
+Adopts mcp-ts-core 0.12.3 (MCP SDK v2): tool inputs reject an undeclared key by name, outputSchema declares the error envelope, and MCP_SESSION_MODE now defaults to stateless. Also fixes a Docker multi-arch build crash under QEMU.
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-08-13
 
 chembl_search_molecules and chembl_search_targets gain cursor pagination past the row cap; chembl_search_molecules also routes exact ChEMBL-ID/InChIKey queries to an honest single-record lookup instead of a fuzzy-search count.

@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-08-13 04:38:33
+Generated on: 2026-08-25 07:58:09
 
 ```text
 chembl-mcp-server/
@@ -173,7 +173,8 @@ chembl-mcp-server/
 │   │   ├── chembl-input-gates.test.ts
 │   │   ├── chembl-registration-gate.test.ts
 │   │   ├── chembl-search-molecules.tool.test.ts
-│   │   └── chembl-search-targets.tool.test.ts
+│   │   ├── chembl-search-targets.tool.test.ts
+│   │   └── chembl-wire-contract.test.ts
 │   └── _fake-canvas.ts
 ├── .dockerignore
 ├── .env.example
