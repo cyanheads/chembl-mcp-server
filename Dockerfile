@@ -3,8 +3,16 @@
 #
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
+#
+# Pinned to $BUILDPLATFORM because `bun run build` emits platform-independent
+# JavaScript, so this stage must never be emulated. Without the pin, the
+# linux/amd64 leg of a multi-arch `buildx` run on an arm64 host executes under
+# QEMU, where Bun 1.4.0 aborts during the build with a JavaScriptCore
+# MemoryExhaustion assertion (exit 134) and the multi-arch push fails outright.
+# The pin holds only while nothing here compiles a native addon — that would
+# need the target-arch toolchain and could not cross-compile.
 # ==============================================================================
-FROM oven/bun:1.3.14 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.0 AS build
 
 WORKDIR /usr/src/app
 
@@ -30,7 +38,7 @@ RUN bun run build
 # application. It uses a slim base image and only includes production
 # dependencies and build artifacts.
 # ==============================================================================
-FROM oven/bun:1.3.14-slim AS production
+FROM oven/bun:1.4.0-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -56,6 +64,13 @@ COPY package.json bun.lock ./
 # actually imports is in its own `dependencies` — @duckdb/node-api included — so
 # nothing needed at runtime is lost. The OTEL step below carries the same flag:
 # without it, that install re-resolves the graph and pulls every peer back in.
+#
+# This install is also what supplies the DataCanvas (DuckDB) native binary:
+# @duckdb/node-api pulls @duckdb/node-bindings, whose per-platform binaries are
+# optional dependencies gated on os/cpu, and this stage runs on the *target*
+# platform, so Bun resolves the binding for the architecture being built. Never
+# source that tree from the build stage — it is pinned to $BUILDPLATFORM and
+# would put arm64 bindings in a linux/amd64 image.
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --production --omit=peer --frozen-lockfile --ignore-scripts
 
@@ -76,14 +91,6 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
         @opentelemetry/sdk-trace-node \
         @opentelemetry/semantic-conventions; \
     fi
-
-# DataCanvas (DuckDB) native binary: @duckdb/node-api ships its platform binary
-# in a separate @duckdb/node-bindings-<platform> optional-dependency package. A
-# production `--ignore-scripts` install can resolve against the build-host's
-# lockfile platform and miss the linux binary, so copy the fully-resolved
-# @duckdb tree from the build stage (linux) over the production node_modules. A
-# CANVAS_PROVIDER_TYPE=duckdb server crashes at runtime without it.
-COPY --from=build /usr/src/app/node_modules/@duckdb ./node_modules/@duckdb
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
