@@ -27,9 +27,11 @@
 
 ---
 
-## Tools
+## Overview
 
-Eight tools — five for the ChEMBL compound/target/bioactivity surface, plus three for SQL analytics over the DuckDB-backed canvas that `chembl_get_bioactivities` spills to (the third is opt-in):
+Drug-discovery data over ChEMBL (EBI) — the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and indications. Search compounds by name, ID, or structure, resolve protein targets, rank bioactivity measurements, and look up drug mechanisms and indications from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:---|:---|
@@ -42,114 +44,123 @@ Eight tools — five for the ChEMBL compound/target/bioactivity surface, plus th
 | `chembl_dataframe_describe` | List the tables and columns staged on a canvas, so you can write correct SQL before querying. |
 | `chembl_dataframe_drop` | Drop a named staged table from a canvas. Opt-in via `CHEMBL_DATAFRAME_DROP_ENABLED=true` — absent from `tools/list` when off, since TTL already reclaims staged tables. |
 
-### `chembl_search_molecules`
+### Resources
 
-The discovery entry point for compounds.
+| Resource | Description |
+|:---|:---|
+| `chembl://molecule/{chemblId}` | A molecule record by ChEMBL ID — the same shape a `chembl_search_molecules` row carries. |
+| `chembl://target/{chemblId}` | A target record by ChEMBL target ID — preferred name, type, organism, and component UniProt accessions + gene symbols. |
 
-- Default `search_type=name` matches drug names, synonyms, ChEMBL IDs, and InChIKeys in one query
-- A `query` that is exactly a ChEMBL ID or an InChIKey is routed to ChEMBL's single-record lookup rather than the fuzzy text index, so it returns `totalCount: 1` instead of a full-text relevance count. Adding `max_phase_min` returns the query to the text index, since that filter belongs to the search endpoint
-- Structure search via `search_type`: `exact` (exact match), `similarity` (Tanimoto ≥ threshold), or `substructure` (contains the query structure) — supply `structure` as a SMILES
-- `similarity_threshold` is an integer 40–100 (default 70; ChEMBL rejects values below 40)
-- `max_phase_min` restricts name searches to compounds at or above a max clinical phase (e.g. `4` for marketed drugs only)
-- Every row carries `max_phase` — the cheap druggability signal (4 = marketed, 0 = research) — plus MW, AlogP, Lipinski rule-of-five violations, and QED. Only `search_type=similarity` carries a Tanimoto `similarity` percent; `exact` and `substructure` results omit the field entirely, because ChEMBL supplies a score for similarity search alone
-- Results past `limit` are reachable: when more remain, the response carries a `nextCursor`, and passing it back as `cursor` returns the following page. It is omitted — not null — on the last page. Redeem a cursor with the same filters that minted it
+All resource data is also reachable via the tools, so tool-only MCP clients lose nothing. There are no prompts — the canonical workflows are short tool chains an agent composes directly, and the cross-server chain guidance ships as server-level `instructions` instead.
+
+## Capability reference
+
+### `chembl_search_molecules` <sub>tool</sub>
+
+- Default `search_type=name` matches drug names, synonyms, ChEMBL IDs, and InChIKeys in one query; a query that is exactly a ChEMBL ID or InChIKey routes to ChEMBL's single-record lookup instead of the fuzzy text index (`totalCount: 1`)
+- Structure search via `search_type`: `exact`, `similarity` (Tanimoto ≥ `similarity_threshold`, integer 40–100, default 70), or `substructure` — supply `structure` as a SMILES; `max_phase_min` (name search only) restricts to compounds at or above a max clinical phase
+- Every row carries `max_phase`, MW, AlogP, Lipinski rule-of-five violations, and QED; only `search_type=similarity` results carry a Tanimoto `similarity` percent — absent, not null, on other modes
+- Paginated via `nextCursor` / `cursor`, omitted (not null) on the last page — redeem a cursor with the same filters that minted it
 - Chain `molecule_chembl_id` into `chembl_get_bioactivities` or `chembl_get_drug_info`
 
 ---
 
-### `chembl_get_bioactivities`
+### `chembl_get_bioactivities` <sub>tool</sub>
 
-The flagship tool and the reason the server exists — the curated compound↔target↔assay link.
-
-- Supply **at least one** of `molecule_chembl_id` (target deconvolution / selectivity) or `target_chembl_id` (lead finding); supplying **both** narrows to that compound–target pair — "how potently does this compound hit this target, and in which assays?" — while neither is a `missing_filter` error
-- Filter by `standard_type` (IC50 / Ki / EC50 / …), minimum potency `pchembl_value_min`, `assay_type`, and `organism`; rows are ranked on `pchembl_value` (−log10 molar potency)
-- **Ranking trap:** `pchembl_value` is comparable only within one `standard_type` — set the filter, because mixing IC50 and Ki is a scientific error
-- **Coverage trap:** many measurements have no derivable `pchembl_value` (non-standard types, censored relations) and are absent from the ranked view — aspirin `CHEMBL25` has 4,087 measurements but only 158 with a `pchembl_value`. `potency_view` picks the side you get: `potency_ranked` (default) or `null_potency` for exactly the excluded rows. `totalCount` spans both either way. The two are separate calls, not one merged stream, because ChEMBL sorts null-potency rows *first* under a descending potency sort
-- Numerics are coerced from upstream JSON strings to `number | null` at the service boundary — a missing potency reads as `null`, never `0`
-- A popular target carries tens of thousands of measurements: when the set exceeds the inline preview it **spills** to a DataCanvas table — call `chembl_dataframe_describe` for its columns, then `chembl_dataframe_query` for honest aggregates across the staged set — while the inline preview answers the immediate question. Each view stages its own table (`bioactivities` / `bioactivities_null_potency`), so running both against one `canvas_id` lets a `UNION ALL` rebuild the full set
-- The staged table is capped at `CHEMBL_MAX_SPILL_ROWS` (default 50,000), which also bounds the upstream page walk behind it. When the cap is hit, `truncated: true` and `staged_row_count` say so on both response surfaces — the table is a bounded slice, not the complete view; narrow with `standard_type` / `pchembl_value_min` to fit
-- The inline rows are always capped at `limit` (default 25) — spilled, fit inline, or canvas off — so compare that count against `totalCount` before treating them as the whole answer. Spilling the rest requires `CANVAS_PROVIDER_TYPE=duckdb`; without it the inline preview is all there is
-- The optional `canvas_id` reuses an existing canvas, but a view's table is always re-registered — a second query of the same view **replaces** its prior rows rather than appending; omit `canvas_id` to mint a fresh one
+- Supply at least one of `molecule_chembl_id` or `target_chembl_id`; supplying both narrows to that compound–target pair — neither is a `missing_filter` error
+- Filter by `standard_type` (IC50/Ki/EC50/…), `pchembl_value_min`, `assay_type`, `organism`; ranked on `pchembl_value` — comparable only within one `standard_type`
+- `potency_view` selects `potency_ranked` (default, measurements with a derivable `pchembl_value`) or `null_potency` (the excluded rows); `pchembl_value_min` with `null_potency` is a `contradictory_potency_filter` error, and `totalCount` spans both views
+- Numerics are coerced to `number | null` at the service boundary — a missing potency reads as `null`, never `0`
+- Large sets spill to a DataCanvas table per view (`bioactivities` / `bioactivities_null_potency`), capped at `CHEMBL_MAX_SPILL_ROWS` (default 50,000) and reported `truncated: true` + `staged_row_count` when hit; requires `CANVAS_PROVIDER_TYPE=duckdb`
+- The inline preview is always capped at `limit` (default 25) regardless of spill status; the optional `canvas_id` reuses a canvas, but re-querying the same view replaces its prior rows
 
 ---
 
-### `chembl_search_targets`
+### `chembl_search_targets` <sub>tool</sub>
 
-Resolve a protein into the ChEMBL target ID downstream tools need.
-
-- Supply at least one of `accession` (UniProt, e.g. `P00533`), `gene_symbol` (e.g. `EGFR`), or `query` (free-text name); narrow further with `organism` and `target_type`
-- A UniProt accession is the most precise input — chain it from a `uniprot` / `protein` server
-- Each row carries the target type, organism, and component UniProt accessions + gene symbols (flattened from ChEMBL's nested component synonyms)
-- Results past `limit` are reachable the same way `chembl_search_molecules` does it — a `nextCursor` when more remain, passed back as `cursor`, omitted on the last page
+- Supply at least one of `accession` (UniProt, e.g. `P00533`), `gene_symbol`, or `query` (free-text); narrow with `organism` and `target_type` — none supplied is a `missing_input` error
+- A UniProt accession is the most precise input — chain it from a `uniprot`/`protein` server
+- Each row carries target type, organism, and component UniProt accessions + gene symbols, flattened from ChEMBL's nested component synonyms
+- Paginated via `nextCursor` / `cursor`, the same contract as `chembl_search_molecules`
 - Chain `target_chembl_id` into `chembl_get_bioactivities`
 
 ---
 
-### `chembl_get_drug_info`
+### `chembl_get_drug_info` <sub>tool</sub>
 
-Drug pharmacology for a molecule — distinct from the `openfda` server's label / adverse-event view.
-
-- Supply `molecule_chembl_id` (from `chembl_search_molecules`)
-- Returns mechanism(s) of action, the molecular target(s), action type (inhibitor / agonist / …), first-approval year, and clinical indications with the max phase reached for each
-- Composed from molecule + mechanisms + indications with `Promise.allSettled`, so a rejected mechanism or indication list degrades to a disclosed partial result rather than failing the call
-- Each list carries its own retrieval state — `mechanisms_status` / `indications_status` (`complete` / `truncated` / `failed`) next to `mechanisms_total_count` / `indications_total_count`, so an empty array is authoritative only when the status is `complete`
-- A mechanism's `target_chembl_id` chains into `chembl_get_bioactivities` for compounds hitting the same target
+- Supply `molecule_chembl_id`; returns mechanism(s) of action, molecular target(s), action type, first-approval year, and clinical indications with the max phase reached for each
+- Mechanisms and indications are fetched with `Promise.allSettled`, so a rejected list degrades to a disclosed partial result rather than failing the call
+- Each list carries its own `mechanisms_status` / `indications_status` (`complete` / `truncated` / `failed`) next to a `*_total_count` — an empty array is authoritative only when the status is `complete`
+- A mechanism's `target_chembl_id` chains into `chembl_get_bioactivities`
 
 ---
 
-### `chembl_get_assay`
-
-Assay provenance behind a bioactivity row — call it to judge whether two measurements are comparable before ranking them together.
+### `chembl_get_assay` <sub>tool</sub>
 
 - Supply `assay_chembl_id` from a `chembl_get_bioactivities` row
-- Returns the description, assay type (binding / functional / ADMET / toxicity), the target it measures, organism, and ChEMBL's 1–9 confidence score (9 = direct assay on the protein target, lower = homologous or indirect)
+- Returns description, assay type (binding / functional / ADMET / toxicity), the target measured, organism, and ChEMBL's 1–9 confidence score (9 = direct assay on the protein target, lower = homologous or indirect)
+- Call it to judge whether two measurements are comparable before ranking them together
 
 ---
 
-### `chembl_dataframe_query` / `chembl_dataframe_describe` / `chembl_dataframe_drop`
+### `chembl_dataframe_query` <sub>tool</sub>
 
-In-conversation SQL analytics over the bioactivity tables that `chembl_get_bioactivities` spills to a DuckDB-backed canvas. When a query spills, the tool returns a `canvas_id` and the `table_name` it staged; pass the canvas ID to `chembl_dataframe_query` for ranking, grouping, deduplication, and aggregation across the full set — standard DuckDB SQL.
+- Accepts a single read-only `SELECT` against a `canvas_id` from a spilled `chembl_get_bioactivities` call; writes, DDL, and non-SELECT statements are rejected by the framework SQL gate
+- Reference each staged table by the name `chembl_get_bioactivities` returned — `bioactivities` (potency_ranked) or `bioactivities_null_potency` (null_potency); discover columns with `chembl_dataframe_describe` first
+- Two independent bounds, each disclosed: `truncated` is the canvas engine's own query-result cap; `rendered_rows` is how many rows the `content[]` markdown table holds under its character budget — either can trip without the other; page past both with SQL `LIMIT`/`OFFSET`
+- `structuredContent.rows` always carries the full materialized result regardless of the render bound
+- Requires `CANVAS_PROVIDER_TYPE=duckdb`, else a `canvas_disabled` error
 
-- **Read-only.** `chembl_dataframe_query` accepts a single `SELECT`; writes, DDL, and non-SELECT statements are rejected by the framework SQL gate. Reference each staged table by the name `chembl_get_bioactivities` returned (`bioactivities` for the `potency_ranked` view, `bioactivities_null_potency` for `null_potency`), and discover its columns with `chembl_dataframe_describe` first.
-- Each spilled table holds the **full** `Activity` row — the same 18 columns including the normalized `standard_*` / `pchembl_value` fields (rank on these) and the raw upstream `type` / `value` / `units` / `relation` (audit only). Compute aggregates here, never over the inline preview.
-- **Two independent bounds, both disclosed.** `truncated` means the canvas engine's own query-result cap was hit. `rendered_rows` reports how many rows the markdown table in `content[]` actually carried — that table is bounded by a character budget rather than a row count, so wide and narrow rows differ several-fold at the same byte cost. Either bound can trip without the other. `structuredContent.rows` always carries the full materialized result; to reach rows past either bound, page with SQL `LIMIT` / `OFFSET`.
-- `chembl_dataframe_drop` is the only destructive tool and is **opt-in** (`CHEMBL_DATAFRAME_DROP_ENABLED=true`) — absent from `tools/list` when off, because per-table and per-canvas TTL already reclaim staged tables. It still appears in the server manifest and landing page while off, carrying the flag needed to enable it. Reach for it only to free a large table early in a long session.
-- All three require `CANVAS_PROVIDER_TYPE=duckdb`; without it they return a `canvas_disabled` error and `chembl_get_bioactivities` degrades to a preview-only response.
+---
 
-## Resources and prompts
+### `chembl_dataframe_describe` <sub>tool</sub>
 
-| Type | Name | Description |
-|:---|:---|:---|
-| Resource | `chembl://molecule/{chemblId}` | A molecule record by ChEMBL ID — the same shape a `chembl_search_molecules` row carries (ID, names, structures, properties, max clinical phase). |
-| Resource | `chembl://target/{chemblId}` | A target record by ChEMBL target ID — preferred name, type, organism, and component UniProt accessions + gene symbols. |
+- Supply a `canvas_id` from a spilled `chembl_get_bioactivities` call
+- Returns each staged table/view with its row count, kind, and column names + types
+- Requires `CANVAS_PROVIDER_TYPE=duckdb`, else a `canvas_disabled` error
 
-All resource data is also reachable via the tools, so tool-only MCP clients lose nothing — the resources are convenience injectable-context mirrors of the per-record fetch. `{chemblId}` is validated against the `CHEMBL\d+` pattern. There are no prompts; the canonical workflows are short tool chains an agent composes directly, and the cross-server chain guidance ships as server-level `instructions` instead.
+---
+
+### `chembl_dataframe_drop` <sub>tool</sub>
+
+- Opt-in — registered only when `CHEMBL_DATAFRAME_DROP_ENABLED=true`; absent from `tools/list` when off, though it still appears in the server manifest carrying the enable hint
+- Drops a named staged table by `canvas_id` + `table_name`; returns `dropped: true` if it existed, `false` if already gone
+- Rarely needed — per-table and per-canvas TTL already reclaim staged tables; reach for it only to free a large table early in a long session
+- Requires `CANVAS_PROVIDER_TYPE=duckdb`
+
+---
+
+### `chembl://molecule/{chemblId}` <sub>resource</sub>
+
+- Molecule record as `application/json` — the same shape a `chembl_search_molecules` row carries (ID, names, structures, properties, max clinical phase)
+- `chemblId` is validated against the `CHEMBL\d+` pattern
+- Fully covered by the tool surface — a convenience injectable-context mirror of the per-record fetch
+
+---
+
+### `chembl://target/{chemblId}` <sub>resource</sub>
+
+- Target record as `application/json` — preferred name, type, organism, and component UniProt accessions + gene symbols
+- `chemblId` is validated against the `CHEMBL\d+` pattern
+- Fully covered by the tool surface — a convenience injectable-context mirror of the per-record fetch
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool and resource definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Typed error contracts with recovery hints (`missing_filter`, `missing_input`, `canvas_disabled`)
-- Pluggable auth (`none`, `jwt`, `oauth`) and swappable storage backends
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 ChEMBL-specific:
 
-- Single keyless upstream client for the ChEMBL REST data API — Django-style filtered URL builder, `page_meta` pagination, `withRetry`-wrapped fetch + parse
-- String → `number | null` numeric coercion at the service boundary (a missing potency becomes `null`, never `0` — the scientific-data fidelity rule)
-- Bidirectional bioactivity: one tool serves both compound→target and target→compound, ranked on `pchembl_value`
+- Bidirectional bioactivity bridge — one tool serves both compound→target and target→compound, ranked on `pchembl_value`
 - Structure search (exact / similarity / substructure) consolidated under one discovery tool via a `search_type` enum
-- DataCanvas spill on the flagship: tens-of-thousands-of-row activity sets stream to a DuckDB table you inspect with `chembl_dataframe_describe` and query via `chembl_dataframe_query`
-- Server-level `instructions` carry the cross-server chain guidance and the ChEMBL CC BY-SA 3.0 attribution
+- String → `number | null` numeric coercion at the service boundary — a missing potency becomes `null`, never `0`
+- DataCanvas spill on the flagship tool — tens-of-thousands-of-row activity sets stream to a DuckDB table you inspect with `chembl_dataframe_describe` and query via `chembl_dataframe_query`
+- Server-level `instructions` carry the cross-server chain guidance and the ChEMBL CC BY-SA 3.0 attribution requirement
 
 Agent-friendly output:
 
 - Provenance on every response — total-found counts, applied-filter echo, and a spill notice so agents know whether the preview is the full set or a slice of a canvas table
-- Truncation disclosure — capped search results report `shown` / `cap` / `totalCount` so a page is never mistaken for the complete set
-- Typed, recoverable errors — `missing_filter` / `missing_input` / `canvas_disabled` carry recovery hints, so callers correct the call without parsing prose
+- Truncation disclosure — capped searches report `shown` / `cap` / `totalCount`, and spilled tables report `truncated` + `staged_row_count`, so a page or slice is never mistaken for the complete set
+- Typed, recoverable errors — `missing_filter` / `missing_input` / `contradictory_potency_filter` / `canvas_disabled` carry recovery hints, so callers correct the call without parsing prose
 - Never fabricates — normalization and `format()` preserve `null` potency / units; a missing measurement renders as "not reported", never `0`
 
 ## Getting started
@@ -234,7 +245,7 @@ To unlock the analytical SQL path (the `bioactivities` spill and the `chembl_dat
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - Optional: set `CANVAS_PROVIDER_TYPE=duckdb` to enable the DataCanvas SQL path for large bioactivity sets.
 
 ### Installation
@@ -342,7 +353,7 @@ See [`CLAUDE.md`/`AGENTS.md`](./CLAUDE.md) for development guidelines and archit
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck
