@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-09-19 · ⚠️ Breaking
+
+Adopts mcp-ts-core 0.12.3 → 0.13.6: canvas_id inputs now validate against the minted id shape (breaking), sessionMode is declared explicitly, and a caller disconnect or a transient upstream 500 classifies correctly instead of failing the call outright.
+
 ## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-08-25
 
 Adopts mcp-ts-core 0.12.3 (MCP SDK v2): tool inputs reject an undeclared key by name, outputSchema declares the error envelope, and MCP_SESSION_MODE now defaults to stateless. Also fixes a Docker multi-arch build crash under QEMU.
