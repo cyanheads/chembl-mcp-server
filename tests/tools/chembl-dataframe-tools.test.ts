@@ -22,6 +22,15 @@ afterEach(() => {
   setCanvas(undefined);
 });
 
+/**
+ * A `canvas_id` of the minted shape (`CanvasIdSchema`, `^[A-Za-z0-9_-]{10}$`)
+ * that no canvas in these tests holds. The tools advertise that shape on their
+ * `canvas_id` input, so a placeholder has to satisfy it to reach the handler at
+ * all — a shorter one is rejected at argument validation and never exercises the
+ * branch under test.
+ */
+const UNHELD_CANVAS_ID = 'Ab3_xY-9Qz';
+
 /** Acquire a fresh canvas, register a `bioactivities` table on it, return the id. */
 async function seedCanvas(fake: FakeDataCanvas, rows: Record<string, unknown>[]): Promise<string> {
   const instance = await fake.acquire(undefined, { tenantId: 'default' });
@@ -33,7 +42,10 @@ describe('canvas_disabled error contract (all three tools)', () => {
   it('chembl_dataframe_query throws ctx.fail("canvas_disabled") with InvalidParams', async () => {
     setCanvas(undefined);
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
-    const input = chemblDataframeQuery.input.parse({ canvas_id: 'x', sql: 'SELECT 1' });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: UNHELD_CANVAS_ID,
+      sql: 'SELECT 1',
+    });
     await expect(chemblDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.InvalidParams,
       data: { reason: 'canvas_disabled' },
@@ -43,7 +55,7 @@ describe('canvas_disabled error contract (all three tools)', () => {
   it('chembl_dataframe_describe throws ctx.fail("canvas_disabled")', async () => {
     setCanvas(undefined);
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeDescribe.errors });
-    const input = chemblDataframeDescribe.input.parse({ canvas_id: 'x' });
+    const input = chemblDataframeDescribe.input.parse({ canvas_id: UNHELD_CANVAS_ID });
     await expect(chemblDataframeDescribe.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'canvas_disabled' },
     });
@@ -52,7 +64,10 @@ describe('canvas_disabled error contract (all three tools)', () => {
   it('chembl_dataframe_drop throws ctx.fail("canvas_disabled")', async () => {
     setCanvas(undefined);
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeDrop.errors });
-    const input = chemblDataframeDrop.input.parse({ canvas_id: 'x', table_name: 'bioactivities' });
+    const input = chemblDataframeDrop.input.parse({
+      canvas_id: UNHELD_CANVAS_ID,
+      table_name: 'bioactivities',
+    });
     await expect(chemblDataframeDrop.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'canvas_disabled' },
     });
@@ -155,7 +170,7 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     setCanvas(fake.cast());
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
-      canvas_id: 'fake_doesnotexist',
+      canvas_id: UNHELD_CANVAS_ID,
       sql: 'SELECT 1',
     });
     // The fake throws NotFound for an unknown id, mirroring the real acquire.
@@ -353,7 +368,10 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
   it('carries the declared recovery hint on canvas_disabled', async () => {
     setCanvas(undefined);
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
-    const input = chemblDataframeQuery.input.parse({ canvas_id: 'x', sql: 'SELECT 1' });
+    const input = chemblDataframeQuery.input.parse({
+      canvas_id: UNHELD_CANVAS_ID,
+      sql: 'SELECT 1',
+    });
     await expect(chemblDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
       data: { recovery: { hint: expect.stringContaining('CANVAS_PROVIDER_TYPE=duckdb') } },
     });

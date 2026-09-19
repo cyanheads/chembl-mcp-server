@@ -13,6 +13,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor.js';
 
@@ -107,9 +108,9 @@ export const chemblDataframeQuery = tool('chembl_dataframe_query', {
     "Run a read-only SQL SELECT over the bioactivity rows chembl_get_bioactivities spilled to a canvas — rank, group, dedupe, and aggregate across the FULL set, not the inline preview. Reference each staged table by the name chembl_get_bioactivities returned — bioactivities for its potency_ranked view, bioactivities_null_potency for null_potency; discover the staged tables and their columns with chembl_dataframe_describe. Compute honest aggregates here (e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities WHERE standard_type = 'IC50' GROUP BY 1 ORDER BY 2 DESC). Two independent bounds apply, each reported on its own field: truncated is true when the SQL result exceeded the canvas row cap, and rendered_rows says how many of the returned rows the markdown table holds once its character budget is reached (below row_count on a wide or long result). Page past either bound with SQL LIMIT/OFFSET — append e.g. LIMIT 500 OFFSET 500 and re-call; offsets reach rows beyond the canvas row cap. Requires CANVAS_PROVIDER_TYPE=duckdb.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    canvas_id: z
-      .string()
-      .describe('Canvas ID returned by chembl_get_bioactivities (spilled: true).'),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by chembl_get_bioactivities (spilled: true).',
+    ),
     sql: z
       .string()
       .describe(

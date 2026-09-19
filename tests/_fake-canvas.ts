@@ -74,7 +74,14 @@ export class FakeDataCanvas {
       return this.makeInstance(existing, false);
     }
     this.idCounter += 1;
-    const canvasId = `fake_${this.idCounter.toString(36).padStart(6, '0')}`;
+    /**
+     * Ten characters from the minted alphabet, matching the framework's
+     * `CanvasIdSchema` (`^[A-Za-z0-9_-]{10}$`). The tools declare their
+     * `canvas_id` INPUT with that schema, so an id this fake hands back has to
+     * survive a round trip through `input.parse` — a wider fake id would let a
+     * test pass on a value no real canvas could mint.
+     */
+    const canvasId = `fake_${this.idCounter.toString(36).padStart(5, '0')}`;
     const state: FakeCanvasState = {
       canvasId,
       tenantId,

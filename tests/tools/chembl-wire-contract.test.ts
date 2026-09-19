@@ -10,7 +10,10 @@
  *      surfaces as a typo instead of as a wrong answer. No tool on this server
  *      proxies arbitrary upstream query parameters, so none opts back out with
  *      `.passthrough()` / `.catchall()`; this asserts that for all eight.
- *   2. Both consumption surfaces carry the same payload. `structuredContent` and
+ *   2. `canvas_id` INPUT fields advertise the minted id shape, so an impossible
+ *      value is rejected at argument validation; the OUTPUT field stays a plain
+ *      string, since a minted id is reported rather than validated.
+ *   3. Both consumption surfaces carry the same payload. `structuredContent` and
  *      `content[]` are read by different clients, on success (domain fields +
  *      enrichment trailer) and on failure (the declared `error` envelope).
  *
@@ -34,6 +37,9 @@ import { chemblSearchMolecules } from '@/mcp-server/tools/definitions/chembl-sea
 import { chemblSearchTargets } from '@/mcp-server/tools/definitions/chembl-search-targets.tool.js';
 import { initChemblService } from '@/services/chembl/chembl-service.js';
 
+/** A `canvas_id` of the shape `CanvasIdSchema` advertises (`^[A-Za-z0-9_-]{10}$`). */
+const MINTED_CANVAS_ID = 'Ab3_xY-9Qz';
+
 /** Every tool this server defines, with an otherwise-valid argument set. */
 const TOOLS = [
   { def: chemblSearchMolecules, valid: { query: 'aspirin' } },
@@ -41,9 +47,12 @@ const TOOLS = [
   { def: chemblSearchTargets, valid: { accession: 'P00533' } },
   { def: chemblGetDrugInfo, valid: { molecule_chembl_id: 'CHEMBL941' } },
   { def: chemblGetAssay, valid: { assay_chembl_id: 'CHEMBL674637' } },
-  { def: chemblDataframeQuery, valid: { canvas_id: 'c1', sql: 'SELECT 1' } },
-  { def: chemblDataframeDescribe, valid: { canvas_id: 'c1' } },
-  { def: chemblDataframeDrop, valid: { canvas_id: 'c1', table_name: 'bioactivities' } },
+  { def: chemblDataframeQuery, valid: { canvas_id: MINTED_CANVAS_ID, sql: 'SELECT 1' } },
+  { def: chemblDataframeDescribe, valid: { canvas_id: MINTED_CANVAS_ID } },
+  {
+    def: chemblDataframeDrop,
+    valid: { canvas_id: MINTED_CANVAS_ID, table_name: 'bioactivities' },
+  },
 ] as const;
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -95,6 +104,58 @@ describe('tool input roots are strict', () => {
     for (const { def, valid } of TOOLS) {
       expect(def.input.safeParse(valid).success).toBe(true);
     }
+  });
+});
+
+/**
+ * Every tool carrying a `canvas_id` INPUT field, and whether it is required. The
+ * output `canvas_id` on chembl_get_bioactivities is a plain string and is not
+ * listed — a minted id is the server's to report, not the caller's to satisfy.
+ */
+const CANVAS_ID_INPUTS = [
+  { def: chemblGetBioactivities, rest: { molecule_chembl_id: 'CHEMBL25' } },
+  { def: chemblDataframeQuery, rest: { sql: 'SELECT 1' } },
+  { def: chemblDataframeDescribe, rest: {} },
+  { def: chemblDataframeDrop, rest: { table_name: 'bioactivities' } },
+] as const;
+
+describe('canvas_id input shape', () => {
+  it.each(CANVAS_ID_INPUTS.map((t) => [t.def.name, t] as const))(
+    '%s accepts a minted canvas id',
+    (_name, { def, rest }) => {
+      expect(def.input.safeParse({ ...rest, canvas_id: MINTED_CANVAS_ID }).success).toBe(true);
+    },
+  );
+
+  /**
+   * `CanvasIdSchema` puts the minted `^[A-Za-z0-9_-]{10}$` shape into the
+   * advertised `inputSchema`, so an id that could never have been minted is
+   * rejected at argument validation and the handler never runs. Without it the
+   * call reached `canvas.acquire` and came back as a missing-or-expired canvas,
+   * which reads as "your canvas went away" for a value that was never one.
+   */
+  it.each(CANVAS_ID_INPUTS.map((t) => [t.def.name, t] as const))(
+    '%s rejects an id that could not have been minted',
+    (_name, { def, rest }) => {
+      for (const bad of ['x', 'Ab3_xY-9Qz0', 'Ab3_xY 9Qz', '']) {
+        expect(
+          def.input.safeParse({ ...rest, canvas_id: bad }).success,
+          `canvas_id ${JSON.stringify(bad)} must be rejected`,
+        ).toBe(false);
+      }
+    },
+  );
+
+  it('leaves the OUTPUT canvas_id a plain string — a minted id is reported, not validated', () => {
+    const shape = chemblGetBioactivities.output.shape;
+    expect(shape.canvas_id.safeParse('anything-at-all').success).toBe(true);
+    expect(shape.canvas_id.safeParse(null).success).toBe(true);
+  });
+
+  it('omits canvas_id entirely on the optional field', () => {
+    expect(chemblGetBioactivities.input.safeParse({ molecule_chembl_id: 'CHEMBL25' }).success).toBe(
+      true,
+    );
   });
 });
 

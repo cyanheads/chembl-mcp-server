@@ -13,7 +13,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { spillover } from '@cyanheads/mcp-ts-core/canvas';
+import { CanvasIdSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas-accessor.js';
@@ -246,12 +246,9 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       .describe(
         'Maximum rows in the inline preview. Defaults to the server default (25). The full set still spills to the canvas.',
       ),
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        "Optional canvas ID from a prior call to reuse the same canvas. Each potency_view re-stages its own table, so a second query of the SAME view REPLACES (overwrites) its prior rows — it does not append — while the other view's table is left intact, which is what lets both coexist on one canvas. Omit to mint a fresh canvas.",
-      ),
+    canvas_id: CanvasIdSchema.optional().describe(
+      "Optional canvas ID from a prior call to reuse the same canvas. Each potency_view re-stages its own table, so a second query of the SAME view REPLACES (overwrites) its prior rows — it does not append — while the other view's table is left intact, which is what lets both coexist on one canvas. Omit to mint a fresh canvas.",
+    ),
   }),
   output: z.object({
     activities: z

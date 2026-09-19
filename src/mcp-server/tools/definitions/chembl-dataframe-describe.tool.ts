@@ -5,6 +5,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor.js';
 
@@ -14,9 +15,9 @@ export const chemblDataframeDescribe = tool('chembl_dataframe_describe', {
     'List the tables and columns staged on a canvas by chembl_get_bioactivities — inspect before calling chembl_dataframe_query to write correct SQL. Returns each table with its row count, kind (table | view), and column names + types. Requires CANVAS_PROVIDER_TYPE=duckdb.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    canvas_id: z
-      .string()
-      .describe('Canvas ID returned by chembl_get_bioactivities (spilled: true).'),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by chembl_get_bioactivities (spilled: true).',
+    ),
   }),
   output: z.object({
     tables: z
