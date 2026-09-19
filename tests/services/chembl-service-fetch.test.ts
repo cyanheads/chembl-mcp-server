@@ -91,6 +91,14 @@ function expectLeakFree(err: unknown): asserts err is McpError {
   expect(JSON.stringify(data)).not.toContain(SECRET_BODY);
 }
 
+/**
+ * A non-retryable upstream rejection. A 400 sanitizes to `validationError`, which
+ * sits outside `withRetry`'s transient set, so a composed list reaches its
+ * terminal `failed` state on the first attempt rather than after the full backoff
+ * ladder. The retryable 5xx path has its own suite below.
+ */
+const REJECTED_STATUS = 400;
+
 /** Run an async call expected to throw and return the thrown value. */
 async function captureThrow(run: () => Promise<unknown>): Promise<unknown> {
   try {
@@ -304,6 +312,41 @@ describe('sanitizeUpstreamError — code mapping (security unit)', () => {
   });
 });
 
+describe('ChemblService — retry classification through fetchJson', () => {
+  /**
+   * A 5xx is transient, so `fetchJson`'s `withRetry` boundary re-attempts it: an
+   * upstream blip resolves inside one call instead of surfacing as a failure. A
+   * 4xx is deterministic and fails on the first attempt — retrying it would only
+   * burn the caller's latency on an answer that cannot change. The split is what
+   * decides whether a composed list in `getDrugInfo` degrades immediately or
+   * after the backoff ladder, so it is pinned here rather than inferred.
+   */
+  it('retries a transient upstream 500 and succeeds on the next attempt', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error_message: 'boom' }, 500))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          mechanisms: [{ mechanism_of_action: 'COX inhibitor' }],
+          page_meta: { total_count: 1 },
+        }),
+      );
+    const page = await new ChemblService(config).getMechanisms('CHEMBL25', ctx());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(page.items).toHaveLength(1);
+    expect(page.totalCount).toBe(1);
+  });
+
+  it('fails a deterministic 400 on the first attempt without retrying', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error_message: 'bad filter' }, 400));
+    const thrown = await captureThrow(() =>
+      new ChemblService(config).getMechanisms('CHEMBL25', ctx()),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expectLeakFree(thrown);
+    expect((thrown as McpError).code).toBe(JsonRpcErrorCode.ValidationError);
+  });
+});
+
 describe('ChemblService.getAssay — normalization', () => {
   it('decodes confidence_score and assay_type, coercing a string score to number', async () => {
     fetchMock.mockResolvedValueOnce(
@@ -363,13 +406,15 @@ describe('ChemblService.getTarget — single fetch + flattening', () => {
 
 describe('ChemblService.getDrugInfo — Promise.allSettled composition', () => {
   it('degrades both secondary lists to an explicit failed state when they fail', async () => {
-    // 1st fetch = molecule approval (ok); every later one = 500. A fresh Response per
-    // call: a shared one has its body consumed by the first read.
+    // 1st fetch = molecule approval (ok); every later one is rejected. A fresh
+    // Response per call: a shared one has its body consumed by the first read.
     fetchMock
       .mockResolvedValueOnce(
         jsonResponse({ pref_name: 'GEFITINIB', max_phase: '4', first_approval: 2003 }),
       )
-      .mockImplementation(() => Promise.resolve(jsonResponse({ error_message: 'boom' }, 500)));
+      .mockImplementation(() =>
+        Promise.resolve(jsonResponse({ error_message: 'boom' }, REJECTED_STATUS)),
+      );
     const info = await new ChemblService(config).getDrugInfo('CHEMBL939', ctx());
     expect(info).toMatchObject({
       molecule_chembl_id: 'CHEMBL939',
@@ -484,7 +529,7 @@ describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
 
   it('reports a rejected list as failed with an unknown count, not as empty', async () => {
     route(
-      () => jsonResponse({ error_message: 'boom' }, 500),
+      () => jsonResponse({ error_message: 'boom' }, REJECTED_STATUS),
       () =>
         jsonResponse({
           drug_indications: [{ mesh_heading: 'Pain' }],

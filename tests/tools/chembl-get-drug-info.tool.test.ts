@@ -243,11 +243,19 @@ describe('chembl_get_drug_info — truncation disclosure (#6)', () => {
   });
 });
 
+/**
+ * A NON-retryable upstream status, so a rejected list reaches its terminal
+ * `failed` state on the first attempt — these tests are about the disclosure,
+ * not about retry timing. The retryable 5xx path is pinned in
+ * `chembl-service-fetch`.
+ */
+const REJECTED_STATUS = 400;
+
 describe('chembl_get_drug_info — partial-result disclosure (#11)', () => {
   it('discloses the failure when exactly one secondary endpoint fails', async () => {
     routeFetch([
       { match: '/molecule/', body: APPROVAL },
-      { match: '/mechanism.json', body: { error_message: 'boom' }, status: 500 },
+      { match: '/mechanism.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
       {
         match: '/drug_indication.json',
         body: {
@@ -282,8 +290,8 @@ describe('chembl_get_drug_info — partial-result disclosure (#11)', () => {
   it('names both lists and never blames the molecule when both fail', async () => {
     routeFetch([
       { match: '/molecule/', body: APPROVAL },
-      { match: '/mechanism.json', body: { error_message: 'boom' }, status: 500 },
-      { match: '/drug_indication.json', body: { error_message: 'boom' }, status: 500 },
+      { match: '/mechanism.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
+      { match: '/drug_indication.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
     ]);
     const c = ctx();
     const result = await chemblGetDrugInfo.handler(
@@ -305,7 +313,7 @@ describe('chembl_get_drug_info — partial-result disclosure (#11)', () => {
     // one clobber the other.
     routeFetch([
       { match: '/molecule/', body: APPROVAL },
-      { match: '/mechanism.json', body: { error_message: 'boom' }, status: 500 },
+      { match: '/mechanism.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
       {
         match: '/drug_indication.json',
         body: { drug_indications: indicationRows(100), page_meta: { total_count: 167 } },
