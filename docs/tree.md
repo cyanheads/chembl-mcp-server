@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-09-19 20:53:18
+Generated on: 2026-09-26 21:12:59
 
 ```text
 chembl-mcp-server/
@@ -171,6 +171,7 @@ chembl-mcp-server/
 │   ├── tools/
 │   │   ├── chembl-bioactivities-preview-limit.test.ts
 │   │   ├── chembl-bioactivities-spill-cap.test.ts
+│   │   ├── chembl-canvas-precision.test.ts
 │   │   ├── chembl-dataframe-tools.test.ts
 │   │   ├── chembl-get-assay.tool.test.ts
 │   │   ├── chembl-get-bioactivities.tool.test.ts

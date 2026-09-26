@@ -13,7 +13,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { CanvasIdSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
+import { CanvasIdSchema, type ColumnType, spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas-accessor.js';
@@ -105,6 +105,33 @@ const ActivitySchema = z
     relation: z.string().nullable().describe('Original relation string from upstream.'),
   })
   .describe('One bioactivity measurement linking a compound, target, and assay.');
+
+/** Keep sparse or integer-only previews from narrowing later fractional measurements. */
+const ACTIVITY_COLUMNS = {
+  activity_id: 'BIGINT',
+  molecule_chembl_id: 'VARCHAR',
+  molecule_pref_name: 'VARCHAR',
+  target_chembl_id: 'VARCHAR',
+  target_pref_name: 'VARCHAR',
+  target_organism: 'VARCHAR',
+  assay_chembl_id: 'VARCHAR',
+  assay_type: 'VARCHAR',
+  assay_description: 'VARCHAR',
+  standard_type: 'VARCHAR',
+  standard_relation: 'VARCHAR',
+  standard_value: 'DOUBLE',
+  standard_units: 'VARCHAR',
+  pchembl_value: 'DOUBLE',
+  type: 'VARCHAR',
+  value: 'VARCHAR',
+  units: 'VARCHAR',
+  relation: 'VARCHAR',
+} satisfies Record<keyof Activity, ColumnType>;
+
+const ACTIVITY_CANVAS_SCHEMA = Object.entries(ACTIVITY_COLUMNS).map(([name, type]) => ({
+  name,
+  type,
+}));
 
 /**
  * Compose the agent-facing notice for a bioactivities result. Names which side of
@@ -328,6 +355,21 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
   },
   errors: [
     {
+      reason: 'not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'ChEMBL has no record for the requested identifier or structure.',
+      recovery:
+        'Verify the ChEMBL ID / SMILES, or discover it via chembl_search_molecules or chembl_search_targets.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'ChEMBL rate-limits the upstream request.',
+      recovery: 'Wait a few seconds and retry.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'missing_filter',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'Neither molecule_chembl_id nor target_chembl_id was supplied, so the query had nothing to scope to.',
@@ -467,6 +509,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       source: activityStream as AsyncIterable<Activity & Record<string, unknown>>,
       previewChars,
       tableName: VIEW[view].table,
+      schema: ACTIVITY_CANVAS_SCHEMA,
       // Bounds the spill drain, and with it the upstream page walk behind this
       // lazy stream (#14) — without it a catch-all target drains hundreds of
       // sequential ChEMBL pages in one call.
