@@ -60,7 +60,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const ctx = () => createMockContext({ tenantId: 'default' });
+const ctx = () => createMockContext({ tenantId: 'default', errors: chemblGetDrugInfo.errors });
 
 describe('chembl_get_drug_info — composition', () => {
   it('joins approval + mechanisms + indications for an approved drug', async () => {

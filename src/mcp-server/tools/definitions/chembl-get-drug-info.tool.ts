@@ -9,6 +9,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 import type { DrugInfo, ListStatus } from '@/services/chembl/types.js';
 
@@ -187,6 +188,24 @@ export const chemblGetDrugInfo = tool('chembl_get_drug_info', {
         'Disclosure of anything the two lists do not say for themselves: a list whose upstream fetch failed (so its emptiness means nothing), a list the page cap bounded, or — only when both lists came back complete and empty — that the molecule may be a research compound rather than a drug.',
       ),
   },
+
+  errors: [
+    {
+      reason: 'not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'ChEMBL has no record for the requested identifier or structure.',
+      recovery:
+        'Verify the ChEMBL ID / SMILES, or discover it via chembl_search_molecules or chembl_search_targets.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'ChEMBL rate-limits the upstream request.',
+      recovery: 'Wait a few seconds and retry.',
+      thrownBy: 'service',
+    },
+  ],
 
   async handler(input, ctx) {
     const id = input.molecule_chembl_id.trim();

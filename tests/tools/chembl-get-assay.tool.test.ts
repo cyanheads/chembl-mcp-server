@@ -34,7 +34,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const ctx = () => createMockContext({ tenantId: 'default' });
+const ctx = () => createMockContext({ tenantId: 'default', errors: chemblGetAssay.errors });
 
 describe('chembl_get_assay — provenance', () => {
   it('returns a fully-decoded assay with a coerced confidence score', async () => {

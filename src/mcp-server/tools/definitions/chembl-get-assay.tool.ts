@@ -7,6 +7,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 export const chemblGetAssay = tool('chembl_get_assay', {
@@ -53,6 +54,24 @@ export const chemblGetAssay = tool('chembl_get_assay', {
         'Human-readable confidence description, e.g. "Direct single protein target assigned". Null when absent.',
       ),
   }),
+
+  errors: [
+    {
+      reason: 'not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'ChEMBL has no record for the requested identifier or structure.',
+      recovery:
+        'Verify the ChEMBL ID / SMILES, or discover it via chembl_search_molecules or chembl_search_targets.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'ChEMBL rate-limits the upstream request.',
+      recovery: 'Wait a few seconds and retry.',
+      thrownBy: 'service',
+    },
+  ],
 
   async handler(input, ctx) {
     return await getChemblService().getAssay(input.assay_chembl_id.trim(), ctx);

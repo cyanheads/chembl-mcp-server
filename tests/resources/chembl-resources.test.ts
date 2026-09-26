@@ -6,6 +6,7 @@
  * @module tests/resources/chembl-resources
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
@@ -37,7 +38,25 @@ afterEach(() => {
 });
 
 const ctx = () =>
-  createMockContext({ tenantId: 'default', uri: new URL('chembl://molecule/CHEMBL25') });
+  createMockContext({
+    tenantId: 'default',
+    uri: new URL('chembl://molecule/CHEMBL25'),
+    errors: chemblMoleculeResource.errors,
+  });
+
+describe.each([chemblMoleculeResource, chemblTargetResource])('$name upstream errors', (def) => {
+  it('preserves the sanitized not-found reason and actionable recovery', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ internal: 'private diagnostic' }, 404));
+    await expect(def.handler({ chemblId: 'CHEMBL999' }, ctx())).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'not_found',
+        recovery: { hint: expect.stringContaining('Verify the ChEMBL ID') },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('chembl://molecule/{chemblId}', () => {
   it('returns a normalized molecule record for a valid ChEMBL ID', async () => {
@@ -84,7 +103,11 @@ describe('chembl://target/{chemblId}', () => {
     const params = chemblTargetResource.params!.parse({ chemblId: 'CHEMBL203' });
     const result = await chemblTargetResource.handler(
       params,
-      createMockContext({ tenantId: 'default', uri: new URL('chembl://target/CHEMBL203') }),
+      createMockContext({
+        tenantId: 'default',
+        uri: new URL('chembl://target/CHEMBL203'),
+        errors: chemblTargetResource.errors,
+      }),
     );
     expect(result).toMatchObject({
       target_chembl_id: 'CHEMBL203',

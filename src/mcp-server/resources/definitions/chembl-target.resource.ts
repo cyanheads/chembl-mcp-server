@@ -7,6 +7,7 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 export const chemblTargetResource = resource('chembl://target/{chemblId}', {
@@ -21,6 +22,24 @@ export const chemblTargetResource = resource('chembl://target/{chemblId}', {
       .regex(/^CHEMBL\d+$/, 'Must be a ChEMBL ID like CHEMBL203.')
       .describe('ChEMBL target ID, e.g. "CHEMBL203".'),
   }),
+
+  errors: [
+    {
+      reason: 'not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'ChEMBL has no record for the requested identifier or structure.',
+      recovery:
+        'Verify the ChEMBL ID / SMILES, or discover it via chembl_search_molecules or chembl_search_targets.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'ChEMBL rate-limits the upstream request.',
+      recovery: 'Wait a few seconds and retry.',
+      thrownBy: 'service',
+    },
+  ],
 
   handler(params, ctx) {
     return getChemblService().getTarget(params.chemblId, ctx);
