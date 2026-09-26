@@ -79,7 +79,10 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }]);
-    fake.nextQuery = { rows: [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }], truncated: false };
+    fake.queryResults = [
+      { rows: [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }], truncated: false },
+      { rows: [{ column_types: ['VARCHAR', 'DOUBLE'] }] },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -95,7 +98,10 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ a: 1 }]);
-    fake.nextQuery = { rows: [{ a: 1 }, { a: 2 }], truncated: true };
+    fake.queryResults = [
+      { rows: [{ a: 1 }, { a: 2 }], truncated: true },
+      { rows: [{ column_types: ['BIGINT'] }] },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -109,23 +115,26 @@ describe('chembl_dataframe_query — happy + boundary', () => {
   it('coerces BIGINT-string aggregates to numbers but preserves VARCHAR columns (#2)', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
-    // Seed so describe() reports column types: value is VARCHAR (raw passthrough),
-    // activity_id is BIGINT. DuckDB-Node serializes BIGINT/COUNT/SUM as JSON strings.
+    // DuckDB-Node serializes BIGINT/COUNT/SUM as JSON strings; projected types
+    // distinguish those strings from the raw VARCHAR value.
     const canvasId = await seedCanvas(fake, [
       { molecule_chembl_id: 'CHEMBL1', value: '500000', activity_id: 32770, pchembl_value: 7.4 },
     ]);
-    fake.nextQuery = {
-      rows: [
-        {
-          molecule_chembl_id: 'CHEMBL176582',
-          n: '5',
-          total_id: '65540',
-          value: '500000',
-          avg_p: 7.4,
-        },
-      ],
-      truncated: false,
-    };
+    fake.queryResults = [
+      {
+        rows: [
+          {
+            molecule_chembl_id: 'CHEMBL176582',
+            n: '5',
+            total_id: '65540',
+            value: '500000',
+            avg_p: 7.4,
+          },
+        ],
+        truncated: false,
+      },
+      { rows: [{ column_types: ['VARCHAR', 'BIGINT', 'HUGEINT', 'VARCHAR', 'DOUBLE'] }] },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -148,10 +157,13 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ a: 1 }]);
-    fake.nextQuery = {
-      rows: [{ big: '99999999999999999999', n: '7' }],
-      truncated: false,
-    };
+    fake.queryResults = [
+      {
+        rows: [{ big: '99999999999999999999', n: '7' }],
+        truncated: false,
+      },
+      { rows: [{ column_types: ['HUGEINT', 'INTEGER'] }] },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -232,7 +244,10 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 1000, molecule_chembl_id: 'CHEMBL0' }]);
-    fake.nextQuery = { rows: narrowRows(60), truncated: false };
+    fake.queryResults = [
+      { rows: narrowRows(60), truncated: false },
+      { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -255,7 +270,10 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
-    fake.nextQuery = { rows: wideRows(200), truncated: false };
+    fake.queryResults = [
+      { rows: wideRows(200), truncated: false },
+      { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -308,7 +326,7 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 1000 }]);
-    fake.nextQuery = { rows: [], truncated: false };
+    fake.queryResults = [{ rows: [], truncated: false }];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -325,17 +343,26 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ molecule_chembl_id: 'CHEMBL1', n: 5 }]);
-    fake.nextQuery = {
-      rows: [
-        {
-          molecule_chembl_id: 'CHEMBL1',
-          nested: { assay: { count: '5' } },
-          ids: ['CHEMBL2', 'CHEMBL3'],
-          n: '5',
-        },
-      ],
-      truncated: false,
-    };
+    fake.queryResults = [
+      {
+        rows: [
+          {
+            molecule_chembl_id: 'CHEMBL1',
+            nested: { assay: { count: '5' } },
+            ids: ['CHEMBL2', 'CHEMBL3'],
+            n: '5',
+          },
+        ],
+        truncated: false,
+      },
+      {
+        rows: [
+          {
+            column_types: ['VARCHAR', 'STRUCT(assay STRUCT(count VARCHAR))', 'VARCHAR[]', 'BIGINT'],
+          },
+        ],
+      },
+    ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,

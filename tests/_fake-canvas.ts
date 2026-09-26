@@ -35,7 +35,7 @@ interface FakeCanvasState {
 }
 
 /**
- * A scripted result for the next `instance.query(...)` call. When set, the fake
+ * A scripted result for an `instance.query(...)` call. When set, the fake
  * returns these rows verbatim (so the query-tool's row_count/truncated mapping is
  * testable). Cleared after one use.
  */
@@ -52,8 +52,8 @@ export interface ScriptedQuery {
  */
 export class FakeDataCanvas {
   readonly canvases = new Map<string, FakeCanvasState>();
-  /** Scripted result for the next query() call, consumed once. */
-  nextQuery: ScriptedQuery | undefined;
+  /** Scripted results consumed in query() call order. */
+  queryResults: ScriptedQuery[] = [];
   /** An error to throw on the next query() call (e.g. a canvas SQL-gate rejection). */
   nextQueryError: unknown;
   private idCounter = 0;
@@ -142,8 +142,7 @@ export class FakeDataCanvas {
           owner.nextQueryError = undefined;
           throw err;
         }
-        const scripted = owner.nextQuery;
-        owner.nextQuery = undefined;
+        const scripted = owner.queryResults.shift();
         const rows = scripted?.rows ?? [];
         return {
           rows,

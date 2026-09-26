@@ -27,10 +27,20 @@ import { getCanvas } from '@/services/canvas-accessor.js';
  */
 const RENDER_CHAR_BUDGET = 40_000;
 
-/** A DuckDB column type tag (sniffed or explicit) is integer-family — INTEGER, BIGINT, HUGEINT, … */
-function isIntegerColumnType(type: string): boolean {
-  return type.toUpperCase().includes('INT');
-}
+/** Whole DuckDB integer tags; ENUM labels, INTERVAL, and nested types must not match. */
+const INTEGER_TYPES = new Set([
+  'TINYINT',
+  'SMALLINT',
+  'INTEGER',
+  'BIGINT',
+  'HUGEINT',
+  'UTINYINT',
+  'USMALLINT',
+  'UINTEGER',
+  'UBIGINT',
+  'UHUGEINT',
+  'BIGNUM',
+]);
 
 /**
  * One cell as markdown-table-safe text. Structs and lists render as JSON —
@@ -78,20 +88,17 @@ function rowsWithinRenderBudget(rows: Record<string, unknown>[]): number {
  *   - A value is coerced only when it is a canonical integer string (/^-?\d+$/) AND
  *     `Number.isSafeInteger` holds — a value beyond 2^53 stays a string so precision
  *     is never silently lost (the documented boundary).
- *   - Genuine non-integer base columns are protected via the engine's column types
- *     (from describe()): the raw `value` passthrough is VARCHAR and can hold
- *     integer-looking strings, so it is left untouched. Derived/aggregate projections
- *     (COUNT/SUM results) have no base-table entry, so the integer-string + safe test
- *     governs them — exactly the columns the bug is about.
+ *   - Only integer-typed SQL projections are converted. Aliases, expressions,
+ *     and casts retain the types DuckDB assigned to the result itself.
  */
 function coerceIntegerStrings(
   rows: Record<string, unknown>[],
-  protectedColumns: Set<string>,
+  integerColumns: ReadonlyMap<string, boolean>,
 ): Record<string, unknown>[] {
   return rows.map((row) => {
     let mutated: Record<string, unknown> | undefined;
     for (const [col, val] of Object.entries(row)) {
-      if (protectedColumns.has(col)) continue; // known non-integer column (e.g. VARCHAR value)
+      if (!integerColumns.get(col)) continue;
       if (typeof val !== 'string' || !/^-?\d+$/.test(val)) continue;
       const num = Number(val);
       if (!Number.isSafeInteger(num)) continue; // beyond 2^53 — keep the string, never lose precision
@@ -152,21 +159,38 @@ export const chemblDataframeQuery = tool('chembl_dataframe_query', {
     // thrown by the DataCanvas primitive with structured data.reason — bubble them.
     const instance = await canvas.acquire(input.canvas_id, ctx);
 
-    // Column types from the staged tables guard the integer-coercion pass below:
-    // protect genuine non-integer columns (VARCHAR — e.g. the raw `value` passthrough)
-    // so their integer-looking strings survive, while true integer columns and
-    // aggregate projections get re-numbered. describe() is a cheap in-process call
-    // against the local DuckDB instance.
-    const tables = await instance.describe();
-    const protectedColumns = new Set<string>();
-    for (const table of tables) {
-      for (const col of table.columns) {
-        if (!isIntegerColumnType(col.type)) protectedColumns.add(col.name);
+    const result = await instance.query(input.sql, { signal: ctx.signal });
+    const integerColumns = new Map<string, boolean>();
+    if (result.rows.length > 0) {
+      /**
+       * DESCRIBE binds the already-gated query without executing or materializing
+       * it. A single aggregate row keeps metadata complete even with rowLimit=1.
+       * query() accepts the original SQL as a literal, including trailing comments
+       * and semicolons; only the metadata query is wrapped, never the data query.
+       */
+      const metadata = await instance.query(
+        `SELECT list(column_type) AS column_types FROM (DESCRIBE SELECT * FROM query('${input.sql.replaceAll("'", "''")}'))`,
+        { rowLimit: 1, signal: ctx.signal },
+      );
+      const columnTypes = z
+        .array(z.string())
+        .length(result.columns.length)
+        .parse(metadata.rows[0]?.column_types);
+      const occurrences = new Map<string, number>();
+      for (const [index, name] of result.columns.entries()) {
+        /**
+         * DuckDB-Node's row objects suffix repeated names with :1, :2, ...;
+         * query() uses different suffixes, so map by position, not metadata name.
+         * A later explicit alias can overwrite a generated key; its type wins too.
+         */
+        const occurrence = occurrences.get(name) ?? 0;
+        occurrences.set(name, occurrence + 1);
+        const key = occurrence === 0 ? name : `${name}:${occurrence}`;
+        // The parsed metadata array has exactly result.columns.length entries.
+        integerColumns.set(key, INTEGER_TYPES.has(columnTypes[index] as string));
       }
     }
-
-    const result = await instance.query(input.sql, { signal: ctx.signal });
-    const rows = coerceIntegerStrings(result.rows, protectedColumns);
+    const rows = coerceIntegerStrings(result.rows, integerColumns);
     return {
       rows,
       row_count: rows.length,

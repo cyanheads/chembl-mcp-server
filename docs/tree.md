@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-09-26 21:12:59
+Generated on: 2026-09-26 21:59:07
 
 ```text
 chembl-mcp-server/
@@ -177,6 +177,7 @@ chembl-mcp-server/
 │   │   ├── chembl-get-bioactivities.tool.test.ts
 │   │   ├── chembl-get-drug-info.tool.test.ts
 │   │   ├── chembl-input-gates.test.ts
+│   │   ├── chembl-query-types.test.ts
 │   │   ├── chembl-registration-gate.test.ts
 │   │   ├── chembl-search-molecules.tool.test.ts
 │   │   ├── chembl-search-targets.tool.test.ts
