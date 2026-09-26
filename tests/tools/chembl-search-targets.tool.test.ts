@@ -231,7 +231,7 @@ describe('chembl_search_targets — cursor pagination', () => {
     expect(enrichment.notice).not.toContain('Verify');
   });
 
-  it('rejects a malformed cursor with InvalidParams, unwrapped by a declared reason', async () => {
+  it('rejects a malformed cursor with InvalidParams and framework recovery', async () => {
     // `handler` is typed to allow a sync return, so normalize before catching.
     const err: unknown = await Promise.resolve(
       chemblSearchTargets.handler(
@@ -241,7 +241,10 @@ describe('chembl_search_targets — cursor pagination', () => {
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(McpError);
     expect((err as McpError).code).toBe(JsonRpcErrorCode.InvalidParams);
-    expect((err as McpError).data).not.toHaveProperty('reason');
+    expect((err as McpError).data).toMatchObject({
+      reason: 'invalid_cursor',
+      recovery: { hint: expect.any(String) },
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

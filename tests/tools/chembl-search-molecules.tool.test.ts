@@ -307,7 +307,7 @@ describe('chembl_search_molecules — cursor pagination', () => {
     expect(enrichment.notice).not.toContain('spelling');
   });
 
-  it('rejects a malformed cursor with InvalidParams, unwrapped by a declared reason', async () => {
+  it('rejects a malformed cursor with InvalidParams and framework recovery', async () => {
     // `handler` is typed to allow a sync return, so normalize before catching.
     const err: unknown = await Promise.resolve(
       chemblSearchMolecules.handler(
@@ -319,7 +319,10 @@ describe('chembl_search_molecules — cursor pagination', () => {
     expect((err as McpError).code).toBe(JsonRpcErrorCode.InvalidParams);
     // Straight from the framework's decodeCursor — never re-declared locally,
     // which would risk drifting off the -32602 the MCP pagination spec mandates.
-    expect((err as McpError).data).not.toHaveProperty('reason');
+    expect((err as McpError).data).toMatchObject({
+      reason: 'invalid_cursor',
+      recovery: { hint: expect.any(String) },
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
