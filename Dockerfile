@@ -32,27 +32,20 @@ RUN bun run build
 
 
 # ==============================================================================
-# Production Stage
+# Production Dependencies Stage
 #
-# This stage creates a minimal, optimized, and secure image for running the
-# application. It uses a slim base image and only includes production
-# dependencies and build artifacts.
+# Bun and the security scanner run natively; optional native packages are
+# selected explicitly for the target image. Running the scanner under QEMU
+# can abort with a JavaScriptCore MemoryExhaustion assertion.
 # ==============================================================================
-FROM oven/bun:1.4.2-slim AS production
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS production-dependencies
 
 WORKDIR /usr/src/app
 
-# Set the environment to production for performance and to ensure only
-# production dependencies are installed.
 ENV NODE_ENV=production
-
-# OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
-ARG APP_VERSION
-LABEL org.opencontainers.image.title="chembl-mcp-server"
-LABEL org.opencontainers.image.description="Link compounds to protein targets, rank bioactivity (IC50/Ki/EC50), and look up drug mechanisms and indications over ChEMBL via MCP. STDIO or Streamable HTTP."
-LABEL org.opencontainers.image.licenses="Apache-2.0"
-LABEL org.opencontainers.image.version="${APP_VERSION}"
-LABEL org.opencontainers.image.source="https://github.com/cyanheads/chembl-mcp-server"
+ARG TARGETARCH
+ARG TARGETOS
+ARG OTEL_ENABLED=true
 
 # Preserve the release-age gate and scanner for production installs.
 COPY package.json bun.lock bunfig.toml ./
@@ -68,20 +61,19 @@ COPY --from=build /usr/src/app/node_modules/@socketsecurity/bun-security-scanner
 # nothing needed at runtime is lost. The OTEL step below carries the same flag:
 # without it, that install re-resolves the graph and pulls every peer back in.
 #
-# This install is also what supplies the DataCanvas (DuckDB) native binary:
-# @duckdb/node-api pulls @duckdb/node-bindings, whose per-platform binaries are
-# optional dependencies gated on os/cpu, and this stage runs on the *target*
-# platform, so Bun resolves the binding for the architecture being built. Never
-# source that tree from the build stage — it is pinned to $BUILDPLATFORM and
-# would put arm64 bindings in a linux/amd64 image.
+# @duckdb/node-bindings selects its prebuilt native binary through optional
+# dependencies. Both installs must use the target OS/CPU, never the builder's
+# defaults. Only the scanner seed comes from the build dependency tree.
+# OTEL peers remain opt-out and use the installed framework's declared ranges.
 RUN --mount=type=cache,target=/root/.bun/install/cache \
-    bun install --production --omit=peer --frozen-lockfile --ignore-scripts
-
-# Conditionally install OpenTelemetry optional peer dependencies (Tier 3).
-# Installed by default; omit with --build-arg OTEL_ENABLED=false.
-# Resolve each package within the installed framework's declared peer range.
-ARG OTEL_ENABLED=true
-RUN --mount=type=cache,target=/root/.bun/install/cache \
+    set -eu; \
+    case "$TARGETARCH" in \
+      amd64) bun_cpu=x64 ;; \
+      arm64) bun_cpu=arm64 ;; \
+      *) echo "Unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    [ "$TARGETOS" = linux ] || { echo "Unsupported target OS: $TARGETOS" >&2; exit 1; }; \
+    bun install --production --omit=peer --frozen-lockfile --ignore-scripts --cpu="$bun_cpu" --os="$TARGETOS"; \
     if [ "$OTEL_ENABLED" = "true" ]; then \
       specs=$(bun -e ' \
         const { peerDependencies: peers } = await Bun.file("node_modules/@cyanheads/mcp-ts-core/package.json").json(); \
@@ -102,9 +94,32 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
         @opentelemetry/sdk-metrics \
         @opentelemetry/sdk-node \
         @opentelemetry/sdk-trace-node \
-        @opentelemetry/semantic-conventions) \
-      && bun add --omit=dev --omit=peer --ignore-scripts $specs; \
+        @opentelemetry/semantic-conventions); \
+      bun add --omit=dev --omit=peer --ignore-scripts --cpu="$bun_cpu" --os="$TARGETOS" $specs; \
     fi
+
+# ==============================================================================
+# Production Stage
+#
+# The slim target-platform runtime receives only production dependencies and
+# compiled JavaScript. No Bun process runs under emulation during this stage.
+# ==============================================================================
+FROM oven/bun:1.4.2-slim AS production
+
+WORKDIR /usr/src/app
+
+ENV NODE_ENV=production
+
+# OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+ARG APP_VERSION
+LABEL org.opencontainers.image.title="chembl-mcp-server"
+LABEL org.opencontainers.image.description="Link compounds to protein targets, rank bioactivity (IC50/Ki/EC50), and look up drug mechanisms and indications over ChEMBL via MCP. STDIO or Streamable HTTP."
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.version="${APP_VERSION}"
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/chembl-mcp-server"
+
+COPY --from=production-dependencies /usr/src/app/package.json /usr/src/app/bun.lock /usr/src/app/bunfig.toml ./
+COPY --from=production-dependencies /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist

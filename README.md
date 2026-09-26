@@ -333,7 +333,7 @@ docker build -t chembl-mcp-server .
 docker run --rm -e MCP_TRANSPORT_TYPE=stdio chembl-mcp-server
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/chembl-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them. DuckDB native bindings are installed for the runtime stage's target architecture so `CANVAS_PROVIDER_TYPE=duckdb` works on either image architecture.
+The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/chembl-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them. Dependency installation and security scanning run on the builder's native platform, with Bun's `--cpu` and `--os` selecting DuckDB bindings for the target `linux/amd64` or `linux/arm64` image. The slim runtime receives that production dependency tree, so `CANVAS_PROVIDER_TYPE=duckdb` works on either image architecture.
 
 ## Project structure
 
