@@ -76,9 +76,9 @@ const EXACT_MOLECULE_IDENTIFIER = /^(?:CHEMBL\d+|[A-Z]{14}-[A-Z]{10}-[A-Z])$/;
  *
  * The framework's `fetchWithTimeout` throws a status-mapped {@link McpError} on
  * any non-2xx / timeout / network failure, and its `data` carries raw upstream
- * internals — `statusCode`, `statusText`, `responseBody` (up to 500 bytes of the
- * upstream's error page), the internal `requestId`, the `operation`, and
- * `errorSource`. The framework ships `McpError.data` verbatim to the client in
+ * diagnostics — `statusCode`, `statusText`, `responseBody` (up to 500 bytes of the
+ * upstream's error page), and `errorSource`. The framework ships `McpError.data`
+ * verbatim to the client in
  * `structuredContent.error.data`, so letting that raw error escape leaks those
  * internals on a public server.
  *
@@ -256,8 +256,8 @@ export class ChemblService {
    *
    * Wraps the fetch so any upstream failure is re-thrown as a clean, leak-free
    * domain error ({@link sanitizeUpstreamError}). Without this catch the raw
-   * framework `McpError` — carrying `statusCode`, `responseBody`, `requestId`,
-   * and the internal URL in its `data` — would propagate to the client on a
+   * framework `McpError` — carrying `statusCode`, `responseBody`,
+   * and the upstream URL in its `data` — would propagate to the client on a
    * public server. This is the single chokepoint for every ChEMBL call.
    */
   private async fetchJson<T>(url: string, operation: string, ctx: Context): Promise<T> {

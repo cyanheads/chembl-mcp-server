@@ -55,7 +55,7 @@ await createApp({
   /**
    * No tool or resource on this surface calls `ctx.requestInput`, so nothing
    * needs a durable session to answer a mid-handler prompt. Declaring it here
-   * rather than leaving it to the framework's `auto` default is what makes a
+   * rather than leaving it to the framework's `auto` default (stateful) makes a
    * source run, the Dockerfile, and `.env.example` resolve alike;
    * `MCP_SESSION_MODE` still overrides whenever it carries a meaningful value.
    */

@@ -2,9 +2,9 @@
 
 **Server:** chembl-mcp-server
 **Version:** 0.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.9`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -32,9 +32,9 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 
 **Service** (`src/services/chembl/chembl-service.ts`): the single upstream client. Builds Django-style filtered `.json` URLs, paginates `page_meta`, coerces string numerics → `number | null` at the boundary (absent → `null`, never `0` — the scientific-fidelity rule), flattens nested upstream structures into the flat domain types in `types.ts`. Every fetch routes through `fetchJson`, which wraps the framework HTTP utility in `withRetry`.
 
-**Security invariant — upstream errors are sanitized at `fetchJson`.** The framework's `fetchWithTimeout` throws a status-mapped `McpError` whose `data` carries raw upstream internals (`statusCode`, `responseBody`, `requestId`, the internal URL), and the framework ships `McpError.data` verbatim to the client. `fetchJson`'s catch calls `sanitizeUpstreamError`, which detects the framework error STRUCTURALLY by `err.code` (never by message string) and re-throws a clean domain error (`notFound` / `validationError` / `timeout` / `rateLimited` / `serviceUnavailable`) whose `data` is leak-free (`reason` + recovery `hint`); the raw error rides as `cause` for server-side logs only. This is the single chokepoint for all eight tools and both resources — never bypass it by calling `fetchWithTimeout` directly from a handler. Regression-tested in `tests/services/chembl-service-fetch.test.ts`.
+**Security invariant — upstream errors are sanitized at `fetchJson`.** The framework's `fetchWithTimeout` throws status-mapped `McpError` values with upstream diagnostics such as response bodies. `McpError.data` reaches the client verbatim. `fetchJson` rethrows clean domain errors through `sanitizeUpstreamError`, preserving only a reason and recovery hint; the raw error stays on `cause`. Every upstream tool and resource declares the service's non-baseline `not_found` and `rate_limited` reasons with `thrownBy: 'service'`. Never bypass this boundary with a direct fetch from a handler. Regression coverage lives in `tests/services/chembl-service-fetch.test.ts`.
 
-**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table when `CANVAS_PROVIDER_TYPE=duckdb` — one per `potency_view` (`bioactivities` / `bioactivities_null_potency`), so both can coexist on one canvas and `UNION ALL` back into the honest full set; otherwise it inlines a preview and the `chembl_dataframe_*` tools return a `canvas_disabled` error. The spill passes `caps: { maxRows: config.maxSpillRows }`, which bounds the upstream page walk behind the lazy stream — a capped table reports `truncated: true` + `staged_row_count` on both response surfaces rather than passing itself off as complete. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`.
+**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table when `CANVAS_PROVIDER_TYPE=duckdb` — one per `potency_view` (`bioactivities` / `bioactivities_null_potency`), so both can coexist on one canvas and `UNION ALL` back into the honest full set; otherwise it inlines a preview and the `chembl_dataframe_*` tools return a `canvas_disabled` error. The spill passes `caps: { maxRows: config.maxSpillRows }`, which bounds the upstream page walk behind the lazy stream — a capped table reports `truncated: true` + `staged_row_count` on both response surfaces rather than passing itself off as complete. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`. Both views pass an explicit canvas schema: `standard_value` and `pchembl_value` are nullable `DOUBLE` columns, `activity_id` is `BIGINT`, and text fields stay `VARCHAR`. Never infer these types from preview rows; sparse or integer-only previews can silently narrow later fractional measurements.
 
 ---
 
@@ -45,6 +45,7 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 - **Use `ctx.state`** for tenant-scoped storage. Never access persistence directly.
 - **Need input the caller didn't supply?** `return ctx.requestInput(...)` and read `ctx.inputs` when the handler is re-entered. Never `await` for user input mid-handler.
 - **Secrets in env vars only** — never hardcoded.
+- **Cut noise.** Add only what earns its place: no speculative generality, no guards for states the framework already prevents (Zod-validated params, classified errors), no abstraction until a third caller proves it, no option nothing sets.
 - **Close the loop on issues.** When implementing work tracked by a GitHub issue, comment on the issue with what landed and close it. Do both — a comment without a close leaves stale issues open; a close without a comment leaves no record of what shipped. The comment is for future readers — state the concrete changes, not the conversation that produced them.
 
 ---
@@ -185,7 +186,7 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any serializable value. |
+| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts JSON-serializable values; reads return their JSON form (a `Date` becomes an ISO string). |
 | `ctx.requestInput` | Suspend and ask the caller for more input — `return ctx.requestInput({ inputRequests: { key: inputRequired.elicit({ message, requestedSchema }) } })`. Never returns; the handler is re-entered with the answers. Always present. This server declares no such surface. |
 | `ctx.inputs` | Reader over a retried request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped`. Empty on the first round. |
 | `ctx.enrich` | Success-path agent context (empty-result notices, query echo, pagination totals) — `ctx.enrich(...)` or `.notice()` / `.total()` / `.echo()` / `.truncated()`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block (no-op otherwise). |
