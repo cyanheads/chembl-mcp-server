@@ -257,3 +257,50 @@ describe('mock context stays aligned with the definition contract', () => {
     });
   });
 });
+
+describe('tool argument representation repairs', () => {
+  it('repairs a numeric limit string before querying and reports the parsed cap on both surfaces', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ targets: [], page_meta: { total_count: 0, next: null } }),
+    );
+    // @ts-expect-error Model-written wire arguments precede representation repair.
+    const result = await runToolContract(chemblSearchTargets, { query: 'kinase', limit: '15' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ targets: [], cap: 15, shown: 0 });
+    expect(contentText(result)).toContain('**cap:** 15');
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('limit')).toBe('15');
+  });
+
+  it('treats null at an optional query as absent and fills the missing-input recovery', async () => {
+    // @ts-expect-error Model-written wire arguments precede representation repair.
+    const result = await runToolContract(chemblSearchTargets, { query: null });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'missing_input',
+          recovery: { hint: expect.stringContaining('Supply at least one: accession') },
+        },
+      },
+    });
+    expect(contentText(result)).toContain('Recovery: Supply at least one: accession');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a non-numeric limit string rejected before the upstream call', async () => {
+    // @ts-expect-error Deliberately invalid wire input must fail argument validation.
+    const result = await runToolContract(chemblSearchTargets, { query: 'kinase', limit: 'many' });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'invalid_arguments' },
+      },
+    });
+    expect(contentText(result)).toContain('limit');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

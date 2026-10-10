@@ -196,11 +196,7 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
     let page: { items: Molecule[]; totalCount: number };
     if (searchType === 'name') {
       if (!query) {
-        throw ctx.fail(
-          'missing_input',
-          'search_type=name requires a query.',
-          ctx.recoveryFor('missing_input'),
-        );
+        throw ctx.fail('missing_input', 'search_type=name requires a query.');
       }
       page = await service.searchMolecules(
         { query, maxPhaseMin: input.max_phase_min, limit, offset },
@@ -208,11 +204,7 @@ export const chemblSearchMolecules = tool('chembl_search_molecules', {
       );
     } else {
       if (!structure) {
-        throw ctx.fail(
-          'missing_input',
-          `search_type=${searchType} requires a structure (SMILES).`,
-          ctx.recoveryFor('missing_input'),
-        );
+        throw ctx.fail('missing_input', `search_type=${searchType} requires a structure (SMILES).`);
       }
       page = await service.structureSearch(
         { structure, searchType, similarityThreshold: input.similarity_threshold, limit, offset },
