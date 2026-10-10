@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-10-10
+
+mcp-ts-core 0.13.14 accepts numeric-string search limits and null optional arguments; tool errors carry request IDs, and registry launch metadata and Docker dependency stages track the framework.
+
 ## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-09-26
 
 Docker dependency installation runs natively while selecting DuckDB bindings for each target architecture.
