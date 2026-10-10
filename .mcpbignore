@@ -12,3 +12,11 @@
 /biome.json
 /tsconfig*.json
 /vitest.config.ts
+/.cache/
+/coverage/
+/tests/
+/src/
+/scripts/
+/docs/
+/.github/
+/.vscode/
