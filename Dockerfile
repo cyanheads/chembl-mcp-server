@@ -38,14 +38,12 @@ RUN bun run build
 # selected explicitly for the target image. Running the scanner under QEMU
 # can abort with a JavaScriptCore MemoryExhaustion assertion.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS production-dependencies
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS deps
 
 WORKDIR /usr/src/app
 
-ENV NODE_ENV=production
 ARG TARGETARCH
 ARG TARGETOS
-ARG OTEL_ENABLED=true
 
 # Preserve the release-age gate and scanner for production installs.
 COPY package.json bun.lock bunfig.toml ./
@@ -65,38 +63,30 @@ COPY --from=build /usr/src/app/node_modules/@socketsecurity/bun-security-scanner
 # dependencies. Both installs must use the target OS/CPU, never the builder's
 # defaults. Only the scanner seed comes from the build dependency tree.
 # OTEL peers remain opt-out and use the installed framework's declared ranges.
+RUN case "$TARGETARCH" in \
+      amd64) echo x64 ;; \
+      arm64) echo arm64 ;; \
+      *) echo "Unsupported TARGETARCH '$TARGETARCH': expected amd64 or arm64" >&2; exit 1 ;; \
+    esac > .bun-cpu
+
 RUN --mount=type=cache,target=/root/.bun/install/cache \
-    set -eu; \
-    case "$TARGETARCH" in \
-      amd64) bun_cpu=x64 ;; \
-      arm64) bun_cpu=arm64 ;; \
-      *) echo "Unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
-    [ "$TARGETOS" = linux ] || { echo "Unsupported target OS: $TARGETOS" >&2; exit 1; }; \
-    bun install --production --omit=peer --frozen-lockfile --ignore-scripts --cpu="$bun_cpu" --os="$TARGETOS"; \
+    bun install --production --omit=peer --frozen-lockfile --ignore-scripts \
+      --os="$TARGETOS" --cpu="$(cat .bun-cpu)"
+
+# Read every OTel peer range from the installed framework.
+COPY scripts/install-otel.ts ./scripts/
+ARG OTEL_ENABLED=true
+RUN --mount=type=cache,target=/root/.bun/install/cache \
     if [ "$OTEL_ENABLED" = "true" ]; then \
-      specs=$(bun -e ' \
-        const { peerDependencies: peers } = await Bun.file("node_modules/@cyanheads/mcp-ts-core/package.json").json(); \
-        const names = process.argv.slice(1); \
-        const missing = names.filter((name) => !peers?.[name]); \
-        if (missing.length > 0) throw new Error(`no peerDependencies range for ${missing.join(", ")}`); \
-        console.log(names.map((name) => `${name}@${peers[name]}`).join(" ")); \
-      ' \
-        @hono/otel \
-        @opentelemetry/api-logs \
-        @opentelemetry/exporter-logs-otlp-http \
-        @opentelemetry/exporter-metrics-otlp-http \
-        @opentelemetry/exporter-trace-otlp-http \
-        @opentelemetry/instrumentation-http \
-        @opentelemetry/instrumentation-pino \
-        @opentelemetry/resources \
-        @opentelemetry/sdk-logs \
-        @opentelemetry/sdk-metrics \
-        @opentelemetry/sdk-node \
-        @opentelemetry/sdk-trace-node \
-        @opentelemetry/semantic-conventions); \
-      bun add --omit=dev --omit=peer --ignore-scripts --cpu="$bun_cpu" --os="$TARGETOS" $specs; \
+      bun scripts/install-otel.ts --os="$TARGETOS" --cpu="$(cat .bun-cpu)"; \
     fi
+
+# Debian uses glibc; discard musl-only optional native bindings after installs.
+COPY scripts/prune-musl-packages.ts ./scripts/
+RUN bun scripts/prune-musl-packages.ts
+
+# The scanner seed is needed only while installing dependencies.
+RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 
 # ==============================================================================
 # Production Stage
@@ -118,8 +108,8 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/chembl-mcp-server"
 
-COPY --from=production-dependencies /usr/src/app/package.json /usr/src/app/bun.lock /usr/src/app/bunfig.toml ./
-COPY --from=production-dependencies /usr/src/app/node_modules ./node_modules
+COPY package.json ./
+COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
