@@ -6,15 +6,20 @@
  * indication list degrades to a per-list `failed` state with an unknown count
  * rather than an authoritative empty array, while a failed molecule fetch still
  * tanks the call), the mechanism/indication page envelope and its truncation
- * signal, getAssay/getTarget normalization, empty-page handling, and the
- * not-initialized accessor guard.
+ * signal, getAssay/getTarget normalization, empty-page handling, and the one
+ * upstream time budget every request of a call draws on.
  * @module tests/services/chembl-service-fetch
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ChemblService, sanitizeUpstreamError } from '@/services/chembl/chembl-service.js';
+import {
+  CALL_DEADLINE_MS,
+  CallDeadline,
+  ChemblService,
+  sanitizeUpstreamError,
+} from '@/services/chembl/chembl-service.js';
 
 const config = {
   apiBaseUrl: 'https://www.ebi.ac.uk/chembl/api/data',
@@ -22,6 +27,8 @@ const config = {
   maxPageSize: 1000,
   defaultLimit: 25,
   maxSpillRows: 50_000,
+  maxConcurrentPages: 4,
+  spillDeadlineMs: 45_000,
   dataframeDropEnabled: false,
 };
 
@@ -192,7 +199,7 @@ describe('ChemblService — request URL construction', () => {
     );
     const rows = [];
     for await (const row of new ChemblService(config).streamActivities(
-      { targetChemblId: 'CHEMBL203', standardType: 'IC50', pchemblValueMin: 7, limit: 25 },
+      { targetChemblId: 'CHEMBL203', standardType: 'IC50', pchemblValueMin: 7 },
       ctx(),
     )) {
       rows.push(row);
@@ -345,6 +352,154 @@ describe('ChemblService — retry classification through fetchJson', () => {
     expectLeakFree(thrown);
     expect((thrown as McpError).code).toBe(JsonRpcErrorCode.ValidationError);
   });
+});
+
+/**
+ * An upstream that accepts the request and never answers. Like real `fetch`, the
+ * request settles only when its signal aborts, rejecting with the signal's reason.
+ */
+function neverAnswers(_input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+  });
+}
+
+/** Drive fake timers until `promise` settles; its outcome and the virtual milliseconds it took. */
+async function settleUnderFakeTimers<T>(
+  promise: Promise<T>,
+): Promise<{ value?: T; error?: unknown; elapsedMs: number }> {
+  const startedAt = Date.now();
+  let outcome: { value?: T; error?: unknown } | undefined;
+  promise.then(
+    (value) => {
+      outcome = { value };
+    },
+    (error: unknown) => {
+      outcome = { error };
+    },
+  );
+  while (!outcome && Date.now() - startedAt < 300_000) {
+    await vi.advanceTimersByTimeAsync(250);
+  }
+  return { ...outcome, elapsedMs: Date.now() - startedAt };
+}
+
+describe('ChemblService — one upstream time budget per call (#33)', () => {
+  /**
+   * The default per-attempt timeout. With it, four 30 s attempts and their
+   * backoff held one call past two minutes, well after an MCP client gave up.
+   */
+  const service = () => new ChemblService({ ...config, requestTimeoutMs: 30_000 });
+
+  /** Record when each request starts, in virtual milliseconds from now. */
+  function recordStarts(impl: (input: string, init?: RequestInit) => Promise<Response>) {
+    const startedAt = Date.now();
+    const starts: number[] = [];
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      starts.push(Date.now() - startedAt);
+      return impl(input, init);
+    });
+    return starts;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('fails a never-answering request as upstream_timeout inside the budget, short of the retry budget', async () => {
+    const starts = recordStarts(neverAnswers);
+    const { error, elapsedMs } = await settleUnderFakeTimers(
+      service().getAssay('CHEMBL674637', ctx()),
+    );
+    expectLeakFree(error);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'upstream_timeout' },
+    });
+    expect(elapsedMs).toBeLessThan(60_000);
+    // The retry budget allows four attempts; the deadline ends the ladder after two.
+    expect(starts).toHaveLength(2);
+    expect(Math.max(...starts)).toBeLessThan(CALL_DEADLINE_MS);
+    expect(elapsedMs).toBeGreaterThanOrEqual(CALL_DEADLINE_MS);
+  });
+
+  it("holds getDrugInfo's three fetches to the one budget it is given, starting none past it", async () => {
+    /**
+     * All three fetches stall, and the budget is shorter than the 45 s default, so
+     * a fetch that started a budget of its own would outlive this one. They start
+     * together, which is why only a passed-in budget can tell them apart.
+     */
+    const starts = recordStarts(neverAnswers);
+    const { error, elapsedMs } = await settleUnderFakeTimers(
+      service().getDrugInfo('CHEMBL25', ctx(), new CallDeadline(10_000)),
+    );
+    expectLeakFree(error);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'upstream_timeout' },
+    });
+    // One attempt each: the budget ended every ladder at its first timeout.
+    const paths = fetchMock.mock.calls.map((_call, i) => new URL(calledUrl(i)).pathname).sort();
+    expect(paths).toEqual([
+      '/chembl/api/data/drug_indication.json',
+      '/chembl/api/data/mechanism.json',
+      '/chembl/api/data/molecule/CHEMBL25.json',
+    ]);
+    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(elapsedMs).toBeLessThan(11_000);
+    expect(Math.max(...starts)).toBeLessThan(10_000);
+  });
+
+  it('sends nothing on a budget a chained call already spent', async () => {
+    const deadline = new CallDeadline(10_000);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const thrown = await captureThrow(() => service().getAssay('CHEMBL674637', ctx(), deadline));
+    expectLeakFree(thrown);
+    expect(thrown).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'upstream_timeout' },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('still retries a fast 5xx inside the budget and returns the answer unchanged', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error_message: 'boom' }, 500))
+      .mockResolvedValueOnce(jsonResponse({ error_message: 'boom' }, 503))
+      .mockResolvedValueOnce(
+        jsonResponse({ assay_chembl_id: 'CHEMBL674637', confidence_score: '9' }),
+      );
+    const { value, elapsedMs } = await settleUnderFakeTimers(
+      service().getAssay('CHEMBL674637', ctx()),
+    );
+    expect(value).toMatchObject({ assay_chembl_id: 'CHEMBL674637', confidence_score: 9 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(elapsedMs).toBeLessThan(60_000);
+  });
+
+  it.each([
+    ['mid-request', neverAnswers, 5_000],
+    ['mid-backoff', () => Promise.resolve(jsonResponse({ error_message: 'boom' }, 503)), 500],
+  ])(
+    'surfaces a caller abort %s as the abort, never as an upstream failure',
+    async (_label, impl, abortAtMs) => {
+      fetchMock.mockImplementation(impl);
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), abortAtMs);
+      const cancelled = createMockContext({ tenantId: 'default', signal: controller.signal });
+      const { error, elapsedMs } = await settleUnderFakeTimers(
+        service().getAssay('CHEMBL674637', cancelled),
+      );
+      expect(error).toMatchObject({ name: 'AbortError' });
+      expect(error).not.toBeInstanceOf(McpError);
+      expect(elapsedMs).toBeLessThan(abortAtMs + 1_000);
+    },
+  );
 });
 
 describe('ChemblService.getAssay — normalization', () => {

@@ -238,15 +238,27 @@ export interface SearchTargetsOptions {
 export type PotencyView = 'potency_ranked' | 'null_potency';
 
 /**
- * Options for `streamActivities` — at least one of molecule/target id is set by the
- * caller. Both together is legal and ANDs upstream, narrowing the query to the
- * measurements of that one compound against that one target.
+ * Options for `streamActivities` / `countActivities` — at least one of molecule/target
+ * id is set by the caller. Both together is legal and ANDs upstream, narrowing the
+ * query to the measurements of that one compound against that one target. The count
+ * reads only the filters; `offset` and `pageSize` shape the stream's page walk.
  */
 export interface GetActivitiesOptions {
   assayType?: string | undefined;
-  limit: number;
   moleculeChemblId?: string | undefined;
+  /**
+   * Zero-based row of the view the stream starts at. Defaults to 0. The tool
+   * derives it from a redeemed cursor; validate it before it gets here — ChEMBL
+   * answers an offset it cannot read with page one rather than an error.
+   */
+  offset?: number | undefined;
   organism?: string | undefined;
+  /**
+   * Rows per upstream page, capped at `CHEMBL_MAX_PAGE_SIZE` and defaulting to it.
+   * A walk that needs only a few rows asks for a page that size rather than
+   * downloading a full page and discarding the rest.
+   */
+  pageSize?: number | undefined;
   pchemblValueMin?: number | undefined;
   /** Defaults to `potency_ranked` when omitted. */
   potencyView?: PotencyView | undefined;

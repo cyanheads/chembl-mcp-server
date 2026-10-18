@@ -25,7 +25,8 @@ beforeEach(() => {
   });
   canvas = new DataCanvas(provider, new CanvasRegistry(provider));
   setCanvas(canvas);
-  initChemblService(getServerConfig());
+  // Two 120-row pages: the walk advances by offset at this page size.
+  initChemblService({ ...getServerConfig(), maxPageSize: 120 });
 });
 
 afterEach(async () => {
@@ -59,13 +60,7 @@ describe('bioactivity precision through DuckDB', () => {
             standard_value: offset === 0 ? value : i < 60 ? '1' : '0.25',
             value: '001',
           })),
-          page_meta: {
-            total_count: 240,
-            next:
-              offset === 0
-                ? '/chembl/api/data/activity.json?offset=120&order_by=-pchembl_value'
-                : null,
-          },
+          page_meta: { total_count: 240 },
         }),
       );
     });

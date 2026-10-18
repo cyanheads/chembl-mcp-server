@@ -16,7 +16,7 @@ export const chemblDataframeDescribe = tool('chembl_dataframe_describe', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     canvas_id: CanvasIdSchema.describe(
-      'Canvas ID returned by chembl_get_bioactivities (spilled: true).',
+      'Canvas ID returned by chembl_get_bioactivities — non-null whenever that call staged a table.',
     ),
   }),
   output: z.object({

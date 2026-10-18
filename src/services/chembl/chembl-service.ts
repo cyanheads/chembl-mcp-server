@@ -1,10 +1,13 @@
 /**
  * @fileoverview The single upstream client for the ChEMBL REST data API. Builds
  * Django-style filtered URLs against `https://www.ebi.ac.uk/chembl/api/data`,
- * fetches `.json`, paginates `page_meta`, coerces string numerics → number/null
- * at the boundary (absent → null, never 0), and flattens nested upstream
- * structures into the flat domain types. Each method wraps its full fetch+parse
- * in `withRetry`; the activity stream yields pages for the DataCanvas spill.
+ * fetches `.json`, coerces string numerics → number/null at the boundary (absent
+ * → null, never 0), and flattens nested upstream structures into the flat domain
+ * types. Each method wraps its full fetch+parse in `withRetry`, and every request
+ * of one call draws on that call's single time budget ({@link CallDeadline}). The
+ * activity stream walks a view's pages by offset for the inline page; the spill
+ * walk fetches them concurrently through a service-wide page limiter and yields
+ * them in offset order.
  * @module services/chembl/chembl-service
  */
 
@@ -18,7 +21,13 @@ import {
   timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  createPacer,
+  fetchWithTimeout,
+  type Pacer,
+  requestContextService,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 import type { ServerConfig } from '@/config/server-config.js';
 import type {
   Activity,
@@ -159,6 +168,72 @@ export function sanitizeUpstreamError(err: unknown, operation: string): McpError
   }
 }
 
+/**
+ * The time budget for one tool or resource call's upstream requests, every
+ * attempt and backoff included. MCP SDK clients give up on a request at 60 s by
+ * default whatever this server's per-attempt timeout is, so the budget is a fixed
+ * span under that bound rather than a multiple of CHEMBL_REQUEST_TIMEOUT_MS; the
+ * 15 s left over cover the handler's own work and the response's trip back. The
+ * bioactivity spill has its own budget, CHEMBL_SPILL_DEADLINE_MS.
+ */
+export const CALL_DEADLINE_MS = 45_000;
+
+/**
+ * One call's upstream time budget, as an absolute expiry. Every request the call
+ * makes draws on the same instance, so chained and concurrent requests (a count
+ * before a page, getDrugInfo's three fetches) share one budget rather than each
+ * restarting the clock.
+ */
+export class CallDeadline {
+  readonly budgetMs: number;
+  readonly expiresAt: number;
+
+  constructor(budgetMs: number) {
+    this.budgetMs = budgetMs;
+    this.expiresAt = Date.now() + budgetMs;
+  }
+
+  /** Milliseconds left, never negative. */
+  get remainingMs(): number {
+    return Math.max(0, this.expiresAt - Date.now());
+  }
+
+  get expired(): boolean {
+    return this.remainingMs === 0;
+  }
+}
+
+/** What ended a spill walk early: its first failed page, and whether the budget ended it. */
+interface WalkFailure {
+  atDeadline: boolean;
+  error: unknown;
+}
+
+/** How {@link ChemblService.fetchJson} runs one request, beyond the call deadline every request draws on. */
+interface JsonFetchOptions {
+  /** Runs as each attempt starts, before the attempt queues. */
+  onAttempt?: () => void;
+  /** Queue each attempt on the spill-page limiter. */
+  paced?: boolean;
+  /** Replaces `ctx.signal`, for a walk that can abandon its own requests. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Whether a sanitized {@link ChemblService.fetchJson} failure is `withRetry`
+ * stopping its ladder for the call's budget: at the expiry, or before an
+ * exponential backoff that would outlast what is left. Either way the attempt's
+ * error is replaced by a `retry_deadline_exceeded` timeout, which
+ * {@link sanitizeUpstreamError} keeps on `cause`. The second case lands while the
+ * budget still has time left, so {@link CallDeadline.expired} alone misses it. A
+ * `Retry-After` wait that would outlast the budget is not one: `withRetry`
+ * rethrows the attempt's own error for it.
+ */
+function isRetryBudgetStop(error: unknown): boolean {
+  const stop = error instanceof Error ? error.cause : undefined;
+  return stop instanceof McpError && stop.data?.reason === 'retry_deadline_exceeded';
+}
+
 /** Raw upstream molecule record (sparse — every field may be absent). */
 interface RawMolecule {
   max_phase?: string | number | null;
@@ -216,37 +291,61 @@ interface RawTarget {
   target_type?: string | null;
 }
 
-/** Raw upstream page_meta. */
+/** Raw upstream page_meta — only `total_count` is read. */
 interface RawPageMeta {
-  next?: string | null;
   total_count?: number;
 }
 
 /**
- * The ChEMBL upstream client. Stateless apart from the resolved base URL +
- * timeout from config; methods take the handler `Context` for correlated
- * logging, cancellation, and retry bindings.
+ * The ChEMBL upstream client. Holds the resolved config values and the spill-page
+ * limiter; methods take the handler `Context` for correlated logging,
+ * cancellation, and retry bindings, and an optional {@link CallDeadline} a caller
+ * chaining several methods passes to keep them on one budget. Without one, each
+ * method starts its own {@link CALL_DEADLINE_MS} budget at entry.
  */
 export class ChemblService {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly maxPageSize: number;
+  private readonly maxConcurrentPages: number;
+  /**
+   * Shared by every spill walk on this service, so CHEMBL_MAX_CONCURRENT_PAGES
+   * bounds the page requests in flight across concurrent calls, not per call. It
+   * sets only `maxConcurrent`, so it arms no timer and needs no teardown.
+   */
+  private readonly pagePacer: Pacer;
 
   constructor(config: ServerConfig) {
     // Strip a trailing slash so URL joins are predictable.
     this.baseUrl = config.apiBaseUrl.replace(/\/+$/, '');
     this.timeoutMs = config.requestTimeoutMs;
     this.maxPageSize = config.maxPageSize;
+    this.maxConcurrentPages = config.maxConcurrentPages;
+    this.pagePacer = createPacer({
+      name: 'chembl-spill-pages',
+      maxConcurrent: config.maxConcurrentPages,
+    });
   }
 
   // --- URL + fetch primitives -------------------------------------------
 
-  /** Build a `.json` resource URL with Django-style query params. */
-  private buildUrl(resource: string, params: Record<string, string | number | undefined>): string {
+  /**
+   * Build a `.json` resource URL with Django-style query params. An array value
+   * repeats its key once per element, in order — the form ChEMBL reads a
+   * multi-key `order_by` from.
+   */
+  private buildUrl(
+    resource: string,
+    params: Record<string, string | number | readonly string[] | undefined>,
+  ): string {
     const url = new URL(`${this.baseUrl}/${resource}.json`);
     for (const [key, raw] of Object.entries(params)) {
       if (raw === undefined || raw === '') continue;
-      url.searchParams.set(key, String(raw));
+      if (typeof raw === 'object') {
+        for (const value of raw) url.searchParams.append(key, value);
+      } else {
+        url.searchParams.set(key, String(raw));
+      }
     }
     return url.toString();
   }
@@ -259,8 +358,28 @@ export class ChemblService {
    * framework `McpError` — carrying `statusCode`, `responseBody`,
    * and the upstream URL in its `data` — would propagate to the client on a
    * public server. This is the single chokepoint for every ChEMBL call.
+   *
+   * Every attempt draws on `deadline`: no request starts once it is spent, each
+   * attempt's timeout is CHEMBL_REQUEST_TIMEOUT_MS or what the budget has left,
+   * whichever is less, and `withRetry` stops its ladder at the expiry, or before an
+   * exponential backoff that would outlast it — either surfacing as the retryable
+   * `upstream_timeout`, its `retry_deadline_exceeded` cause kept for
+   * {@link isRetryBudgetStop}. A `Retry-After` wait that would outlast the budget
+   * rethrows the attempt's own error instead (e.g. `rate_limited`), since waiting
+   * out the window the upstream named is still the caller's move. A `paced`
+   * request queues on the spill-page limiter inside each attempt, so a retry
+   * re-queues and the wait is charged to the budget; `signal` replaces
+   * `ctx.signal` for a walk that can abandon its own requests; `onAttempt` runs as
+   * each attempt starts, so a walk can time a page's final attempt. A caller abort
+   * is rethrown as the caller's reason, never sanitized into an upstream failure.
    */
-  private async fetchJson<T>(url: string, operation: string, ctx: Context): Promise<T> {
+  private async fetchJson<T>(
+    url: string,
+    operation: string,
+    ctx: Context,
+    deadline: CallDeadline,
+    request: JsonFetchOptions = {},
+  ): Promise<T> {
     /**
      * `Context extends RequestContext`, so the handler ctx is the parent directly —
      * a hand-copied field list would silently drop `sessionId` and the `extra`
@@ -273,24 +392,40 @@ export class ChemblService {
       operation,
       parentContext: ctx,
     });
+    const send = async (signal: AbortSignal): Promise<T> => {
+      const response = await fetchWithTimeout(
+        url,
+        Math.min(this.timeoutMs, deadline.remainingMs),
+        reqCtx,
+        {
+          signal,
+          headers: { Accept: 'application/json', 'User-Agent': 'chembl-mcp-server' },
+        },
+      );
+      return (await response.json()) as T;
+    };
     try {
+      if (deadline.expired) {
+        throw timeout('The call spent its upstream time budget before this request started.', {
+          budgetMs: deadline.budgetMs,
+        });
+      }
       return await withRetry(
-        async () => {
-          const response = await fetchWithTimeout(url, this.timeoutMs, reqCtx, {
-            signal: ctx.signal,
-            headers: { Accept: 'application/json', 'User-Agent': 'chembl-mcp-server' },
-          });
-          return (await response.json()) as T;
+        ({ signal }) => {
+          request.onAttempt?.();
+          return request.paced ? this.pagePacer.run(send, { signal }) : send(signal);
         },
         {
           operation,
           context: reqCtx,
           // ChEMBL is generous but unspecified — be a good citizen on 429/5xx.
           baseDelayMs: 1500,
-          signal: ctx.signal,
+          signal: request.signal ?? ctx.signal,
+          deadlineMs: deadline.remainingMs,
         },
       );
     } catch (err) {
+      ctx.signal.throwIfAborted();
       throw sanitizeUpstreamError(err, operation);
     }
   }
@@ -319,9 +454,13 @@ export class ChemblService {
    * answers 200 with page one for an offset it rejects rather than erroring, so a
    * bad offset would return page one labelled as some later page.
    */
-  async searchMolecules(opts: SearchMoleculesOptions, ctx: Context): Promise<Page<Molecule>> {
+  async searchMolecules(
+    opts: SearchMoleculesOptions,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Page<Molecule>> {
     if (opts.maxPhaseMin === undefined && EXACT_MOLECULE_IDENTIFIER.test(opts.query)) {
-      return await this.lookupMoleculeByIdentifier(opts, ctx);
+      return await this.lookupMoleculeByIdentifier(opts, ctx, deadline);
     }
     const params: Record<string, string | number | undefined> = {
       q: opts.query,
@@ -336,6 +475,7 @@ export class ChemblService {
       url,
       'ChemblService.searchMolecules',
       ctx,
+      deadline,
     );
     const items = (raw.molecules ?? []).map((m) => this.normalizeMolecule(m));
     return { items, totalCount: raw.page_meta?.total_count ?? items.length };
@@ -361,10 +501,11 @@ export class ChemblService {
   private async lookupMoleculeByIdentifier(
     opts: SearchMoleculesOptions,
     ctx: Context,
+    deadline: CallDeadline,
   ): Promise<Page<Molecule>> {
     const offset = opts.offset ?? 0;
     try {
-      const molecule = await this.getMolecule(opts.query, ctx);
+      const molecule = await this.getMolecule(opts.query, ctx, deadline);
       return { items: [molecule].slice(offset, offset + opts.limit), totalCount: 1 };
     } catch (err) {
       if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
@@ -388,7 +529,11 @@ export class ChemblService {
    * NotFound). Detect the single-object shape so an exact match is not silently
    * dropped.
    */
-  async structureSearch(opts: StructureSearchOptions, ctx: Context): Promise<Page<Molecule>> {
+  async structureSearch(
+    opts: StructureSearchOptions,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Page<Molecule>> {
     const smiles = encodeURIComponent(opts.structure);
     let resource: string;
     if (opts.searchType === 'exact') {
@@ -401,7 +546,7 @@ export class ChemblService {
     const url = this.buildUrl(resource, { limit: opts.limit, offset: opts.offset ?? 0 });
     const raw = await this.fetchJson<
       { molecules?: RawMolecule[]; page_meta?: RawPageMeta } & RawMolecule
-    >(url, `ChemblService.structureSearch.${opts.searchType}`, ctx);
+    >(url, `ChemblService.structureSearch.${opts.searchType}`, ctx, deadline);
 
     // Exact match returns a single molecule object (top-level molecule_chembl_id),
     // not a list envelope. Wrap it so the row is surfaced.
@@ -415,9 +560,13 @@ export class ChemblService {
   }
 
   /** Fetch a single molecule by ChEMBL ID. */
-  async getMolecule(id: string, ctx: Context): Promise<Molecule> {
+  async getMolecule(
+    id: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Molecule> {
     const url = this.buildUrl(`molecule/${encodeURIComponent(id)}`, {});
-    const raw = await this.fetchJson<RawMolecule>(url, 'ChemblService.getMolecule', ctx);
+    const raw = await this.fetchJson<RawMolecule>(url, 'ChemblService.getMolecule', ctx, deadline);
     return this.normalizeMolecule(raw);
   }
 
@@ -425,6 +574,7 @@ export class ChemblService {
   async getMoleculeApproval(
     id: string,
     ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
   ): Promise<{
     pref_name: string | null;
     max_phase: number | null;
@@ -435,6 +585,7 @@ export class ChemblService {
       url,
       'ChemblService.getMoleculeApproval',
       ctx,
+      deadline,
     );
     return {
       pref_name: toStringOrNull(raw.pref_name),
@@ -475,7 +626,11 @@ export class ChemblService {
    * matches `pref_name`. `opts.offset` windows the match set as in
    * {@link searchMolecules}, and carries the same caller-validates constraint.
    */
-  async searchTargets(opts: SearchTargetsOptions, ctx: Context): Promise<Page<Target>> {
+  async searchTargets(
+    opts: SearchTargetsOptions,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Page<Target>> {
     const params: Record<string, string | number | undefined> = {
       limit: opts.limit,
       offset: opts.offset ?? 0,
@@ -494,15 +649,20 @@ export class ChemblService {
       url,
       'ChemblService.searchTargets',
       ctx,
+      deadline,
     );
     const items = (raw.targets ?? []).map((t) => this.normalizeTarget(t));
     return { items, totalCount: raw.page_meta?.total_count ?? items.length };
   }
 
   /** Fetch a single target by ChEMBL target ID. */
-  async getTarget(id: string, ctx: Context): Promise<Target> {
+  async getTarget(
+    id: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Target> {
     const url = this.buildUrl(`target/${encodeURIComponent(id)}`, {});
-    const raw = await this.fetchJson<RawTarget>(url, 'ChemblService.getTarget', ctx);
+    const raw = await this.fetchJson<RawTarget>(url, 'ChemblService.getTarget', ctx, deadline);
     return this.normalizeTarget(raw);
   }
 
@@ -530,8 +690,8 @@ export class ChemblService {
 
   /**
    * Build the shared Django-style filter params for an activity query from the
-   * caller's options. Both {@link streamActivities} (preview/spill) and
-   * {@link countActivities} (honest total) start here; the stream layers on the
+   * caller's options. The page walks ({@link activityPageUrl}) and
+   * {@link countActivities} (honest total) start here; a page layers on the
    * ordering + pchembl_value presence filter, the count layers on `limit: 1`.
    */
   private activityFilterParams(
@@ -555,7 +715,11 @@ export class ChemblService {
    * reports this as `totalCount`, so the preview's potency filter never silently
    * redefines what the total represents.
    */
-  async countActivities(opts: GetActivitiesOptions, ctx: Context): Promise<number> {
+  async countActivities(
+    opts: GetActivitiesOptions,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<number> {
     const url = this.buildUrl('activity', {
       ...this.activityFilterParams(opts),
       limit: 1,
@@ -565,17 +729,83 @@ export class ChemblService {
       url,
       'ChemblService.countActivities',
       ctx,
+      deadline,
     );
     return raw.page_meta?.total_count ?? 0;
   }
 
   /**
-   * Stream bioactivity rows as an async iterable, paginating `page_meta.next`
-   * until exhausted (or the source is cancelled). Designed to feed `spillover()`:
-   * the preview drain pulls only what fits the budget, and the spill drain
-   * registers rows up to the caller's `caps.maxRows`. The stream itself is
-   * unbounded by design — it is lazy, so it advances only as far as the consumer
-   * pulls, and bounding the drain is the consumer's call.
+   * The URL of one page of an activity view: the caller's filters, the view's
+   * `pchembl_value` presence filter and total order, and the window
+   * `[offset, offset + pageSize)`. A function of its arguments alone, so every
+   * walk over a view requests exactly the same pages whatever order it issues
+   * them in.
+   */
+  private activityPageUrl(opts: GetActivitiesOptions, offset: number, pageSize: number): string {
+    const nullPotency = opts.potencyView === 'null_potency';
+    return this.buildUrl('activity', {
+      ...this.activityFilterParams(opts),
+      limit: pageSize,
+      offset,
+      /**
+       * Potency-ranked view: most potent first, ties broken on the unique
+       * `activity_id`. ChEMBL's order inside a `-pchembl_value` tie is not stable
+       * from one request to the next, so without the second key a tie group that
+       * straddles a page edge repeats some rows and drops others. ChEMBL reads the
+       * two keys only as a repeated param — the comma form is HTTP 400.
+       * Null-potency view: every pchembl_value is null, so only the primary key
+       * orders it.
+       */
+      order_by: nullPotency ? ['activity_id'] : ['-pchembl_value', 'activity_id'],
+      /**
+       * ChEMBL sorts NULLs first for a descending sort, so an unfiltered preview is
+       * dominated by measurements with no derivable pchembl_value. The default view
+       * excludes them so the potency ranking is meaningful; the null-potency view is
+       * the explicit, opt-in way to reach exactly those excluded rows. The honest
+       * full count (which spans both) is recovered separately by countActivities,
+       * leaving totalCount intact either way.
+       */
+      pchembl_value__isnull: nullPotency ? 'true' : 'false',
+    });
+  }
+
+  /**
+   * One page of an activity view ({@link activityPageUrl}): its raw rows and the
+   * view's `page_meta.total_count` (0 when page_meta is absent).
+   */
+  private async fetchActivityPage(
+    opts: GetActivitiesOptions,
+    offset: number,
+    pageSize: number,
+    ctx: Context,
+    deadline: CallDeadline,
+    operation: string,
+    request?: JsonFetchOptions,
+  ): Promise<{ rows: RawActivity[]; total: number }> {
+    const raw = await this.fetchJson<{ activities?: RawActivity[]; page_meta?: RawPageMeta }>(
+      this.activityPageUrl(opts, offset, pageSize),
+      operation,
+      ctx,
+      deadline,
+      request,
+    );
+    return { rows: raw.activities ?? [], total: raw.page_meta?.total_count ?? 0 };
+  }
+
+  /**
+   * Stream bioactivity rows as an async iterable, walking the view by offset from
+   * `opts.offset` (default 0) in pages of `opts.pageSize` rows (default and cap
+   * `CHEMBL_MAX_PAGE_SIZE`), one page at a time, until a short page or the view's
+   * `page_meta.total_count` ends it. Feeds the tool's inline page drain, which
+   * pulls only the page it returns; the stream is lazy, so it advances only as far
+   * as the consumer pulls. A cancellation or a spent `deadline` throws rather than
+   * ending the stream early, so a partial page never passes for a whole one. The
+   * DataCanvas spill walks the view with {@link spillActivities} instead.
+   *
+   * Each page is built by {@link activityPageUrl}, never taken from
+   * `page_meta.next`: ChEMBL writes the two-key ranked order back into `next` as a
+   * Python list (`order_by=['-pchembl_value', 'activity_id']`), which it then
+   * answers with HTTP 400.
    *
    * `opts.potencyView` selects which side of the `pchembl_value` presence split
    * is streamed; the two views partition the match set exactly and are never
@@ -588,51 +818,142 @@ export class ChemblService {
     opts: GetActivitiesOptions,
     ctx: Context,
     onTotal?: (total: number) => void,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
   ): AsyncGenerator<Activity> {
-    const nullPotency = opts.potencyView === 'null_potency';
-    const params: Record<string, string | number | undefined> = {
-      ...this.activityFilterParams(opts),
-      limit: Math.min(this.maxPageSize, 1000),
-      offset: 0,
-      /**
-       * Potency-ranked view: order by pchembl_value descending so the preview leads
-       * with the most potent measurements. Null-potency view: every row's
-       * pchembl_value is null, so that ordering is meaningless — walk the stable
-       * primary key instead, which keeps the page sequence deterministic.
-       */
-      order_by: nullPotency ? 'activity_id' : '-pchembl_value',
-      /**
-       * ChEMBL sorts NULLs first for a descending sort, so an unfiltered preview is
-       * dominated by measurements with no derivable pchembl_value. The default view
-       * excludes them so the potency ranking is meaningful; the null-potency view is
-       * the explicit, opt-in way to reach exactly those excluded rows. The honest
-       * full count (which spans both) is recovered separately by countActivities,
-       * leaving totalCount intact either way.
-       */
-      pchembl_value__isnull: nullPotency ? 'true' : 'false',
-    };
+    const pageSize = Math.min(opts.pageSize ?? this.maxPageSize, this.maxPageSize);
+    let offset = opts.offset ?? 0;
 
-    let nextUrl: string | null = this.buildUrl('activity', params);
-    let reportedTotal = false;
-
-    while (nextUrl) {
-      if (ctx.signal.aborted) return;
-      const raw: { activities?: RawActivity[]; page_meta?: RawPageMeta } = await this.fetchJson(
-        nextUrl,
-        'ChemblService.streamActivities',
+    for (let first = true; ; first = false) {
+      const { rows, total } = await this.fetchActivityPage(
+        opts,
+        offset,
+        pageSize,
         ctx,
+        deadline,
+        'ChemblService.streamActivities',
       );
-      if (!reportedTotal) {
-        onTotal?.(raw.page_meta?.total_count ?? 0);
-        reportedTotal = true;
-      }
-      for (const row of raw.activities ?? []) {
+      if (first) onTotal?.(total);
+      for (const row of rows) {
         yield this.normalizeActivity(row);
       }
-      const next = raw.page_meta?.next;
-      // page_meta.next is a relative path ("/chembl/api/data/activity.json?...");
-      // resolve it against the configured origin so a base-URL override is honored.
-      nextUrl = next ? new URL(next, this.baseUrl).toString() : null;
+      offset += pageSize;
+      if (rows.length < pageSize || offset >= total) return;
+    }
+  }
+
+  /**
+   * Walk a whole view for the DataCanvas spill, in CHEMBL_MAX_PAGE_SIZE pages:
+   * the first page alone (it carries the view total, reported through
+   * `walk.onTotal`), then every remaining offset below both the view total and
+   * `walk.maxRows`, through an ordered window of at most
+   * CHEMBL_MAX_CONCURRENT_PAGES pending pages. Rows yield in offset order whatever
+   * order the pages land in, and every row of a fetched page is yielded, so the
+   * consumer's own row cap stays the staging bound; no page is requested at or
+   * past either bound. Each page request queues on the service-wide page limiter
+   * inside its retry, so concurrent spills share one in-flight ceiling.
+   *
+   * Every request draws on `walk.deadline`, and no page starts unless more of it is
+   * left than the latest page to land took on its final attempt, queueing
+   * included: a page the budget would not hold would only be abandoned at the
+   * deadline, after ChEMBL had computed it. A landed page's failed attempts and
+   * their backoff are left out, since a fresh page does not wait them out. Once
+   * the budget would not hold another page, the walk ends after the pages already
+   * in flight and calls `walk.onDeadline`. The first page that fails abandons the
+   * walk's other pages, queued or in flight. When the deadline caused that
+   * failure — it expired, or a page's retries stopped short of an exponential
+   * backoff it would outlast — the walk ends after the contiguous prefix it has
+   * yielded and calls `walk.onDeadline`, unless that is the first page, which
+   * throws `upstream_timeout` because nothing was fetched. Any other failure
+   * throws its sanitized error (a `Retry-After` wait the budget cannot hold
+   * included), and a caller abort throws its reason, however the walk was ending.
+   * A consumer that stops pulling early must call `return()` so in-flight pages
+   * are released.
+   */
+  async *spillActivities(
+    opts: GetActivitiesOptions,
+    ctx: Context,
+    walk: {
+      deadline: CallDeadline;
+      maxRows: number;
+      onTotal: (total: number) => void;
+      onDeadline: () => void;
+    },
+  ): AsyncGenerator<Activity> {
+    const pageSize = this.maxPageSize;
+    const abandon = new AbortController();
+    const request = { paced: true, signal: AbortSignal.any([ctx.signal, abandon.signal]) };
+    /** How long the latest page to land took on its final attempt, queueing included. */
+    let latestPageMs = 0;
+    const fetchPage = async (offset: number) => {
+      let attemptedAt = Date.now();
+      const page = await this.fetchActivityPage(
+        opts,
+        offset,
+        pageSize,
+        ctx,
+        walk.deadline,
+        'ChemblService.spillActivities',
+        {
+          ...request,
+          onAttempt: () => {
+            attemptedAt = Date.now();
+          },
+        },
+      );
+      latestPageMs = Date.now() - attemptedAt;
+      return page;
+    };
+    const budgetHoldsAPage = () => walk.deadline.remainingMs > latestPageMs;
+    const state: { failure?: WalkFailure } = {};
+    /** Settles with the page's rows, or with `undefined` once it failed — never rejects. */
+    const pending: Promise<RawActivity[] | undefined>[] = [];
+    try {
+      const first = await fetchPage(0);
+      walk.onTotal(first.total);
+      const end = Math.min(first.total, walk.maxRows);
+      let next = pageSize;
+      const refill = () => {
+        while (
+          !state.failure &&
+          next < end &&
+          pending.length < this.maxConcurrentPages &&
+          budgetHoldsAPage()
+        ) {
+          pending.push(
+            fetchPage(next).then(
+              (page) => page.rows,
+              (error: unknown): undefined => {
+                state.failure ??= {
+                  atDeadline: walk.deadline.expired || isRetryBudgetStop(error),
+                  error,
+                };
+                abandon.abort();
+              },
+            ),
+          );
+          next += pageSize;
+        }
+      };
+
+      let rows: RawActivity[] | undefined = first.rows;
+      while (rows) {
+        const short = rows.length < pageSize;
+        if (!short) refill();
+        for (const row of rows) {
+          yield this.normalizeActivity(row);
+        }
+        if (short) return;
+        rows = await pending.shift();
+        // A failed page, or a budget that stopped dispatch with pages still to request.
+        const endedShort = rows === undefined && (state.failure !== undefined || next < end);
+        if (endedShort) {
+          ctx.signal.throwIfAborted();
+          if (state.failure && !state.failure.atDeadline) throw state.failure.error;
+          walk.onDeadline();
+        }
+      }
+    } finally {
+      abandon.abort();
     }
   }
 
@@ -665,7 +986,11 @@ export class ChemblService {
    * Fetch mechanism-of-action rows for a molecule. One request at the configured
    * page size — see {@link getIndications} for why that is enough here.
    */
-  async getMechanisms(moleculeChemblId: string, ctx: Context): Promise<Page<Mechanism>> {
+  async getMechanisms(
+    moleculeChemblId: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Page<Mechanism>> {
     const url = this.buildUrl('mechanism', {
       molecule_chembl_id: moleculeChemblId,
       limit: this.maxPageSize,
@@ -677,7 +1002,7 @@ export class ChemblService {
         action_type?: string | null;
       }>;
       page_meta?: RawPageMeta;
-    }>(url, 'ChemblService.getMechanisms', ctx);
+    }>(url, 'ChemblService.getMechanisms', ctx, deadline);
     const items = (raw.mechanisms ?? []).map((m) => ({
       target_chembl_id: toStringOrNull(m.target_chembl_id),
       mechanism_of_action: toStringOrNull(m.mechanism_of_action),
@@ -689,7 +1014,7 @@ export class ChemblService {
   /**
    * Fetch clinical-indication rows for a molecule.
    *
-   * One request at the configured page size, not a `page_meta.next` walk: an
+   * One request at the configured page size, not a page walk: an
    * indication list runs to the low hundreds at the extreme (167 for aspirin, the
    * largest observed), two to three orders of magnitude under the activity sets
    * {@link streamActivities} paginates. The page size covers that whole range in a
@@ -697,7 +1022,11 @@ export class ChemblService {
    * overflows it is reported as truncated instead of passing itself off as
    * complete.
    */
-  async getIndications(moleculeChemblId: string, ctx: Context): Promise<Page<Indication>> {
+  async getIndications(
+    moleculeChemblId: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Page<Indication>> {
     const url = this.buildUrl('drug_indication', {
       molecule_chembl_id: moleculeChemblId,
       limit: this.maxPageSize,
@@ -709,7 +1038,7 @@ export class ChemblService {
         max_phase_for_ind?: string | null;
       }>;
       page_meta?: RawPageMeta;
-    }>(url, 'ChemblService.getIndications', ctx);
+    }>(url, 'ChemblService.getIndications', ctx, deadline);
     const items = (raw.drug_indications ?? []).map((i) => ({
       mesh_heading: toStringOrNull(i.mesh_heading),
       efo_term: toStringOrNull(i.efo_term),
@@ -745,13 +1074,18 @@ export class ChemblService {
   /**
    * Compose drug pharmacology from molecule approval + mechanisms + indications.
    * `Promise.allSettled` so a rejected mechanism or indication list degrades to a
-   * disclosed partial result rather than tanking the whole call.
+   * disclosed partial result rather than tanking the whole call. The three
+   * concurrent fetches share one deadline, so the call settles inside it.
    */
-  async getDrugInfo(moleculeChemblId: string, ctx: Context): Promise<DrugInfo> {
+  async getDrugInfo(
+    moleculeChemblId: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<DrugInfo> {
     const [approval, mechanisms, indications] = await Promise.allSettled([
-      this.getMoleculeApproval(moleculeChemblId, ctx),
-      this.getMechanisms(moleculeChemblId, ctx),
-      this.getIndications(moleculeChemblId, ctx),
+      this.getMoleculeApproval(moleculeChemblId, ctx, deadline),
+      this.getMechanisms(moleculeChemblId, ctx, deadline),
+      this.getIndications(moleculeChemblId, ctx, deadline),
     ]);
 
     // The molecule fetch is the anchor — if it failed (e.g. 404), surface that.
@@ -777,7 +1111,11 @@ export class ChemblService {
   // --- Assay -------------------------------------------------------------
 
   /** Fetch a single assay by ChEMBL assay ID. */
-  async getAssay(id: string, ctx: Context): Promise<Assay> {
+  async getAssay(
+    id: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<Assay> {
     const url = this.buildUrl(`assay/${encodeURIComponent(id)}`, {});
     const raw = await this.fetchJson<{
       assay_chembl_id?: string;
@@ -788,7 +1126,7 @@ export class ChemblService {
       assay_organism?: string | null;
       confidence_score?: number | string | null;
       confidence_description?: string | null;
-    }>(url, 'ChemblService.getAssay', ctx);
+    }>(url, 'ChemblService.getAssay', ctx, deadline);
     return {
       assay_chembl_id: raw.assay_chembl_id ?? id,
       description: toStringOrNull(raw.description),

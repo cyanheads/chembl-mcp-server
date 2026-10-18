@@ -3,16 +3,23 @@
  * controlled upstream payloads — including a sparse payload with omitted fields,
  * verifying absence is preserved as null rather than fabricated — plus the
  * exact-shape routing of a name query (ChEMBL ID / InChIKey → the by-resource
- * lookup, everything else → the fuzzy endpoint) and the search modes that do and
- * do not carry a Tanimoto percent. `fetch` is stubbed so no live ChEMBL call is
- * made.
+ * lookup, everything else → the fuzzy endpoint), the search modes that do and do
+ * not carry a Tanimoto percent, and the bioactivity view walks — the inline
+ * stream and the concurrent spill — over a fake `/activity` corpus. `fetch` is
+ * stubbed so no live ChEMBL call is made.
  * @module tests/services/chembl-service
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ChemblService } from '@/services/chembl/chembl-service.js';
+import { CallDeadline, ChemblService } from '@/services/chembl/chembl-service.js';
+import {
+  type ActivityCorpusOptions,
+  activityCorpus,
+  corpusTraffic,
+  viewRequests,
+} from '../_fake-activity-upstream.js';
 
 const config = {
   apiBaseUrl: 'https://www.ebi.ac.uk/chembl/api/data',
@@ -20,6 +27,8 @@ const config = {
   maxPageSize: 1000,
   defaultLimit: 25,
   maxSpillRows: 50_000,
+  maxConcurrentPages: 4,
+  spillDeadlineMs: 45_000,
   dataframeDropEnabled: false,
 };
 
@@ -453,7 +462,7 @@ describe('ChemblService.streamActivities — potency view selects the isnull fil
     );
     const svc = new ChemblService(config);
     for await (const _row of svc.streamActivities(
-      { moleculeChemblId: 'CHEMBL25', limit: 25, ...(potencyView && { potencyView }) },
+      { moleculeChemblId: 'CHEMBL25', ...(potencyView && { potencyView }) },
       createMockContext({ tenantId: 'default' }),
     )) {
       // drain
@@ -484,12 +493,567 @@ describe('ChemblService.streamActivities — potency view selects the isnull fil
       );
       const svc = new ChemblService(config);
       const total = await svc.countActivities(
-        { moleculeChemblId: 'CHEMBL25', limit: 25, potencyView },
+        { moleculeChemblId: 'CHEMBL25', potencyView },
         createMockContext({ tenantId: 'default' }),
       );
       expect(total).toBe(4087);
       expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('pchembl_value__isnull');
     }
+  });
+});
+
+describe('ChemblService.streamActivities — the view page walk (#32)', () => {
+  /** A ranked row with the given potency; ids double as the identity under test. */
+  const ranked = (activity_id: number, pchembl_value: string) => ({ activity_id, pchembl_value });
+
+  /** Drain the stream over a small page size, returning the rows and reported total. */
+  async function walk(
+    opts: { potencyView?: 'potency_ranked' | 'null_potency' } = {},
+    pageSize = 4,
+  ): Promise<{ ids: number[]; potencies: (number | null)[]; total: number }> {
+    const svc = new ChemblService({ ...config, maxPageSize: pageSize });
+    const rows = [];
+    let total = -1;
+    for await (const row of svc.streamActivities(
+      { targetChemblId: 'CHEMBL203', ...opts },
+      createMockContext({ tenantId: 'default' }),
+      (t) => {
+        total = t;
+      },
+    )) {
+      rows.push(row);
+    }
+    return {
+      ids: rows.map((r) => r.activity_id),
+      potencies: rows.map((r) => r.pchembl_value),
+      total,
+    };
+  }
+
+  it('walks a tie-free view across pages in upstream order, every row once', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ranked(100 + i, (9 - i / 10).toFixed(2)));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const { ids, total } = await walk();
+    expect(ids).toEqual(rows.map((r) => r.activity_id));
+    expect(total).toBe(10);
+    // Ten rows at four per page: three pages, and nothing requested past the view.
+    expect(viewRequests(fetchMock.mock.calls).map((p) => p.get('offset'))).toEqual(['0', '4', '8']);
+  });
+
+  it('breaks -pchembl_value ties on activity_id with a repeated order_by param', async () => {
+    fetchMock.mockImplementation(activityCorpus({ rows: [ranked(1, '8.00')] }));
+    await walk();
+    const [params] = viewRequests(fetchMock.mock.calls);
+    // Repeated, in this order — ChEMBL answers the comma form with HTTP 400.
+    expect(params?.getAll('order_by')).toEqual(['-pchembl_value', 'activity_id']);
+  });
+
+  it('keeps the null-potency view on its single activity_id order', async () => {
+    fetchMock.mockImplementation(activityCorpus({ rows: [{ activity_id: 1 }] }));
+    await walk({ potencyView: 'null_potency' });
+    const [params] = viewRequests(fetchMock.mock.calls);
+    expect(params?.getAll('order_by')).toEqual(['activity_id']);
+  });
+
+  it('returns every tied measurement exactly once when ties cross page boundaries', async () => {
+    // A six-row tie at 8.00 straddles the page edges at offsets 4 and 8.
+    const rows = [
+      ranked(901, '9.10'),
+      ranked(902, '9.00'),
+      ranked(903, '8.90'),
+      ...[611, 604, 609, 602, 607, 605].map((id) => ranked(id, '8.00')),
+      ranked(801, '7.50'),
+      ranked(802, '7.40'),
+      ranked(803, '7.30'),
+    ];
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const { ids, potencies, total } = await walk();
+
+    expect(total).toBe(12);
+    expect(ids).toHaveLength(12);
+    expect(new Set(ids).size).toBe(12);
+    expect([...ids].sort()).toEqual(rows.map((r) => r.activity_id).sort());
+    // Most potent first, non-increasing; inside the tie, ascending activity_id.
+    expect(potencies).toEqual([...potencies].sort((a, b) => Number(b) - Number(a)));
+    expect(ids.slice(3, 9)).toEqual([602, 604, 605, 607, 609, 611]);
+  });
+
+  it('carries the two-key order on every page instead of following page_meta.next', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ranked(100 + i, '8.00'));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const { ids } = await walk();
+    expect(ids).toEqual(rows.map((r) => r.activity_id));
+    // page_meta.next re-serializes the two keys as a Python list, which ChEMBL 400s;
+    // each page is built from the offset instead, with the order intact.
+    const pages = viewRequests(fetchMock.mock.calls);
+    expect(pages).toHaveLength(3);
+    for (const params of pages) {
+      expect(params.getAll('order_by')).toEqual(['-pchembl_value', 'activity_id']);
+    }
+  });
+
+  it('stops at a short page even when total_count claims more rows', async () => {
+    const rows = Array.from({ length: 6 }, (_, i) => ranked(100 + i, (9 - i / 10).toFixed(2)));
+    fetchMock.mockImplementation(activityCorpus({ rows, viewTotal: 100 }));
+    const { ids } = await walk();
+    expect(ids).toHaveLength(6);
+    expect(viewRequests(fetchMock.mock.calls)).toHaveLength(2);
+  });
+
+  it('stops at total_count without requesting a page past a full last page', async () => {
+    const rows = Array.from({ length: 8 }, (_, i) => ranked(100 + i, (9 - i / 10).toFixed(2)));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const { ids } = await walk();
+    expect(ids).toHaveLength(8);
+    expect(viewRequests(fetchMock.mock.calls).map((p) => p.get('offset'))).toEqual(['0', '4']);
+  });
+
+  it('stops after one page when page_meta is missing, rather than walking blind', async () => {
+    const rows = Array.from({ length: 4 }, (_, i) => ranked(100 + i, (9 - i / 10).toFixed(2)));
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse({ activities: rows })));
+    const svc = new ChemblService({ ...config, maxPageSize: 4 });
+    const ids: number[] = [];
+    // Bounded, so a walk that never stops fails here instead of hanging the run.
+    for await (const row of svc.streamActivities(
+      { targetChemblId: 'CHEMBL203' },
+      createMockContext({ tenantId: 'default' }),
+    )) {
+      ids.push(row.activity_id);
+      if (ids.length > 8) break;
+    }
+    expect(ids).toHaveLength(4);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('walks the null-potency view by offset in activity_id order', async () => {
+    const rows = [7, 3, 9, 1, 5, 2].map((activity_id) => ({ activity_id }));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const { ids, potencies } = await walk({ potencyView: 'null_potency' });
+    expect(ids).toEqual([1, 2, 3, 5, 7, 9]);
+    expect(potencies.every((p) => p === null)).toBe(true);
+  });
+});
+
+describe('ChemblService.streamActivities — page size and start (#29, #17)', () => {
+  /** Drain one empty page and hand back the view request's params. */
+  async function firstPage(
+    opts: { pageSize?: number; offset?: number },
+    maxPageSize = 1000,
+  ): Promise<URLSearchParams | undefined> {
+    fetchMock.mockImplementation(activityCorpus({ rows: [] }));
+    const svc = new ChemblService({ ...config, maxPageSize });
+    for await (const _row of svc.streamActivities(
+      { targetChemblId: 'CHEMBL203', ...opts },
+      createMockContext({ tenantId: 'default' }),
+    )) {
+      // drain
+    }
+    return viewRequests(fetchMock.mock.calls)[0];
+  }
+
+  it('requests the caller page size', async () => {
+    // Read through URLSearchParams — "limit=1000" contains "limit=100".
+    expect((await firstPage({ pageSize: 25 }))?.get('limit')).toBe('25');
+    fetchMock.mockClear();
+    expect((await firstPage({ pageSize: 1000 }))?.get('limit')).toBe('1000');
+  });
+
+  it('defaults the page to CHEMBL_MAX_PAGE_SIZE when the caller names none', async () => {
+    expect((await firstPage({}))?.get('limit')).toBe('1000');
+    fetchMock.mockClear();
+    expect((await firstPage({}, 200))?.get('limit')).toBe('200');
+  });
+
+  it('caps a larger page size at CHEMBL_MAX_PAGE_SIZE', async () => {
+    expect((await firstPage({ pageSize: 500 }, 200))?.get('limit')).toBe('200');
+  });
+
+  it('starts at offset 0 by default and at the caller offset when given', async () => {
+    expect((await firstPage({}))?.get('offset')).toBe('0');
+    fetchMock.mockClear();
+    expect((await firstPage({ offset: 50 }))?.get('offset')).toBe('50');
+  });
+
+  it('walks on from the caller offset by the page size', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({
+      activity_id: 100 + i,
+      pchembl_value: (9 - i / 10).toFixed(2),
+    }));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const svc = new ChemblService(config);
+    const ids = [];
+    for await (const row of svc.streamActivities(
+      { targetChemblId: 'CHEMBL203', offset: 3, pageSize: 3 },
+      createMockContext({ tenantId: 'default' }),
+    )) {
+      ids.push(row.activity_id);
+    }
+    expect(ids).toEqual([103, 104, 105, 106, 107, 108, 109]);
+    expect(viewRequests(fetchMock.mock.calls).map((p) => p.get('offset'))).toEqual(['3', '6', '9']);
+  });
+
+  it('throws a cancellation between pages instead of ending the stream on a partial page', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => ({ activity_id: 100 + i }));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const controller = new AbortController();
+    const svc = new ChemblService({ ...config, maxPageSize: 4 });
+    const ids: number[] = [];
+    const drained = (async () => {
+      for await (const row of svc.streamActivities(
+        { targetChemblId: 'CHEMBL203', potencyView: 'null_potency' },
+        createMockContext({ tenantId: 'default', signal: controller.signal }),
+      )) {
+        ids.push(row.activity_id);
+        if (ids.length === 4) controller.abort();
+      }
+    })();
+    await expect(drained).rejects.toMatchObject({ name: 'AbortError' });
+    expect(ids).toEqual([100, 101, 102, 103]);
+  });
+});
+
+describe('ChemblService.spillActivities — the concurrent spill walk (#16)', () => {
+  /** 23 ranked rows in tie groups of three, so ties straddle the 4-row page edges. */
+  const ROWS = Array.from({ length: 23 }, (_, i) => ({
+    activity_id: 100 + i,
+    pchembl_value: (9 - Math.floor(i / 3) / 10).toFixed(2),
+  }));
+
+  /**
+   * Walk `rows` (default ROWS) in 4-row pages, collecting what the walk yields and
+   * reports. `abortAfter` cancels the call once that many rows have been yielded,
+   * and the walk is pulled on.
+   */
+  async function spill(
+    opts: {
+      abortAfter?: number;
+      concurrency?: number;
+      corpus?: Omit<ActivityCorpusOptions, 'rows' | 'traffic'>;
+      deadline?: CallDeadline;
+      maxRows?: number;
+      rows?: ActivityCorpusOptions['rows'];
+      stopAfter?: number;
+    } = {},
+  ) {
+    const traffic = corpusTraffic();
+    fetchMock.mockImplementation(
+      activityCorpus({ rows: opts.rows ?? ROWS, traffic, ...opts.corpus }),
+    );
+    const svc = new ChemblService({
+      ...config,
+      maxPageSize: 4,
+      maxConcurrentPages: opts.concurrency ?? 2,
+    });
+    let total = -1;
+    let deadlineHit = false;
+    /** What the budget had left when the walk reported it ended the walk. */
+    let leftAtDeadlineMs: number | undefined;
+    const deadline = opts.deadline ?? new CallDeadline(45_000);
+    const caller = new AbortController();
+    const walk = svc.spillActivities(
+      { targetChemblId: 'CHEMBL203' },
+      createMockContext({ tenantId: 'default', signal: caller.signal }),
+      {
+        deadline,
+        maxRows: opts.maxRows ?? 50_000,
+        onTotal: (t) => {
+          total = t;
+        },
+        onDeadline: () => {
+          deadlineHit = true;
+          leftAtDeadlineMs = deadline.remainingMs;
+        },
+      },
+    );
+    const ids: number[] = [];
+    for await (const row of walk) {
+      ids.push(row.activity_id);
+      if (ids.length === opts.abortAfter) caller.abort();
+      if (ids.length === opts.stopAfter) break;
+    }
+    const offsets = viewRequests(fetchMock.mock.calls).map((p) => Number(p.get('offset')));
+    return {
+      ids,
+      total,
+      deadlineHit,
+      leftAtDeadlineMs,
+      traffic,
+      offsets: offsets.sort((a, b) => a - b),
+    };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('yields the whole view once, in its total order, while pages land out of order', async () => {
+    vi.useFakeTimers();
+    // Later pages answer sooner, so the window completes out of order.
+    const walked = spill({ corpus: { latencyMs: (offset) => 30 - offset } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    const { ids, total, offsets, deadlineHit, traffic } = await walked;
+    // The precondition: some page answered before a page ahead of it in the view.
+    expect(traffic.answered).not.toEqual([...traffic.answered].sort((a, b) => a - b));
+    expect(ids).toEqual(ROWS.map((r) => r.activity_id));
+    expect(total).toBe(23);
+    expect(deadlineHit).toBe(false);
+    expect(offsets).toEqual([0, 4, 8, 12, 16, 20]);
+  });
+
+  it('holds concurrent spills on one service to CHEMBL_MAX_CONCURRENT_PAGES page requests in flight', async () => {
+    vi.useFakeTimers();
+    const traffic = corpusTraffic();
+    fetchMock.mockImplementation(activityCorpus({ rows: ROWS, traffic, latencyMs: 5 }));
+    // A walk's own window is the same size, so only a second walk can overrun the limiter.
+    const svc = new ChemblService({ ...config, maxPageSize: 4, maxConcurrentPages: 2 });
+    const drain = async () => {
+      const ids: number[] = [];
+      for await (const row of svc.spillActivities(
+        { targetChemblId: 'CHEMBL203' },
+        createMockContext({ tenantId: 'default' }),
+        {
+          deadline: new CallDeadline(45_000),
+          maxRows: 50_000,
+          onTotal: () => {},
+          onDeadline: () => {},
+        },
+      )) {
+        ids.push(row.activity_id);
+      }
+      return ids;
+    };
+    const both = Promise.all([drain(), drain()]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const [first, second] = await both;
+    expect(first).toEqual(ROWS.map((r) => r.activity_id));
+    expect(second).toEqual(ROWS.map((r) => r.activity_id));
+    // The service-wide limiter binds across both walks, and is used up to its cap.
+    expect(traffic.maxInFlight).toBe(2);
+    expect(traffic.answered).toHaveLength(12);
+  });
+
+  it('requests no page at or past a row cap that splits one, yielding that page whole', async () => {
+    const { ids, offsets } = await spill({ maxRows: 10 });
+    // Offset 8 starts below the cap; 12 would start past it.
+    expect(offsets).toEqual([0, 4, 8]);
+    // The consumer's own cap is the staging bound, so the split page yields whole.
+    expect(ids).toEqual(ROWS.slice(0, 12).map((r) => r.activity_id));
+  });
+
+  it('requests no page past the view total, nor past the first page when it is short', async () => {
+    // Eight rows fill two pages exactly; a third request would start at the total.
+    const full = await spill({ rows: ROWS.slice(0, 8) });
+    expect(full.offsets).toEqual([0, 4]);
+    expect(full.ids).toEqual(ROWS.slice(0, 8).map((r) => r.activity_id));
+    fetchMock.mockClear();
+    // A stale total_count claims more, but a short first page is the whole view.
+    const short = await spill({ rows: ROWS.slice(0, 3), corpus: { viewTotal: 100 } });
+    expect(short.offsets).toEqual([0]);
+    expect(short.ids).toEqual(ROWS.slice(0, 3).map((r) => r.activity_id));
+  });
+
+  it('ends at a short page even when total_count claims more rows', async () => {
+    const { ids, traffic } = await spill({ corpus: { viewTotal: 100 } });
+    expect(ids).toEqual(ROWS.map((r) => r.activity_id));
+    expect(traffic.inFlight).toBe(0);
+  });
+
+  it('ends after the contiguous prefix when the deadline cuts the walk, and says so', async () => {
+    vi.useFakeTimers();
+    const deadline = new CallDeadline(10_000);
+    const walked = spill({ deadline, corpus: { stallAt: [8], latencyMs: (o) => (o > 8 ? 1 : 0) } });
+    await vi.advanceTimersByTimeAsync(11_000);
+    const { ids, deadlineHit, offsets } = await walked;
+    expect(deadlineHit).toBe(true);
+    // Pages 0 and 4 staged; the stalled page and the one fetched past it did not.
+    expect(ids).toEqual(ROWS.slice(0, 8).map((r) => r.activity_id));
+    expect(offsets).toContain(12);
+  });
+
+  /**
+   * The page at `offset` answers HTTP 500 four seconds into every attempt, under a
+   * 10 s budget. Attempt one fails at 4 s and its backoff (1125–1875 ms with
+   * jitter) fits; attempt two fails 9.1–9.9 s in, where the next backoff
+   * (2250–3750 ms) would outlast the budget, so `withRetry` stops the ladder
+   * before the deadline expires — whatever the jitter draws.
+   */
+  const failsWithinOneBackoffOfExpiry = (offset: number) => ({
+    deadline: new CallDeadline(10_000),
+    corpus: {
+      failAt: { offset, status: 500 },
+      latencyMs: (o: number) => (o === offset ? 4_000 : 0),
+    },
+  });
+
+  it('ends after the contiguous prefix when the budget cuts the retries of a failing page short', async () => {
+    vi.useFakeTimers();
+    const walked = spill(failsWithinOneBackoffOfExpiry(8)).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(11_000);
+    const outcome = await walked;
+    // The walk ended at the budget instead of failing as upstream_timeout.
+    expect(outcome).not.toHaveProperty('error');
+    const { ids, deadlineHit, leftAtDeadlineMs, offsets } = (
+      outcome as { value: Awaited<ReturnType<typeof spill>> }
+    ).value;
+    // Pages 0 and 4 staged.
+    expect(ids).toEqual(ROWS.slice(0, 8).map((r) => r.activity_id));
+    expect(deadlineHit).toBe(true);
+    // The ladder stopped before the deadline itself expired, after two attempts.
+    expect(leftAtDeadlineMs).toBeGreaterThan(0);
+    expect(offsets.filter((o) => o === 8)).toHaveLength(2);
+  });
+
+  it('still fails as upstream_timeout when the budget cuts the retries of the first page short', async () => {
+    vi.useFakeTimers();
+    const walked = spill(failsWithinOneBackoffOfExpiry(0)).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(11_000);
+    const error = await walked;
+    // Nothing was fetched, so there is no prefix to stage.
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'upstream_timeout' },
+    });
+    // The sanitized error carries withRetry's budget stop on cause, never on the wire.
+    expect((error as Error).cause).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'retry_deadline_exceeded', retryAttempts: 2 },
+    });
+    expect((error as { data: object }).data).not.toHaveProperty('retryAttempts');
+    expect(viewRequests(fetchMock.mock.calls).map((p) => p.get('offset'))).toEqual(['0', '0']);
+  });
+
+  it('releases its in-flight pages when the consumer stops pulling early', async () => {
+    vi.useFakeTimers();
+    const walked = spill({ stopAfter: 2, corpus: { latencyMs: (o) => (o === 0 ? 0 : 60_000) } });
+    await vi.advanceTimersByTimeAsync(0);
+    const { traffic } = await walked;
+    expect(traffic.aborted).toBe(2);
+    expect(traffic.inFlight).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  /** `n` ranked rows tied on potency, so the view's total order is ascending activity_id. */
+  const tiedRows = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ activity_id: 100 + i, pchembl_value: '8.00' }));
+  const idsOf = (rows: readonly { activity_id: number }[]) => rows.map((r) => r.activity_id);
+
+  /**
+   * Every page takes 4 s, four at a time, under a 10 s budget: page 0 lands at 4 s
+   * and the four after it at 8 s, when a page started would need until 12 s.
+   */
+  const slowPages = { concurrency: 4, corpus: { latencyMs: 4_000 } };
+
+  it('starts no page the budget would not hold, ending after the pages in flight', async () => {
+    vi.useFakeTimers();
+    const rows = tiedRows(48);
+    const walked = spill({ ...slowPages, rows, deadline: new CallDeadline(10_000) });
+    await vi.advanceTimersByTimeAsync(12_000);
+    const { ids, deadlineHit, leftAtDeadlineMs, offsets, traffic } = await walked;
+    // Five pages sent, and none abandoned at the deadline.
+    expect(offsets).toEqual([0, 4, 8, 12, 16]);
+    expect(traffic.aborted).toBe(0);
+    expect(ids).toEqual(idsOf(rows.slice(0, 20)));
+    // The budget ended the walk 8 s in, with 2 s left that would not hold a 4 s page.
+    expect(deadlineHit).toBe(true);
+    expect(leftAtDeadlineMs).toBe(2_000);
+  });
+
+  it('still walks the whole view when its pages are fast against the budget', async () => {
+    vi.useFakeTimers();
+    const rows = tiedRows(48);
+    const walked = spill({
+      rows,
+      concurrency: 4,
+      deadline: new CallDeadline(10_000),
+      corpus: { latencyMs: 100 },
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    const { ids, deadlineHit, offsets, traffic } = await walked;
+    expect(ids).toEqual(idsOf(rows));
+    expect(deadlineHit).toBe(false);
+    expect(offsets).toEqual(Array.from({ length: 12 }, (_, page) => page * 4));
+    expect(traffic.aborted).toBe(0);
+  });
+
+  /**
+   * The estimate is the latest page's time, so the first page's time is the only
+   * one the first dispatch has. Pages landing after it replace it.
+   */
+  it('re-estimates from each page that lands, so fast pages after a slow first page walk on', async () => {
+    vi.useFakeTimers();
+    // Page 0 takes 4 s of a 10 s budget; the 49 pages after it take 100 ms, two at a time, ending ~6.5 s in.
+    const rows = tiedRows(200);
+    const walked = spill({
+      rows,
+      deadline: new CallDeadline(10_000),
+      corpus: { latencyMs: (offset) => (offset === 0 ? 4_000 : 100) },
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    const { ids, deadlineHit } = await walked;
+    // Holding the estimate at the slowest page so far would stop dispatch 6 s in.
+    expect(ids).toEqual(idsOf(rows));
+    expect(deadlineHit).toBe(false);
+  });
+
+  it('ends after a first page that took longer than the budget it left', async () => {
+    vi.useFakeTimers();
+    // Page 0 takes 4 s of a 7 s budget; the 3 s left would not hold another page like it.
+    const rows = tiedRows(48);
+    const walked = spill({
+      rows,
+      deadline: new CallDeadline(7_000),
+      corpus: { latencyMs: (offset) => (offset === 0 ? 4_000 : 100) },
+    });
+    await vi.advanceTimersByTimeAsync(8_000);
+    const { ids, deadlineHit, leftAtDeadlineMs, offsets } = await walked;
+    // The estimate's pessimistic case: the fast pages behind a slow first page are never requested.
+    expect(offsets).toEqual([0]);
+    expect(ids).toEqual(idsOf(rows.slice(0, 4)));
+    expect(deadlineHit).toBe(true);
+    expect(leftAtDeadlineMs).toBe(3_000);
+  });
+
+  /**
+   * Pages take 1 s, two at a time, under a 10 s budget. The page at offset 36 is
+   * sent 5 s in, answers HTTP 500 at 6 s, and lands on its retry 8.1–8.9 s in,
+   * 3.1–3.9 s after it was first sent but 1 s after its final attempt began.
+   */
+  it('times a page that landed after a retry by its final attempt, not its backoff', async () => {
+    vi.useFakeTimers();
+    const rows = tiedRows(80);
+    const walked = spill({
+      rows,
+      deadline: new CallDeadline(10_000),
+      corpus: { latencyMs: 1_000, failAt: { offset: 36, status: 500, times: 1 } },
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    const { ids, deadlineHit, leftAtDeadlineMs, offsets, traffic } = await walked;
+    // The 1.1–1.9 s left when it landed held two more 1 s pages; the ones after them were never sent.
+    const pages = Array.from({ length: 13 }, (_, page) => page * 4);
+    expect(offsets).toEqual([...pages, 36].sort((a, b) => a - b));
+    expect(ids).toEqual(idsOf(rows.slice(0, 52)));
+    expect(traffic.aborted).toBe(0);
+    expect(deadlineHit).toBe(true);
+    expect(leftAtDeadlineMs).toBeGreaterThan(0);
+    expect(leftAtDeadlineMs).toBeLessThan(1_000);
+  });
+
+  it.each([
+    [4, 'with the window in flight'],
+    [20, 'as the budget stops dispatch with the window drained'],
+  ])('throws a cancellation after %i rows (%s), never ending at the budget', async (abortAfter) => {
+    vi.useFakeTimers();
+    const walked = spill({
+      ...slowPages,
+      rows: tiedRows(48),
+      deadline: new CallDeadline(10_000),
+      abortAfter,
+    }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(await walked).toMatchObject({ name: 'AbortError' });
   });
 });
 
@@ -506,7 +1070,6 @@ describe('ChemblService — molecule × target pair filters', () => {
       {
         moleculeChemblId: 'CHEMBL941',
         targetChemblId: 'CHEMBL385',
-        limit: 25,
         ...(opts.potencyView && { potencyView: opts.potencyView }),
       },
       createMockContext({ tenantId: 'default' }),
@@ -534,7 +1097,7 @@ describe('ChemblService — molecule × target pair filters', () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ page_meta: { total_count: 116 } }));
     const svc = new ChemblService(config);
     const total = await svc.countActivities(
-      { moleculeChemblId: 'CHEMBL941', targetChemblId: 'CHEMBL385', limit: 25 },
+      { moleculeChemblId: 'CHEMBL941', targetChemblId: 'CHEMBL385' },
       createMockContext({ tenantId: 'default' }),
     );
     const url = String(fetchMock.mock.calls[0]?.[0]);
@@ -580,7 +1143,7 @@ describe('ChemblService.streamActivities — coercion + raw passthrough', () => 
     let total = -1;
     const rows = [];
     for await (const row of svc.streamActivities(
-      { targetChemblId: 'CHEMBL203', standardType: 'IC50', limit: 25 },
+      { targetChemblId: 'CHEMBL203', standardType: 'IC50' },
       createMockContext({ tenantId: 'default' }),
       (t) => {
         total = t;

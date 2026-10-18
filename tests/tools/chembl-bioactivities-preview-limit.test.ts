@@ -16,11 +16,13 @@
  */
 
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { decodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import { chemblGetBioactivities } from '@/mcp-server/tools/definitions/chembl-get-bioactivities.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
 import { initChemblService } from '@/services/chembl/chembl-service.js';
+import { activityCorpus, viewRequests } from '../_fake-activity-upstream.js';
 import { FakeDataCanvas } from '../_fake-canvas.js';
 
 function jsonResponse(body: unknown): Response {
@@ -94,30 +96,19 @@ function mockUpstream(opts: {
   });
 }
 
-/** `pages` pages of `perPage` rows chained via `page_meta.next`, as ChEMBL does. */
+/**
+ * `pages` × `perPage` rows behind a fake `/activity` that honors `offset` /
+ * `limit` as ChEMBL does, walked by the service at `perPage` rows per page (its
+ * CHEMBL_MAX_PAGE_SIZE). `afterEach` restores the configured page size.
+ */
 function mockPagedUpstream(opts: { honest: number; pages: number; perPage: number }): void {
-  fetchMock.mockImplementation((url: string | URL) => {
-    const href = String(url);
-    if (!href.includes('order_by=')) {
-      return Promise.resolve(
-        jsonResponse({ activities: [], page_meta: { total_count: opts.honest, next: null } }),
-      );
-    }
-    const offset = Number(new URL(href).searchParams.get('offset') ?? 0);
-    const page = Math.floor(offset / opts.perPage);
-    const next =
-      page + 1 < opts.pages
-        ? `/chembl/api/data/activity.json?offset=${offset + opts.perPage}&order_by=x`
-        : null;
-    return Promise.resolve(
-      jsonResponse({
-        activities: Array.from({ length: opts.perPage }, (_, i) =>
-          rawActivity(page * opts.perPage + i),
-        ),
-        page_meta: { total_count: opts.pages * opts.perPage, next },
-      }),
-    );
-  });
+  initChemblService({ ...getServerConfig(), maxPageSize: opts.perPage });
+  fetchMock.mockImplementation(
+    activityCorpus({
+      honest: opts.honest,
+      rows: Array.from({ length: opts.pages * opts.perPage }, (_, i) => rawActivity(i)),
+    }),
+  );
 }
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -135,6 +126,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   setCanvas(undefined);
+  initChemblService(getServerConfig());
 });
 
 const ctx = () => createMockContext({ tenantId: 'default', errors: chemblGetBioactivities.errors });
@@ -171,7 +163,7 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
     );
 
     // The whole view fit under the 40 KB budget, so nothing spilled — and the
-    // rows past `limit` are simply not returned, exactly as with no canvas.
+    // rows past `limit` are reached through nextCursor, exactly as with no canvas.
     expect(result.spilled).toBe(false);
     expect(result.canvas_id).toBeNull();
     expect(result.table_name).toBeNull();
@@ -184,6 +176,9 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
     expect(result.activities.map((a) => a.activity_id)).toEqual([1000, 1001]);
     // totalCount stays the honest full match count, unmoved by the preview cap.
     expect(result.totalCount).toBe(FITS_INLINE);
+    expect(decodeCursor(result.nextCursor as string, createMockContext({}))).toMatchObject({
+      offset: 2,
+    });
     expect(result).toEqual(expect.schemaMatching(chemblGetBioactivities.output));
   });
 
@@ -194,8 +189,9 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
 
     expect(result.spilled).toBe(false);
     expect(result.activities).toHaveLength(3);
-    // Nothing was held back, so there is nothing to say.
+    // Nothing was held back, so there is nothing to say and nothing to continue.
     expect(noticeOf(c)).toBe('');
+    expect(result).not.toHaveProperty('nextCursor');
     expect(textOf(result)).toContain('preview is the full set');
   });
 
@@ -274,9 +270,37 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
     expect(nullView.activities.every((a) => a.pchembl_value === null)).toBe(true);
     expect(nullView.table_name).toBeNull();
 
-    // Neither view staged anything — a fit-inline result is not a canvas result.
-    const instance = await fake.acquire(undefined, { tenantId: 'default' });
-    expect(await instance.describe()).toEqual([]);
+    // Neither view staged anything, so neither held a canvas slot (#28).
+    expect(fake.countForTenant({ tenantId: 'default' })).toBe(0);
+  });
+
+  it('stages the whole fit view on a supplied canvas while returning only limit rows (#31)', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const existing = await fake.acquire(undefined, { tenantId: 'default' });
+    mockUpstream({ honest: FITS_INLINE, rows: FITS_INLINE });
+    const c = ctx();
+    const result = await chemblGetBioactivities.handler(
+      chemblGetBioactivities.input.parse({
+        target_chembl_id: 'CHEMBL203',
+        limit: 2,
+        canvas_id: existing.canvasId,
+      }),
+      c,
+    );
+
+    expect(result.spilled).toBe(false);
+    expect(result.activities).toHaveLength(2);
+    expect(result.canvas_id).toBe(existing.canvasId);
+    expect(result.table_name).toBe('bioactivities');
+    expect(result.staged_row_count).toBe(FITS_INLINE);
+    expect(fake.canvases.get(existing.canvasId)?.tables.get('bioactivities')?.rows).toHaveLength(
+      FITS_INLINE,
+    );
+    expect(noticeOf(c)).toContain(`Showing 2 of the ${FITS_INLINE} rows`);
+    const text = textOf(result);
+    expect(text).toContain(`staged_row_count: ${FITS_INLINE}`);
+    expect(text).not.toContain('preview is the full set');
   });
 
   it('slices the returned rows without shrinking the upstream drain', async () => {
@@ -294,6 +318,69 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
   });
 });
 
+describe('chembl_get_bioactivities — upstream page size (#29)', () => {
+  /** A ranked view of `n` rows, most potent first in index order. */
+  const corpus = (n: number) => Array.from({ length: n }, (_, i) => rawActivity(i));
+
+  /** `[offset, limit]` of every view request, read through URLSearchParams. */
+  const pages = () =>
+    viewRequests(fetchMock.mock.calls).map((p) => [p.get('offset'), p.get('limit')]);
+
+  const run = (input: Record<string, unknown>, c = ctx()) =>
+    chemblGetBioactivities.handler(chemblGetBioactivities.input.parse(input), c);
+
+  it('requests a page the size of limit when the canvas is off', async () => {
+    setCanvas(undefined);
+    fetchMock.mockImplementation(activityCorpus({ honest: 26600, rows: corpus(1200) }));
+    const byDefault = await run({ target_chembl_id: 'CHEMBL203' });
+    expect(pages()).toEqual([['0', String(getServerConfig().defaultLimit)]]);
+    expect(byDefault.activities).toHaveLength(getServerConfig().defaultLimit);
+
+    fetchMock.mockClear();
+    const atMax = await run({ target_chembl_id: 'CHEMBL203', limit: 1000 });
+    expect(pages()).toEqual([['0', '1000']]);
+    expect(atMax.activities).toHaveLength(1000);
+  });
+
+  it('continues by offset in CHEMBL_MAX_PAGE_SIZE pages until limit rows are held', async () => {
+    setCanvas(undefined);
+    initChemblService({ ...getServerConfig(), maxPageSize: 200 });
+    fetchMock.mockImplementation(activityCorpus({ honest: 26600, rows: corpus(1200) }));
+    const result = await run({ target_chembl_id: 'CHEMBL203', limit: 500 });
+    expect(pages()).toEqual([
+      ['0', '200'],
+      ['200', '200'],
+      ['400', '200'],
+    ]);
+    expect(result.activities.map((a) => a.activity_id)).toEqual(
+      corpus(500).map((row) => row.activity_id),
+    );
+  });
+
+  it('keeps CHEMBL_MAX_PAGE_SIZE pages on the spill', async () => {
+    fetchMock.mockImplementation(activityCorpus({ honest: 26600, rows: corpus(1200) }));
+    const { result } = await withCanvas({ target_chembl_id: 'CHEMBL203', limit: 25 });
+    expect(result.spilled).toBe(true);
+    expect(result.staged_row_count).toBe(1200);
+    expect(pages()).toEqual([
+      ['0', '1000'],
+      ['1000', '1000'],
+    ]);
+  });
+
+  it('leaves the canvas-off rows, totals, and flags as they were', async () => {
+    setCanvas(undefined);
+    fetchMock.mockImplementation(activityCorpus({ honest: 26600, rows: corpus(1200) }));
+    const c = ctx();
+    const result = await run({ target_chembl_id: 'CHEMBL203', limit: 4 }, c);
+    expect(result.activities.map((a) => a.activity_id)).toEqual([1000, 1001, 1002, 1003]);
+    expect(result.totalCount).toBe(26600);
+    expect(result.canvasDisabled).toBe(true);
+    expect(result.spilled).toBe(false);
+    expect(noticeOf(c)).toContain('of the 1200 rows in this view');
+  });
+});
+
 describe('chembl_get_bioactivities — preview boundary disclosure', () => {
   it('names what the caller has versus what the view holds when limit bites', async () => {
     mockUpstream({ honest: FITS_INLINE, rows: FITS_INLINE });
@@ -301,8 +388,10 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
     await withCanvas({ target_chembl_id: 'CHEMBL203', limit: 2 }, c);
 
     const notice = noticeOf(c);
-    expect(notice).toContain(`Showing 2 of the ${FITS_INLINE} rows in this view`);
-    expect(notice).toContain('raise limit');
+    expect(notice).toContain(`Showing rows 1–2 of the ${FITS_INLINE} rows in this view`);
+    // Nothing was staged, so the rows past limit continue by cursor (#17), not a wider re-call.
+    expect(notice).toContain('pass nextCursor back as cursor');
+    expect(notice).not.toContain('raise limit');
     // Nothing was staged, so there is no table to describe or query.
     expect(notice).not.toContain('chembl_dataframe_');
   });
@@ -314,7 +403,7 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
 
     const notice = noticeOf(c);
     // The preview bound and the cross-view pointer are separate facts; both ship.
-    expect(notice).toContain('raise limit');
+    expect(notice).toContain('pass nextCursor back as cursor');
     expect(notice).toContain(String(FITS_INLINE));
     expect(notice).toContain('Ranked by potency');
     expect(notice).toContain('null_potency');
@@ -331,8 +420,10 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
     expect(result.activities).toHaveLength(4);
     const notice = noticeOf(c);
     expect(notice).toContain('Canvas disabled');
-    expect(notice).toContain(`Showing 4 of the ${FITS_INLINE} rows`);
-    expect(notice).toContain('raise limit');
+    expect(notice).toContain(`Showing rows 1–4 of the ${FITS_INLINE} rows`);
+    // The canvas-off page continues by cursor (#17), not by a wider re-call.
+    expect(notice).toContain('pass nextCursor back as cursor');
+    expect(notice).not.toContain('raise limit');
   });
 
   it('does not imply rows were held back when the canvas-disabled view fits under limit', async () => {
@@ -370,5 +461,7 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
     expect(text).not.toContain('preview is the full set');
     expect(text).toContain('staged_row_count: — (nothing staged)');
     expect(text).toContain('truncated: no');
+    // A content[]-only client reaches the rest the same way.
+    expect(text).toContain(`cursor="${result.nextCursor}"`);
   });
 });
