@@ -37,14 +37,14 @@
         },
         {
           "name": "CHEMBL_REQUEST_TIMEOUT_MS",
-          "description": "Per-request timeout in milliseconds for upstream ChEMBL fetches.",
+          "description": "Per-attempt timeout in milliseconds for an upstream ChEMBL request, capped by what is left of the call's time budget (45 s for most calls, CHEMBL_SPILL_DEADLINE_MS for a bioactivity spill).",
           "format": "string",
           "isRequired": false,
           "default": "30000"
         },
         {
           "name": "CHEMBL_MAX_PAGE_SIZE",
-          "description": "ChEMBL per-page cap when streaming activity pages for the bioactivity spill (max 1000).",
+          "description": "Rows per upstream ChEMBL page (max 1000). The bioactivity spill walks pages of this size; an inline bioactivity page requests its limit, capped at this size.",
           "format": "string",
           "isRequired": false,
           "default": "1000"
@@ -58,10 +58,24 @@
         },
         {
           "name": "CHEMBL_MAX_SPILL_ROWS",
-          "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page drain behind it. Over the cap the response reports truncated: true.",
+          "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page walk behind it. Over the cap the response reports truncated: true and truncated_by: \"row_cap\".",
           "format": "string",
           "isRequired": false,
           "default": "50000"
+        },
+        {
+          "name": "CHEMBL_MAX_CONCURRENT_PAGES",
+          "description": "Most chembl_get_bioactivities spill-page requests in flight at once (1–6), shared by every call on the server.",
+          "format": "string",
+          "isRequired": false,
+          "default": "4"
+        },
+        {
+          "name": "CHEMBL_SPILL_DEADLINE_MS",
+          "description": "Time budget in milliseconds for one chembl_get_bioactivities spill, its count and page walk (10000–600000). At expiry the rows fetched so far stage with truncated: true and truncated_by: \"time_budget\".",
+          "format": "string",
+          "isRequired": false,
+          "default": "45000"
         },
         {
           "name": "CHEMBL_DATAFRAME_DROP_ENABLED",
@@ -146,14 +160,14 @@
         },
         {
           "name": "CHEMBL_REQUEST_TIMEOUT_MS",
-          "description": "Per-request timeout in milliseconds for upstream ChEMBL fetches.",
+          "description": "Per-attempt timeout in milliseconds for an upstream ChEMBL request, capped by what is left of the call's time budget (45 s for most calls, CHEMBL_SPILL_DEADLINE_MS for a bioactivity spill).",
           "format": "string",
           "isRequired": false,
           "default": "30000"
         },
         {
           "name": "CHEMBL_MAX_PAGE_SIZE",
-          "description": "ChEMBL per-page cap when streaming activity pages for the bioactivity spill (max 1000).",
+          "description": "Rows per upstream ChEMBL page (max 1000). The bioactivity spill walks pages of this size; an inline bioactivity page requests its limit, capped at this size.",
           "format": "string",
           "isRequired": false,
           "default": "1000"
@@ -167,10 +181,24 @@
         },
         {
           "name": "CHEMBL_MAX_SPILL_ROWS",
-          "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page drain behind it. Over the cap the response reports truncated: true.",
+          "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page walk behind it. Over the cap the response reports truncated: true and truncated_by: \"row_cap\".",
           "format": "string",
           "isRequired": false,
           "default": "50000"
+        },
+        {
+          "name": "CHEMBL_MAX_CONCURRENT_PAGES",
+          "description": "Most chembl_get_bioactivities spill-page requests in flight at once (1–6), shared by every call on the server.",
+          "format": "string",
+          "isRequired": false,
+          "default": "4"
+        },
+        {
+          "name": "CHEMBL_SPILL_DEADLINE_MS",
+          "description": "Time budget in milliseconds for one chembl_get_bioactivities spill, its count and page walk (10000–600000). At expiry the rows fetched so far stage with truncated: true and truncated_by: \"time_budget\".",
+          "format": "string",
+          "isRequired": false,
+          "default": "45000"
         },
         {
           "name": "CHEMBL_DATAFRAME_DROP_ENABLED",

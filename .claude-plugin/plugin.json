@@ -20,12 +20,84 @@
     "bioactivity",
     "cheminformatics"
   ],
+  "userConfig": {
+    "CANVAS_PROVIDER_TYPE": {
+      "type": "string",
+      "title": "DataCanvas provider",
+      "description": "Set to 'duckdb' to enable the bioactivity DataCanvas spill and the chembl_dataframe_* SQL tools. When 'none', large bioactivity sets inline a preview but never spill.",
+      "default": ""
+    },
+    "CHEMBL_API_BASE_URL": {
+      "type": "string",
+      "title": "ChEMBL API base URL",
+      "description": "Base URL for the ChEMBL REST data API. Override for a private mirror or pinned host.",
+      "default": ""
+    },
+    "CHEMBL_REQUEST_TIMEOUT_MS": {
+      "type": "string",
+      "title": "Request timeout (ms)",
+      "description": "Per-attempt timeout in milliseconds for an upstream ChEMBL request, capped by what is left of the call's time budget (45 s for most calls, CHEMBL_SPILL_DEADLINE_MS for a bioactivity spill).",
+      "default": ""
+    },
+    "CHEMBL_MAX_PAGE_SIZE": {
+      "type": "string",
+      "title": "Max page size",
+      "description": "Rows per upstream ChEMBL page (max 1000). The bioactivity spill walks pages of this size; an inline bioactivity page requests its limit, capped at this size.",
+      "default": ""
+    },
+    "CHEMBL_DEFAULT_LIMIT": {
+      "type": "string",
+      "title": "Default result limit",
+      "description": "Default result limit applied when callers omit it.",
+      "default": ""
+    },
+    "CHEMBL_MAX_SPILL_ROWS": {
+      "type": "string",
+      "title": "Max spill rows",
+      "description": "Ceiling on rows chembl_get_bioactivities stages to a DataCanvas table, and so on the upstream page walk behind it. Over the cap the response reports truncated: true and truncated_by: \"row_cap\".",
+      "default": ""
+    },
+    "CHEMBL_MAX_CONCURRENT_PAGES": {
+      "type": "string",
+      "title": "Max concurrent spill pages",
+      "description": "Most chembl_get_bioactivities spill-page requests in flight at once (1–6), shared by every call on the server.",
+      "default": ""
+    },
+    "CHEMBL_SPILL_DEADLINE_MS": {
+      "type": "string",
+      "title": "Spill time budget (ms)",
+      "description": "Time budget in milliseconds for one chembl_get_bioactivities spill, its count and page walk (10000–600000). At expiry the rows fetched so far stage with truncated: true and truncated_by: \"time_budget\".",
+      "default": ""
+    },
+    "CHEMBL_DATAFRAME_DROP_ENABLED": {
+      "type": "string",
+      "title": "Enable chembl_dataframe_drop",
+      "description": "Set to 'true' to register the opt-in chembl_dataframe_drop tool (absent from tools/list when off).",
+      "default": ""
+    },
+    "MCP_LOG_LEVEL": {
+      "type": "string",
+      "title": "Log level",
+      "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
+      "default": ""
+    }
+  },
   "mcpServers": {
     "chembl-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/chembl-mcp-server"],
       "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "CANVAS_PROVIDER_TYPE": "${user_config.CANVAS_PROVIDER_TYPE}",
+        "CHEMBL_API_BASE_URL": "${user_config.CHEMBL_API_BASE_URL}",
+        "CHEMBL_REQUEST_TIMEOUT_MS": "${user_config.CHEMBL_REQUEST_TIMEOUT_MS}",
+        "CHEMBL_MAX_PAGE_SIZE": "${user_config.CHEMBL_MAX_PAGE_SIZE}",
+        "CHEMBL_DEFAULT_LIMIT": "${user_config.CHEMBL_DEFAULT_LIMIT}",
+        "CHEMBL_MAX_SPILL_ROWS": "${user_config.CHEMBL_MAX_SPILL_ROWS}",
+        "CHEMBL_MAX_CONCURRENT_PAGES": "${user_config.CHEMBL_MAX_CONCURRENT_PAGES}",
+        "CHEMBL_SPILL_DEADLINE_MS": "${user_config.CHEMBL_SPILL_DEADLINE_MS}",
+        "CHEMBL_DATAFRAME_DROP_ENABLED": "${user_config.CHEMBL_DATAFRAME_DROP_ENABLED}",
+        "MCP_LOG_LEVEL": "${user_config.MCP_LOG_LEVEL}"
       }
     }
   }

@@ -19,7 +19,12 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "CHEMBL_API_BASE_URL": "${user_config.CHEMBL_API_BASE_URL}",
+        "CHEMBL_REQUEST_TIMEOUT_MS": "${user_config.CHEMBL_REQUEST_TIMEOUT_MS}",
+        "CHEMBL_MAX_PAGE_SIZE": "${user_config.CHEMBL_MAX_PAGE_SIZE}",
+        "CHEMBL_DEFAULT_LIMIT": "${user_config.CHEMBL_DEFAULT_LIMIT}",
+        "MCP_LOG_LEVEL": "${user_config.MCP_LOG_LEVEL}"
       }
     }
   },
@@ -28,5 +33,36 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "CHEMBL_API_BASE_URL": {
+      "type": "string",
+      "title": "ChEMBL API base URL",
+      "description": "Base URL for the ChEMBL REST data API. Override for a private mirror or pinned host.",
+      "default": ""
+    },
+    "CHEMBL_REQUEST_TIMEOUT_MS": {
+      "type": "string",
+      "title": "Request timeout (ms)",
+      "description": "Per-attempt timeout in milliseconds for an upstream ChEMBL request, capped by what is left of the call's time budget (45 s for most calls, CHEMBL_SPILL_DEADLINE_MS for a bioactivity spill).",
+      "default": ""
+    },
+    "CHEMBL_MAX_PAGE_SIZE": {
+      "type": "string",
+      "title": "Max page size",
+      "description": "Rows per upstream ChEMBL page (max 1000). The bioactivity spill walks pages of this size; an inline bioactivity page requests its limit, capped at this size.",
+      "default": ""
+    },
+    "CHEMBL_DEFAULT_LIMIT": {
+      "type": "string",
+      "title": "Default result limit",
+      "description": "Default result limit applied when callers omit it.",
+      "default": ""
+    },
+    "MCP_LOG_LEVEL": {
+      "type": "string",
+      "title": "Log level",
+      "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
+      "default": ""
+    }
+  }
 }

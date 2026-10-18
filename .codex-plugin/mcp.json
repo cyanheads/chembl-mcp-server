@@ -4,6 +4,18 @@
     "args": ["-y", "@cyanheads/chembl-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
-    }
+    },
+    "env_vars": [
+      "CANVAS_PROVIDER_TYPE",
+      "CHEMBL_API_BASE_URL",
+      "CHEMBL_REQUEST_TIMEOUT_MS",
+      "CHEMBL_MAX_PAGE_SIZE",
+      "CHEMBL_DEFAULT_LIMIT",
+      "CHEMBL_MAX_SPILL_ROWS",
+      "CHEMBL_MAX_CONCURRENT_PAGES",
+      "CHEMBL_SPILL_DEADLINE_MS",
+      "CHEMBL_DATAFRAME_DROP_ENABLED",
+      "MCP_LOG_LEVEL"
+    ]
   }
 }
