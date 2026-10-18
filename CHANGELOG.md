@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-17 · ⚠️ Breaking
+
+chembl_get_bioactivities spills pages concurrently under a time budget, pages inline views with cursors, and mints a canvas only when a view spills. Calls hold upstream requests to 45 s, and chembl_dataframe_query refuses the SQL the mcp-ts-core 0.13.15 gate denies.
+
 ## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-10-10
 
 mcp-ts-core 0.13.14 accepts numeric-string search limits and null optional arguments; tool errors carry request IDs, and registry launch metadata and Docker dependency stages track the framework.
