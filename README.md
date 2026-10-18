@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Drug-discovery data over ChEMBL (EBI) — the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and indications. Search compounds by name, ID, or structure, resolve protein targets, rank bioactivity measurements, and look up drug mechanisms and indications from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Drug-discovery data from ChEMBL (EBI): the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and indications. Search compounds by name, ID, or structure, resolve targets, and rank the most potent measurements.
 
 ### Tools
 
@@ -40,7 +40,7 @@ Drug-discovery data over ChEMBL (EBI) — the curated link between compounds, pr
 | `chembl_search_targets` | Resolve a protein / gene symbol / UniProt accession to the ChEMBL target ID `chembl_get_bioactivities` needs. |
 | `chembl_get_drug_info` | Drug pharmacology — mechanism(s) of action, molecular target(s), action type, first-approval year, and clinical indications. |
 | `chembl_get_assay` | Assay provenance behind a bioactivity row — type, target, organism, and ChEMBL's 1–9 confidence score. |
-| `chembl_dataframe_query` | Run a read-only SQL `SELECT` over the bioactivity rows spilled to a canvas — rank, group, dedupe, aggregate across the full set. |
+| `chembl_dataframe_query` | Run a read-only SQL `SELECT` over the bioactivity rows staged on a canvas — rank, group, dedupe, aggregate across the full set. |
 | `chembl_dataframe_describe` | List the tables and columns staged on a canvas, so you can write correct SQL before querying. |
 | `chembl_dataframe_drop` | Drop a named staged table from a canvas. Opt-in via `CHEMBL_DATAFRAME_DROP_ENABLED=true` — absent from `tools/list` when off, since TTL already reclaims staged tables. |
 
@@ -71,8 +71,11 @@ All resource data is also reachable via the tools, so tool-only MCP clients lose
 - Filter by `standard_type` (IC50/Ki/EC50/…), `pchembl_value_min`, `assay_type`, `organism`; ranked on `pchembl_value` — comparable only within one `standard_type`
 - `potency_view` selects `potency_ranked` (default, measurements with a derivable `pchembl_value`) or `null_potency` (the excluded rows); `pchembl_value_min` with `null_potency` is a `contradictory_potency_filter` error, and `totalCount` spans both views
 - Numerics are coerced to `number | null` at the service boundary — a missing potency reads as `null`, never `0`
-- Large sets spill to a DataCanvas table per view (`bioactivities` / `bioactivities_null_potency`), capped at `CHEMBL_MAX_SPILL_ROWS` (default 50,000) and reported `truncated: true` + `staged_row_count` when hit; requires `CANVAS_PROVIDER_TYPE=duckdb`
-- The inline preview is always capped at `limit` (default 25) regardless of spill status; the optional `canvas_id` reuses a canvas, but re-querying the same view replaces its prior rows
+- Large sets spill to a DataCanvas table per view (`bioactivities` / `bioactivities_null_potency`); requires `CANVAS_PROVIDER_TYPE=duckdb`
+- The spill fetches its pages `CHEMBL_MAX_CONCURRENT_PAGES` at a time (default 4) and stays inside a row cap, `CHEMBL_MAX_SPILL_ROWS` (default 50,000), and a time budget, `CHEMBL_SPILL_DEADLINE_MS` (default 45 s). When either bound stops it short of the view, the response reports `truncated: true`, `staged_row_count`, and `truncated_by` (`row_cap` or `time_budget`)
+- The inline preview is always capped at `limit` (default 25) regardless of spill status
+- A canvas is minted only when the view spills, so an inline fit holds no canvas; pass the returned `canvas_id` back and each later non-cursor call re-stages that view's table with its own rows — even when they fit inline or none match — replacing the prior rows, while the other view's table stays put. A spill replaces the table only once it succeeds, so one that fails or is cancelled leaves the prior rows. At the per-tenant canvas cap, a spill without `canvas_id` fails as `canvas_capacity_exhausted`
+- Whenever a call stages nothing (the canvas is disabled, or the view fit inline with no `canvas_id`), the view comes back a page at a time via `nextCursor` / `cursor`, omitted (not null) on the last page — redeem a cursor with the same filters and `potency_view` that minted it; a cursor page is served inline and never staged, even with the canvas enabled
 
 ---
 
@@ -105,7 +108,7 @@ All resource data is also reachable via the tools, so tool-only MCP clients lose
 
 ### `chembl_dataframe_query` <sub>tool</sub>
 
-- Accepts a single read-only `SELECT` against a `canvas_id` from a spilled `chembl_get_bioactivities` call; writes, DDL, and non-SELECT statements are rejected by the framework SQL gate
+- Accepts a single read-only `SELECT` against a `canvas_id` from a `chembl_get_bioactivities` call that staged a table; writes, DDL, and non-SELECT statements are rejected by the framework SQL gate
 - Reference each staged table by the name `chembl_get_bioactivities` returned — `bioactivities` (potency_ranked) or `bioactivities_null_potency` (null_potency); discover columns with `chembl_dataframe_describe` first
 - Two independent bounds, each disclosed: `truncated` is the canvas engine's own query-result cap; `rendered_rows` is how many rows the `content[]` markdown table holds under its character budget — either can trip without the other; page past both with SQL `LIMIT`/`OFFSET`
 - `structuredContent.rows` always carries the full materialized result regardless of the render bound
@@ -115,7 +118,7 @@ All resource data is also reachable via the tools, so tool-only MCP clients lose
 
 ### `chembl_dataframe_describe` <sub>tool</sub>
 
-- Supply a `canvas_id` from a spilled `chembl_get_bioactivities` call
+- Supply a `canvas_id` from a `chembl_get_bioactivities` call that staged a table
 - Returns each staged table/view with its row count, kind, and column names + types
 - Requires `CANVAS_PROVIDER_TYPE=duckdb`, else a `canvas_disabled` error
 
@@ -124,8 +127,9 @@ All resource data is also reachable via the tools, so tool-only MCP clients lose
 ### `chembl_dataframe_drop` <sub>tool</sub>
 
 - Opt-in — registered only when `CHEMBL_DATAFRAME_DROP_ENABLED=true`; absent from `tools/list` when off, though it still appears in the server manifest carrying the enable hint
-- Drops a named staged table by `canvas_id` + `table_name`; returns `dropped: true` if it existed, `false` if already gone
-- Rarely needed — per-table and per-canvas TTL already reclaim staged tables; reach for it only to free a large table early in a long session
+- Drops a named staged table by `canvas_id` + `table_name`; returns `dropped: true` if it existed, `false` if the live canvas holds no table by that name
+- An unknown or expired `canvas_id` fails as `canvas_not_found` — an expired canvas has already freed its tables, so there is nothing left to drop
+- Rarely needed — a staged table lives as long as its canvas, which expires on its sliding TTL (`CANVAS_TTL_MS`, default 24 h) or its absolute cap (`CANVAS_ABSOLUTE_CAP_MS`, default 7 days) and frees every table on it; reach for it only to free a large table early in a long session
 - Requires `CANVAS_PROVIDER_TYPE=duckdb`
 
 ---
@@ -159,8 +163,9 @@ ChEMBL-specific:
 Agent-friendly output:
 
 - Provenance on every response — total-found counts, applied-filter echo, and a spill notice so agents know whether the preview is the full set or a slice of a canvas table
-- Truncation disclosure — capped searches report `shown` / `cap` / `totalCount`, and spilled tables report `truncated` + `staged_row_count`, so a page or slice is never mistaken for the complete set
-- Typed, recoverable errors — `missing_filter` / `missing_input` / `contradictory_potency_filter` / `canvas_disabled` carry recovery hints, so callers correct the call without parsing prose
+- Truncation disclosure — capped searches report `shown` / `cap` / `totalCount`, and spilled tables report `truncated` + `staged_row_count` + `truncated_by`, so a page or slice is never mistaken for the complete set
+- Bounded latency — every call holds its upstream requests, retries included, to one 45 s budget, so a hung upstream fails as `upstream_timeout` before an MCP client's 60 s timeout; a spill's budget is `CHEMBL_SPILL_DEADLINE_MS` (default 45 s), and at expiry the rows fetched so far stage with `truncated_by: "time_budget"`
+- Typed, recoverable errors — `missing_filter` / `missing_input` / `contradictory_potency_filter` / `canvas_disabled` / `canvas_capacity_exhausted` carry recovery hints, so callers correct the call without parsing prose
 - Never fabricates — normalization and `format()` preserve `null` potency / units; a missing measurement renders as "not reported", never `0`
 
 ## Getting started
@@ -277,22 +282,24 @@ cp .env.example .env
 
 ## Configuration
 
-All configuration is validated at startup via Zod schemas in `src/config/server-config.ts`. ChEMBL is keyless, so every variable is optional.
+The `CHEMBL_*` variables are validated at startup by the Zod schema in `src/config/server-config.ts`: an invalid value stops the server with a configuration banner naming the variable. The framework validates the rest and also refuses to start on an invalid value. A blank value falls back to its default. ChEMBL is keyless, so every variable is optional.
 
 | Variable | Description | Default |
 |:---|:---|:---|
 | `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable the bioactivity spill and the `chembl_dataframe_*` SQL tools. When `none`, large sets inline a preview but never spill. | `none` |
 | `CHEMBL_API_BASE_URL` | Base URL for the ChEMBL REST data API. Override for a private mirror or pinned host. | `https://www.ebi.ac.uk/chembl/api/data` |
-| `CHEMBL_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds for upstream ChEMBL fetches. | `30000` |
-| `CHEMBL_MAX_PAGE_SIZE` | ChEMBL per-page cap when streaming activity pages for the spill (max 1000). | `1000` |
+| `CHEMBL_REQUEST_TIMEOUT_MS` | Per-attempt timeout in milliseconds for an upstream ChEMBL request, capped by what is left of the call's time budget (45 s for most calls, `CHEMBL_SPILL_DEADLINE_MS` for a bioactivity spill). | `30000` |
+| `CHEMBL_MAX_PAGE_SIZE` | Rows per upstream ChEMBL page (max 1000). The bioactivity spill walks pages of this size; an inline bioactivity page requests its `limit`, capped at this size. | `1000` |
 | `CHEMBL_DEFAULT_LIMIT` | Default result limit applied when callers omit it. | `25` |
-| `CHEMBL_MAX_SPILL_ROWS` | Ceiling on rows `chembl_get_bioactivities` stages to a canvas table, and so on the upstream page drain behind it. Over the cap the response reports `truncated: true`. | `50000` |
+| `CHEMBL_MAX_SPILL_ROWS` | Ceiling on rows `chembl_get_bioactivities` stages to a canvas table, and so on the upstream page walk behind it. Over the cap the response reports `truncated: true` and `truncated_by: "row_cap"`. | `50000` |
+| `CHEMBL_MAX_CONCURRENT_PAGES` | Most `chembl_get_bioactivities` spill-page requests in flight at once (1–6), shared by every call on the server. | `4` |
+| `CHEMBL_SPILL_DEADLINE_MS` | Time budget in milliseconds for one `chembl_get_bioactivities` spill, its count and page walk (10000–600000). At expiry the rows fetched so far stage with `truncated: true` and `truncated_by: "time_budget"`. | `45000` |
 | `CHEMBL_DATAFRAME_DROP_ENABLED` | Register the opt-in `chembl_dataframe_drop` tool (absent from `tools/list` when off). | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
 | `MCP_SESSION_MODE` | HTTP session posture; `stateless`, `stateful`, or `auto` (resolves to `stateful`). Overrides the server's stateless declaration. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
-| `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
+| `MCP_LOG_LEVEL` | Log level (RFC 5424). | `debug` (the Docker image sets `info`) |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
 | `LOG_TOOL_FAILURE_PAYLOADS` | Log failed calls' arguments and results with key-name redaction; secrets inside free-form values remain visible. | `false` |
 | `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` | UTF-8 byte cap per logged input/result payload. | `16384` |
@@ -301,6 +308,8 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Explicit full endpoint for OTLP log export. Requires the optional log peers; included in the default Docker build. | — |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
+
+Installed as a Claude Code plugin, a Codex plugin, or the Claude Desktop `.mcpb` bundle, the server takes the `CANVAS_PROVIDER_TYPE`, `CHEMBL_*`, and `MCP_LOG_LEVEL` settings above without an `env` block: the Claude Code plugin and the `.mcpb` bundle declare them as install options (in Claude Code, `/plugin configure` changes them later), Codex forwards them from the environment it runs in, and an option left blank keeps its default. The `.mcpb` bundle ships without DuckDB's native binding, so it runs with the canvas off and leaves out the options that only matter with it on (`CANVAS_PROVIDER_TYPE`, `CHEMBL_DATAFRAME_DROP_ENABLED`, `CHEMBL_MAX_SPILL_ROWS`, `CHEMBL_MAX_CONCURRENT_PAGES`, `CHEMBL_SPILL_DEADLINE_MS`); use an `npx` or `bunx` install for the SQL path.
 
 ## Running the server
 

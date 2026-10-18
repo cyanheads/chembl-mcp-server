@@ -5,7 +5,7 @@
 > framework and the live ChEMBL REST API (probed against `www.ebi.ac.uk/chembl/api/data/` during design).
 
 Display identity is the hyphenated repo name **`chembl-mcp-server`** on every surface (`createApp()`
-`name`/`title`, manifest `display_name`, docs headers) — never a Title-Cased "ChEMBL MCP Server".
+`name`/`title`, manifest `name`, docs headers) — never a Title-Cased "ChEMBL MCP Server".
 
 ---
 
@@ -15,21 +15,21 @@ Display identity is the hyphenated repo name **`chembl-mcp-server`** on every su
 
 | Tool | Summary | readOnlyHint | openWorldHint | Key inputs | Output shape |
 |---|---|---|---|---|---|
-| `chembl_search_molecules` | Discovery entry point. Find compounds by name / ChEMBL ID / InChIKey, or run a structure search (exact \| similarity \| substructure) from a SMILES/InChI. `search_type` defaults to `name`; `structure` is required when `search_type` is `exact`, `similarity`, or `substructure`. At least one of `query` or `structure` must be supplied. | `true` | `true` | `query?`, `structure?`, `search_type` (default `name`), `similarity_threshold?` (integer 40–100, default 70), `max_phase_min?`, `limit` | `{ molecules[] }` — ChEMBL ID, pref_name, canonical SMILES, formula, MW, AlogP, RO5 violations, QED, max_phase, (similarity score 0–100 when structure search); `totalCount`/`truncated`/`shown`/`cap` via enrichment |
-| `chembl_get_bioactivities` | **Flagship.** Bioactivity measurements for a molecule, a target, or **both** (the compound↔target↔assay bridge). At least one of `molecule_chembl_id` or `target_chembl_id` is required — both together ANDs upstream and narrows to that compound–target pair, neither is a `missing_filter` error. Filters by standard_type, potency, assay type, organism. `potency_view` selects which side of the `pchembl_value` presence split is retrieved: `potency_ranked` (default, `pchembl_value__isnull=false`, ranked most-potent-first) or `null_potency` (`pchembl_value__isnull=true`, the rows the ranked view excludes). `totalCount` spans both (separate `limit:1` call, no isnull filter). Large sets spill to DataCanvas, one table per view, capped at `CHEMBL_MAX_SPILL_ROWS`. | `true` | `true` | at least one of `molecule_chembl_id?` / `target_chembl_id?`, `standard_type?`, `pchembl_value_min?`, `assay_type?`, `organism?`, `potency_view` (default `potency_ranked`), `limit`, `canvas_id?` | `{ activities[], totalCount, potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, canvasDisabled }` per-measurement: molecule, target, assay, standard_type/value/units, pchembl_value, assay confidence |
-| `chembl_search_targets` | Resolve a protein/gene/UniProt accession → ChEMBL target ID that `get_bioactivities` needs. At least one of `query`, `accession`, or `gene_symbol` must be supplied; omitting all returns a `ValidationError`. | `true` | `true` | `query?`, `accession?`, `gene_symbol?`, `organism?`, `target_type?`, `limit` | `{ targets[] }` — target_chembl_id, pref_name, target_type, organism, component accessions + gene symbols; `totalCount`/`truncated`/`shown`/`cap` via enrichment |
+| `chembl_search_molecules` | Discovery entry point. Find compounds by name / ChEMBL ID / InChIKey, or run a structure search (exact \| similarity \| substructure) from a SMILES/InChI. `search_type` defaults to `name`; `structure` is required when `search_type` is `exact`, `similarity`, or `substructure`. At least one of `query` or `structure` must be supplied. | `true` | `true` | `query?`, `structure?`, `search_type` (default `name`), `similarity_threshold?` (integer 40–100, default 70), `max_phase_min?`, `limit`, `cursor?` | `{ molecules[], nextCursor? }` — ChEMBL ID, pref_name, canonical SMILES, formula, MW, AlogP, RO5 violations, QED, max_phase, (similarity score 0–100 when structure search); `totalCount`/`truncated`/`shown`/`cap` via enrichment |
+| `chembl_get_bioactivities` | **Flagship.** Bioactivity measurements for a molecule, a target, or **both** (the compound↔target↔assay bridge). At least one of `molecule_chembl_id` or `target_chembl_id` is required — both together ANDs upstream and narrows to that compound–target pair, neither is a `missing_filter` error. Filters by standard_type, potency, assay type, organism. `potency_view` selects which side of the `pchembl_value` presence split is retrieved: `potency_ranked` (default, `pchembl_value__isnull=false`, ranked most-potent-first with ties broken on `activity_id`) or `null_potency` (`pchembl_value__isnull=true`, the rows the ranked view excludes, in `activity_id` order). Either view is walked by offset on that total order. `totalCount` spans both (separate `limit:1` call, no isnull filter). Large sets spill to DataCanvas, one table per view, capped at `CHEMBL_MAX_SPILL_ROWS`; a canvas is minted only on a spill, and a supplied `canvas_id` has the view re-staged on every non-cursor call, a spill replacing its table only once it succeeds. Whenever a call stages nothing (the canvas off, or an inline fit with no `canvas_id`), `cursor` / `nextCursor` walk the view a page at a time; a cursor page is always served inline and never stages, canvas or not. | `true` | `true` | at least one of `molecule_chembl_id?` / `target_chembl_id?`, `standard_type?`, `pchembl_value_min?`, `assay_type?`, `organism?`, `potency_view` (default `potency_ranked`), `limit`, `canvas_id?`, `cursor?` | `{ activities[], totalCount, potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, truncated_by, canvasDisabled, nextCursor? }` per-measurement: molecule, target, assay (ID, type, description), standard_type/relation/value/units, pchembl_value, raw type/value/units/relation (assay confidence comes from `chembl_get_assay`) |
+| `chembl_search_targets` | Resolve a protein/gene/UniProt accession → ChEMBL target ID that `get_bioactivities` needs. At least one of `query`, `accession`, or `gene_symbol` must be supplied; omitting all fails as `missing_input` (`InvalidParams`). | `true` | `true` | `query?`, `accession?`, `gene_symbol?`, `organism?`, `target_type?`, `limit`, `cursor?` | `{ targets[], nextCursor? }` — target_chembl_id, pref_name, target_type, organism, component accessions + gene symbols; `totalCount`/`truncated`/`shown`/`cap` via enrichment |
 | `chembl_get_drug_info` | Pharmacology for a drug (molecule): mechanism(s) of action, molecular target(s), action type, first-approval year, indications + max phase. `molecule_chembl_id` comes from `chembl_search_molecules`. | `true` | `true` | `molecule_chembl_id` (from `chembl_search_molecules`) | `{ molecule_chembl_id, pref_name, max_phase, first_approval, mechanisms[], mechanisms_status, mechanisms_total_count, indications[], indications_status, indications_total_count }` — each secondary list carries its own `complete`\|`truncated`\|`failed` state + upstream total, so an empty array is never ambiguous |
-| `chembl_get_assay` | Assay detail by assay ChEMBL ID — provenance behind a bioactivity row (type, target, organism, confidence). `assay_chembl_id` comes from a bioactivity row's `assay_chembl_id` field. | `true` | `true` | `assay_chembl_id` (from a bioactivity row) | `{ assay_chembl_id, description, assay_type, target_chembl_id?, organism?, confidence_score?, confidence_description? }` — confidence_score is ChEMBL's 1–9 scale (9 = direct assay on protein target) |
-| `chembl_dataframe_query` | Run read-only SQL `SELECT` over the bioactivity rows `chembl_get_bioactivities` spilled to a canvas (rank, group, dedupe, aggregate across the **full** set). Two independent bounds, each on its own field: the canvas row limit caps the result set (`truncated`), and a character budget caps the markdown table rendered into `content[]` (`rendered_rows`). SQL `LIMIT`/`OFFSET` pages past both. | `true` | `false` | `canvas_id`, `sql` | `{ rows[], row_count, rendered_rows, truncated }` — `truncated` signals the SQL result was row-capped by the canvas (not the spill); `rendered_rows` signals the rendered table was budget-capped (not the data) |
+| `chembl_get_assay` | Assay detail by assay ChEMBL ID — provenance behind a bioactivity row (type, target, organism, confidence). `assay_chembl_id` comes from a bioactivity row's `assay_chembl_id` field. | `true` | `true` | `assay_chembl_id` (from a bioactivity row) | `{ assay_chembl_id, description, assay_type, assay_type_description, target_chembl_id, organism, confidence_score, confidence_description }` (every field but the ID nullable) — confidence_score is ChEMBL's 1–9 scale (9 = direct assay on protein target) |
+| `chembl_dataframe_query` | Run read-only SQL `SELECT` over the bioactivity rows `chembl_get_bioactivities` staged on a canvas (rank, group, dedupe, aggregate across the **full** set). Two independent bounds, each on its own field: the canvas row limit caps the result set (`truncated`), and a character budget caps the markdown table rendered into `content[]` (`rendered_rows`). SQL `LIMIT`/`OFFSET` pages past both. | `true` | `false` | `canvas_id`, `sql` | `{ rows[], row_count, rendered_rows, truncated }` — `truncated` signals the SQL result was row-capped by the canvas (not the spill); `rendered_rows` signals the rendered table was budget-capped (not the data) |
 | `chembl_dataframe_describe` | List tables + columns staged on a canvas, so the agent can write correct SQL before calling `chembl_dataframe_query`. | `true` | `false` | `canvas_id` | `{ tables[] }` — name, kind (`table`\|`view`), row_count, columns (name + type) |
-| `chembl_dataframe_drop` | Drop a named staged table from a canvas (`instance.drop`). **Opt-in** behind `CHEMBL_DATAFRAME_DROP_ENABLED=true` (default off) and **conditionally registered** — absent from `tools/list` when the flag is off. Off by default because per-table/canvas TTL already reclaims staged tables; the tool only matters when an agent wants to free a large table early within a long session. | `false` | `false` | `canvas_id`, `table_name` | `{ dropped }` — `true` if the table existed and was dropped, `false` if it was already gone |
+| `chembl_dataframe_drop` | Drop a named staged table from a canvas (`instance.drop`). **Opt-in** behind `CHEMBL_DATAFRAME_DROP_ENABLED=true` (default off) and **conditionally registered** — absent from `tools/list` when the flag is off. Off by default because the canvas's sliding TTL already reclaims staged tables; the tool only matters when an agent wants to free a large table early within a long session. | `false` | `false` | `canvas_id`, `table_name` | `{ dropped }` — `true` if the table existed and was dropped, `false` if the live canvas holds no table by that name; an unknown or expired `canvas_id` fails as `canvas_not_found` |
 
 **8 tools** (7 always registered; `chembl_dataframe_drop` registers only when its env flag is on). The 5
 from `idea.md`'s sketch, plus the 3 standardized DataCanvas consumer tools the spill in
 `chembl_get_bioactivities` makes the home for — `idea.md` names `chembl_dataframe_query` explicitly
 (Design Notes), and the framework's DataCanvas contract requires a `dataframe_query` tool wherever a
 tool emits a `canvas_id` (a token with no query tool is dead output), with `dataframe_describe`
-strongly recommended so the agent can discover staged table/column names and `dataframe_drop` the
+required alongside it so the agent can discover staged table/column names and `dataframe_drop` the
 opt-in third (off by default; TTL handles cleanup). See **Design Decisions**.
 
 ### Resources
@@ -41,7 +41,7 @@ opt-in third (off by default; TTL handles cleanup). See **Design Decisions**.
 
 Both are read-only, URI-addressable, and fully covered by the tool surface (a tool-only client never
 needs them) — they exist only as injectable context for clients that support resources. `{chemblId}`
-is validated against the `CHEMBL\d+` pattern. **Optional for v1** — ship if cheap, defer without loss.
+is validated against the `CHEMBL\d+` pattern. **Shipped in v1** as optional convenience.
 
 ### Prompts
 
@@ -100,9 +100,19 @@ them IC50), so it pairs an inline preview with a DataCanvas spill that the agent
 
 - **No auth.** ChEMBL is keyless; server runs `MCP_AUTH_MODE=none` for stdio, no scopes on tools.
 - **Rate limits.** ChEMBL is generous but unspecified; be a good citizen — a `User-Agent`, modest
-  default `limit` (25), the framework's `withRetry` with ~1–2 s backoff on 429/5xx. No batching
+  default `limit` (25), the framework's `withRetry` with ~1–2 s backoff on 429/5xx, and at most
+  `CHEMBL_MAX_CONCURRENT_PAGES` spill pages in flight across the whole server. No batching
   endpoint exists (`filter.ids`-style bulk GET is not part of the ChEMBL data API), so single-record
   fetches stay single calls.
+- **Every call settles under the client's timeout.** MCP SDK clients abandon a request at 60 s by
+  default. All the upstream requests of one tool or resource call — chained, concurrent, retried —
+  share one deadline: 45 s (`CALL_DEADLINE_MS`), or `CHEMBL_SPILL_DEADLINE_MS` for a canvas-on
+  `chembl_get_bioactivities` call without a cursor (its count and spill walk, whether or not the view
+  ends up spilling). No request starts once it is spent, each attempt's timeout is
+  `CHEMBL_REQUEST_TIMEOUT_MS` or what is left, whichever is less, and `withRetry`'s `deadlineMs` ends the
+  ladder at the expiry, or before an exponential backoff that would outlast it. Either stop fails as the
+  retryable `upstream_timeout` (a `Retry-After` wait that would outlast the budget rethrows the
+  attempt's own error, e.g. `rate_limited`); a caller's cancellation still surfaces as cancelled.
 - **Licensing / attribution.** ChEMBL data is **CC BY-SA 3.0**. Share-alike binds downstream
   *redistribution* of the data, not serving it via MCP; the practical obligation is **attribution in
   output** — carry a source/attribution line. Surface it in `instructions` and/or per-tool output.
@@ -130,7 +140,7 @@ load-bearing detail:
 | Molecule ChEMBL ID | `CHEMBL\d+` | a compound/drug | `chembl_search_molecules` rows; a bioactivity row's `molecule_chembl_id` |
 | Target ChEMBL ID | `CHEMBL\d+` | a protein/complex/cell-line/organism target | `chembl_search_targets` rows; a bioactivity row's `target_chembl_id` |
 | Assay ChEMBL ID | `CHEMBL\d+` | one assay | a bioactivity row's `assay_chembl_id` (input to `chembl_get_assay`) |
-| `canvas_id` | opaque 10-char | a spilled DataCanvas | returned by `chembl_get_bioactivities` when `spilled: true` |
+| `canvas_id` | opaque 10-char | a DataCanvas holding a staged view | returned by `chembl_get_bioactivities` when the view spills (minting the canvas), and echoed back when a supplied one was re-staged |
 
 Because the three ID classes share the `CHEMBL\d+` shape, the **field name** in every schema is the
 disambiguator (`molecule_chembl_id` vs `target_chembl_id` vs `assay_chembl_id`), and each `.describe()`
@@ -219,7 +229,7 @@ fetched independently of the molecule record, so an empty array has three possib
 be able to tell apart: ChEMBL records none (`complete`), the single-request page cap bounded the list
 (`truncated`, so the array is a prefix of `*_total_count` rows), or the fetch failed (`failed`, count
 `null` — unknown, never `0`, the same fidelity rule the numeric coercion follows). Each list is one
-request at `CHEMBL_MAX_PAGE_SIZE` rather than a `page_meta.next` walk: indication lists run to the low
+request at `CHEMBL_MAX_PAGE_SIZE` rather than a page walk: indication lists run to the low
 hundreds at the extreme (167 for aspirin, the largest observed), which one round trip covers, and
 `page_meta.total_count` rides back so a list that still overflows reports itself truncated instead of
 passing itself off as complete.
@@ -242,17 +252,45 @@ raw `type`/`value`/`units`/`relation` (those are present for audit but are not n
 
 | Service | Responsibility | Key methods |
 |---|---|---|
-| `ChemblService` (`src/services/chembl/chembl-service.ts`) | The single upstream client. Wraps `https://www.ebi.ac.uk/chembl/api/data/`; builds Django-style filtered URLs, fetches `.json`, paginates `page_meta`, **coerces string numerics → number/null at the boundary**, flattens nested structures (`molecule_structures`, `molecule_properties`, `target_components`) into the flat domain types above. Each method wraps its full fetch+parse in `withRetry`. | `searchMolecules(opts)`, `structureSearch(opts)`, `streamActivities(opts)` (returns an async-iterable page stream for spillover), `searchTargets(opts)`, `getMolecule(id)`, `getMechanisms(molId)`, `getIndications(molId)`, `getDrugInfo(molId)`, `getAssay(id)` |
+| `ChemblService` (`src/services/chembl/chembl-service.ts`) | The single upstream client. Wraps `https://www.ebi.ac.uk/chembl/api/data/`; builds Django-style filtered URLs, fetches `.json`, walks a bioactivity view by offset, **coerces string numerics → number/null at the boundary**, flattens nested structures (`molecule_structures`, `molecule_properties`, `target_components`) into the flat domain types above. Each method wraps its full fetch+parse in `withRetry` under one call deadline (`CallDeadline`), started at entry or passed in by a caller chaining methods; one `createPacer({ maxConcurrent })` per service caps the spill-page requests in flight across all calls. | `searchMolecules(opts)`, `structureSearch(opts)`, `countActivities(opts)`, `streamActivities(opts)` (the sequential inline page walk), `spillActivities(opts, walk)` (the concurrent, offset-ordered spill walk for spillover), `searchTargets(opts)`, `getMolecule(id)`, `getMechanisms(molId)`, `getIndications(molId)`, `getDrugInfo(molId)`, `getAssay(id)` |
 | `canvas-accessor` (`src/services/canvas-accessor.ts`) | Module-level holder for the optional `DataCanvas` wired in `createApp({ setup })`. `getCanvas()` returns `undefined` when canvas is disabled. | `setCanvas(core.canvas)`, `getCanvas()` |
 
-`chembl_get_bioactivities` uses `spillover({ canvas, source: chembl.streamActivities(...), previewChars, tableName: <the view's table>, caps: { maxRows: CHEMBL_MAX_SPILL_ROWS }, signal })`
+`chembl_get_bioactivities` uses `spillover({ canvas, source: chembl.spillActivities(...), previewChars, tableName: <the view's table, or its staging table>, schema: ACTIVITY_CANVAS_SCHEMA, caps: { maxRows: CHEMBL_MAX_SPILL_ROWS }, signal })`
 (with `previewChars = max(40_000, limit * 600)`) — preview rows inline, the selected `potency_view`
-staged as its own table. `previewChars` is a character budget on the drain buffer, not a row cap, so the
-handler slices the returned rows to `limit` afterwards (see *Output Design Notes*). The optional
-`canvas_id` input lets callers reuse an existing canvas, but a
-view is always re-registered under its own fixed table name, so a second query of the **same** view
-**replaces (overwrites)** its prior rows rather than appending to them, while the other view's table is
-left intact; omit `canvas_id` to mint a fresh canvas. `chembl_get_drug_info` composes `getMolecule` + `getMechanisms` +
+staged as its own table. The walk fetches the first page alone (it carries the view total), then
+every remaining offset below the view total and `CHEMBL_MAX_SPILL_ROWS` through an ordered window of
+`CHEMBL_MAX_CONCURRENT_PAGES` pending pages, yielding rows in offset order whatever order the pages
+land in; each page request queues on the service's pacer inside its retry. The first page failure
+abandons the walk's other pages. One `CHEMBL_SPILL_DEADLINE_MS` deadline covers the count and the walk:
+at expiry the contiguous prefix stages with `truncated_by: 'time_budget'`, and with nothing fetched the
+call fails as `upstream_timeout`. A page whose retries `withRetry` stops short of an exponential backoff
+the budget cannot hold counts as expiry too: it fails while the deadline still has time left, and its sanitized
+`upstream_timeout` carries `retry_deadline_exceeded` on `cause`. No page starts unless more of the
+budget is left than the latest page to land took on its final attempt (queueing included, its failed
+attempts and their backoff not): once the budget would not hold another page, the walk ends after the
+pages in flight and the prefix stages the same way, before the deadline expires. `spillover()` never closes a source it stops reading early, so the
+handler closes the walk afterwards, releasing pages still in flight. `previewChars` is a character budget on the drain buffer, not a row cap, so the
+handler slices the returned rows to `limit` afterwards (see *Output Design Notes*). Without a
+`canvas_id`, `spillover()` receives a stand-in instance that mints the canvas on its first
+`registerTable` — which `spillover()` makes only on a spill — so a call whose view fits inline never
+holds a tenant canvas slot, and a spill whose registration fails releases the canvas it minted before
+the error propagates (the stand-in goes once the framework acquires lazily, cyanheads/mcp-ts-core#501).
+A supplied `canvas_id` is acquired up front and re-staged on every non-cursor call. A spill goes
+through `spillover()` under a per-call staging table (`<view table>_staging_<12 hex>`), since
+registering under the view's own name drops its earlier table before the first row lands: once the
+spill succeeds (a deadline-cut prefix included), the handler drops the view's table, copies the
+staging table in with `query('SELECT * FROM <staging>', { registerAs, preview: 0 })`, and drops the
+staging table. `registerAs` refuses a name that exists (`register_as_clash`) rather than replacing
+it, so the swap is drop-then-copy; it takes no signal, so a cancellation cannot land inside it, and
+one already observed when it would begin drops the staging table and leaves the earlier table. A
+spill that fails or is cancelled leaves only its staging table to `spillover()`'s cleanup. An inline
+fit (zero rows included) is registered under the view's name with the declared schema, capped at
+`CHEMBL_MAX_SPILL_ROWS`; one whose call was cancelled by the time it would write leaves the earlier
+table. Every write onto a supplied canvas's view table, swap or re-stage, waits for the one before it,
+so two same-view calls that finish together both land, the later one last; a failed write hands the
+turn on. A minted canvas has no earlier table and spills straight to the view's name. A view always ends up under its own fixed table name, so a second query of
+the **same** view **replaces (overwrites)** its prior rows rather than appending to them, while the
+other view's table is left intact. `chembl_get_drug_info` composes `getMoleculeApproval` + `getMechanisms` +
 `getIndications` with `Promise.allSettled`, so one secondary list failing degrades that list rather than
 tanking the call — but it degrades to `status: 'failed'` with a `null` count, never to a bare empty
 array that would read as "ChEMBL records none". `getMechanisms` / `getIndications` return `Page<T>`
@@ -272,16 +310,19 @@ name the variable, not the path.
 | Env var | Field | Required | Default | Purpose |
 |---|---|---|---|---|
 | `CHEMBL_API_BASE_URL` | `apiBaseUrl` | no | `https://www.ebi.ac.uk/chembl/api/data` | Override the upstream base (private mirror / pinned host). |
-| `CHEMBL_REQUEST_TIMEOUT_MS` | `requestTimeoutMs` | no | `30000` | Per-request timeout for upstream fetches. |
-| `CHEMBL_MAX_PAGE_SIZE` | `maxPageSize` | no | `1000` | ChEMBL's per-page cap when streaming activity pages for spill. |
+| `CHEMBL_REQUEST_TIMEOUT_MS` | `requestTimeoutMs` | no | `30000` | Per-attempt timeout for an upstream request, capped by what is left of the call's deadline (45 s, or `CHEMBL_SPILL_DEADLINE_MS` for a spill). |
+| `CHEMBL_MAX_PAGE_SIZE` | `maxPageSize` | no | `1000` | Rows per upstream ChEMBL page. The bioactivity spill walks pages of this size; an inline bioactivity page (canvas off, or a cursor page) requests `min(limit, CHEMBL_MAX_PAGE_SIZE)` rows, since nothing past `limit` would be kept. |
 | `CHEMBL_DEFAULT_LIMIT` | `defaultLimit` | no | `25` | Default `limit` applied when callers omit it; keeps preview sizes sane. |
-| `CHEMBL_MAX_SPILL_ROWS` | `maxSpillRows` | no | `50000` | Hard ceiling on rows staged to a canvas table, and so on the upstream page drain behind it (50,000 rows = 50 sequential ChEMBL fetches at the 1,000-row page cap). Over the cap the response reports `truncated: true`. Deployment-shaped — a shared hosted instance tightens it, a local stdio session can raise it. |
+| `CHEMBL_MAX_SPILL_ROWS` | `maxSpillRows` | no | `50000` | Hard ceiling on rows staged to a canvas table, and so on the upstream page walk behind it: no page is requested at or past it (50,000 rows = 50 ChEMBL page fetches at the 1,000-row page cap). Over the cap the response reports `truncated: true`, `truncated_by: 'row_cap'`. Deployment-shaped — a shared hosted instance tightens it, a local stdio session can raise it. |
+| `CHEMBL_MAX_CONCURRENT_PAGES` | `maxConcurrentPages` | no | `4` | Spill-page requests in flight at once (1–6), shared by every call on the server through one pacer; each spill keeps at most this many pages pending, so concurrent calls interleave. |
+| `CHEMBL_SPILL_DEADLINE_MS` | `spillDeadlineMs` | no | `45000` | Time budget for one spill's count and page walk (10,000–600,000). At expiry the fetched prefix stages with `truncated: true`, `truncated_by: 'time_budget'`; with nothing fetched the call fails as `upstream_timeout`. The default settles under a client's 60 s request timeout; raise it only for a client that waits longer. |
 | `CANVAS_PROVIDER_TYPE` | (framework) | no | `none` | Set to `duckdb` to enable the bioactivity spill + SQL path. When `none`, `chembl_get_bioactivities` still inlines a preview but never spills; `chembl_dataframe_*` return a "canvas disabled" error. |
-| `CHEMBL_DATAFRAME_DROP_ENABLED` | `dataframeDropEnabled` | no | `false` | Opt-in toggle for the `chembl_dataframe_drop` tool. Off by default — per-table/canvas TTL already reclaims staged tables, so the explicit drop is unnecessary in the common case. Set `true` only when agents need to free a large staged table early within a long session; the tool is conditionally registered, so it is absent from `tools/list` when this is off. `z.stringbool()` so `=false` actually disables. |
+| `CHEMBL_DATAFRAME_DROP_ENABLED` | `dataframeDropEnabled` | no | `false` | Opt-in toggle for the `chembl_dataframe_drop` tool. Off by default — the canvas's sliding TTL already reclaims staged tables, so the explicit drop is unnecessary in the common case. Set `true` only when agents need to free a large staged table early within a long session; the tool is conditionally registered, so it is absent from `tools/list` when this is off. `z.stringbool()` so `=false` actually disables. |
 
 No API key — ChEMBL is keyless, so there is no degraded-without-key mode to document. The capability
 gate is `CANVAS_PROVIDER_TYPE`: without `duckdb`, the analytical SQL path is off and the flagship tool
-degrades to preview-only (documented in its description and surfaced via `enrichment`).
+returns the view a page at a time through `cursor` / `nextCursor` (documented in its description and
+surfaced via `enrichment`).
 `CHEMBL_DATAFRAME_DROP_ENABLED` is the only other toggle — a feature flag for the opt-in drop tool, not
 a degraded mode.
 
@@ -295,7 +336,7 @@ Each step is independently buildable + testable.
 1. **Config + identity** — `server-config.ts` (Zod schema, env mapping); set `createApp()`
    `name`/`title` to `chembl-mcp-server`, add `instructions` (cross-server chain + attribution), wire
    the `setup(core)` → `setCanvas(core.canvas)` callback. Delete the echo tool/resource/prompt scaffold.
-2. **`ChemblService`** — URL builder, `.json` fetch + `page_meta` pagination, the string→number/null
+2. **`ChemblService`** — URL builder, `.json` fetch + the offset page walk, the string→number/null
    coercion layer, nested-structure flattening into the flat domain types. Add the canvas-accessor
    module. Unit-test coercion (string "180.16" → 180.16; absent → null) and a sparse-payload case.
 3. **`chembl_search_targets`** — needed first; it produces the target IDs the flagship consumes.
@@ -354,7 +395,7 @@ target `CHEMBL203`) + indications (non-small-cell lung carcinoma, max phase 4). 
 
 - **Structure search consolidated under `chembl_search_molecules` via a `search_type` enum**
   (`name` \| `exact` \| `similarity` \| `substructure`) rather than three tools. ChEMBL exposes them as
-  distinct endpoints (`/molecule` for name/ID/InChIKey, `/molecule/{smiles}` for exact, `/similarity/{smiles}/{threshold}` for similarity, `/substructure/{smiles}` for substructure); the handler routes by `search_type`. Default is `name`. `structure` (SMILES string) is required for `exact`/`similarity`/`substructure`; `query` is required for `name`. `similarity_threshold` is an integer 40–100 (ChEMBL rejects values below 40); default 70. Keeps the discovery surface one tool. Handler validates at least one of `query`/`structure` is present and that `structure` accompanies structure-mode `search_type` values — throws `missing_input` otherwise.
+  distinct endpoints (`/molecule/search` for name text, `/molecule/{id}` for an exact ChEMBL ID or InChIKey, `/molecule/{smiles}` for exact, `/similarity/{smiles}/{threshold}` for similarity, `/substructure/{smiles}` for substructure); the handler routes by `search_type`. Default is `name`. `structure` (SMILES string) is required for `exact`/`similarity`/`substructure`; `query` is required for `name`. `similarity_threshold` is an integer 40–100 (ChEMBL rejects values below 40); default 70. Keeps the discovery surface one tool. Handler validates at least one of `query`/`structure` is present and that `structure` accompanies structure-mode `search_type` values — throws `missing_input` otherwise.
 - **`chembl_get_bioactivities` is one bidirectional tool, not `get_compound_activities` +
   `get_target_activities`.** The molecule↔target bridge is symmetric and shares all filters; an
   at-least-one input gate (`molecule_chembl_id`, `target_chembl_id`, or both) keeps the surface tight.
@@ -366,12 +407,14 @@ target `CHEMBL203`) + indications (non-small-cell lung carcinoma, max phase 4). 
 - **The three `dataframe_*` tools are the standardized canvas surface, not scope creep.** The framework's
   DataCanvas contract defines a three-tool standard wherever a tool emits a `canvas_id`:
   `chembl_dataframe_query` (mandatory — a token with no query tool is dead output),
-  `chembl_dataframe_describe` (strongly recommended so the agent learns table/column names before
+  `chembl_dataframe_describe` (required alongside it so the agent learns table/column names before
   writing SQL), and `chembl_dataframe_drop` (the **opt-in** third — drops a named staged table by name).
   Drop is **off by default** (`CHEMBL_DATAFRAME_DROP_ENABLED=false`) and **conditionally registered** —
-  absent from `tools/list` when off — because the canvas already self-cleans via sliding per-table and
-  per-canvas TTL; an explicit drop only earns its place when an agent wants to reclaim a large table
-  early inside a long session. `idea.md` already names `chembl_dataframe_query` (Design Notes). These
+  absent from `tools/list` when off — because the canvas already self-cleans: no staged table is
+  registered with a TTL of its own, so each lives exactly as long as its canvas, which expires on its
+  sliding TTL (`CANVAS_TTL_MS`, 24 h) or its absolute cap (`CANVAS_ABSOLUTE_CAP_MS`, 7 days). An
+  explicit drop only earns its place when an agent wants to reclaim a large table early inside a long
+  session. `idea.md` already names `chembl_dataframe_query` (Design Notes). These
   three are the only additions beyond the 5-tool sketch, and the drop tool keeps the `canvas_id` +
   `table_name` model unchanged — it operates on the same primitive, adding no new architecture.
 - **Standardize, carry raw alongside.** Surface ChEMBL's `standard_*` + `pchembl_value` as the primary
@@ -393,25 +436,49 @@ target `CHEMBL203`) + indications (non-small-cell lung carcinoma, max phase 4). 
 
 ## Error Contract
 
-Most tools are simple reads — the framework's auto-classification (404 → `NotFound`, 429/5xx →
-`ServiceUnavailable`, bad params → `ValidationError`) covers them, so no typed contract is needed there.
-Two tools have a domain failure worth declaring:
+Most tools are simple reads — `sanitizeUpstreamError` maps an upstream failure by code (404 → `NotFound`
+`not_found`, 429 → `RateLimited` `rate_limited`, timeout → `Timeout` `upstream_timeout`, rejected params →
+`ValidationError` `invalid_query`, 5xx/network → `ServiceUnavailable` `upstream_unavailable`), and every
+upstream tool and resource declares the two non-baseline reasons, `not_found` and `rate_limited`, with
+`thrownBy: 'service'`. These tools also declare a domain failure:
 
 | Tool | `reason` | code | When | Recovery |
 |---|---|---|---|---|
 | `chembl_get_bioactivities` | `missing_filter` | `InvalidParams` | Neither `molecule_chembl_id` nor `target_chembl_id` supplied, so the query had nothing to scope to. | Supply `molecule_chembl_id` (from `chembl_search_molecules`), `target_chembl_id` (from `chembl_search_targets`), or both to narrow to one compound–target pair. |
-| `chembl_search_molecules` | `missing_input` | `InvalidParams` | Neither `query` nor `structure` supplied. | Supply `query` for name/ID/InChIKey search, or `structure` (SMILES) with an appropriate `search_type` for structure search. |
+| `chembl_get_bioactivities` | `contradictory_potency_filter` | `InvalidParams` | `pchembl_value_min` supplied alongside `potency_view: 'null_potency'`, whose rows have no `pchembl_value` to compare against. | Drop `pchembl_value_min` to browse the null-potency measurements, or leave `potency_view` at `potency_ranked` to apply the floor. |
+| `chembl_get_bioactivities` | `canvas_capacity_exhausted` | `RateLimited` (retryable) | The view spilled with no `canvas_id` supplied, and the tenant already holds `CANVAS_MAX_CANVASES_PER_TENANT` canvases, so none could be minted. `data` carries `cap` and `activeCount`. | Pass a `canvas_id` from an earlier `chembl_get_bioactivities` response to stage on that canvas (replacing its table for the same `potency_view`), narrow the filters until the view fits inline (an inline fit needs no canvas), or retry once idle canvases expire. |
+| `chembl_search_molecules` | `missing_input` | `InvalidParams` | Neither `query` nor `structure` supplied, or the `search_type` lacks the one it needs (`query` for `name`, `structure` for a structure mode). | Supply `query` for name/ID/InChIKey search, or `structure` (SMILES) with an appropriate `search_type` for structure search. |
 | `chembl_search_targets` | `missing_input` | `InvalidParams` | None of `query`, `accession`, or `gene_symbol` supplied. | Supply at least one: `accession` (UniProt, e.g. `P00533`), `gene_symbol` (e.g. `EGFR`), or `query` (free-text name). |
-| `chembl_dataframe_query` / `chembl_dataframe_describe` / `chembl_dataframe_drop` | `canvas_disabled` | `InvalidParams` | Called while `CANVAS_PROVIDER_TYPE` is `none` (no canvas). (`chembl_dataframe_drop` reaches this only when registered, i.e. `CHEMBL_DATAFRAME_DROP_ENABLED=true` but canvas is still off.) | Set `CANVAS_PROVIDER_TYPE=duckdb` to enable the SQL path; otherwise read the inline preview from `chembl_get_bioactivities`. |
+| `chembl_dataframe_query` / `chembl_dataframe_describe` / `chembl_dataframe_drop` | `canvas_disabled` | `InvalidParams` | Called while `CANVAS_PROVIDER_TYPE` is `none` (no canvas). (`chembl_dataframe_drop` reaches this only when registered, i.e. `CHEMBL_DATAFRAME_DROP_ENABLED=true` but canvas is still off.) | Set `CANVAS_PROVIDER_TYPE=duckdb` to enable the SQL path; otherwise read the inline preview from `chembl_get_bioactivities` (for `chembl_dataframe_drop`: otherwise there is nothing to drop). |
+| `chembl_dataframe_drop` | `canvas_not_found` | `NotFound` | The `canvas_id` is unknown or its canvas expired, taking its tables with it. | Nothing is left to drop; check the `canvas_id` was copied exactly if the canvas should still be live. |
+| `chembl_dataframe_drop` | `identifier_reserved` | `ValidationError` | `table_name` is a reserved SQL keyword, which no staged table can carry. | Nothing by that name exists to drop; list the staged tables with `chembl_dataframe_describe`. |
 
-Canvas-resolution failures (`unknown canvas_id`, expired table, invalid SQL) are thrown by the
-DataCanvas primitive itself with structured `data.reason` (`missing_table`, `invalid_sql`,
-`non_select_statement`) — let them bubble; don't re-wrap.
+A malformed `cursor` on `chembl_get_bioactivities`, `chembl_search_molecules`, or
+`chembl_search_targets` fails as `InvalidParams` with `data.reason: 'invalid_cursor'`, raised by the
+framework's `decodeCursor` before any upstream request — ChEMBL answers an offset it cannot read with
+HTTP 200 and some other page, so a forwarded bad cursor would return rows labelled as a different page. The
+framework's recovery hint (omit `cursor`, or pass the previous `nextCursor` unchanged) fits, so no tool
+redeclares the reason.
+
+Canvas failures — an unknown or expired `canvas_id`, a missing table, invalid SQL, a rejected table
+name — are raised by the DataCanvas primitive with a structured `data.reason` (`canvas_not_found`,
+`missing_table`, `invalid_sql`, `non_select_statement`, `identifier_shape`, …) and usually a recovery
+hint set at the throw site. They bubble unchanged unless that hint is advice the calling tool cannot
+follow. A throw-site hint outranks a declared contract entry, so declaring the reason alone changes
+nothing: a tool that needs its own recovery declares the reason in `errors[]` and re-raises the failure
+through `ctx.fail(reason, …, { cause })`, keeping the framework's code and reason and carrying the
+original on `cause`. `chembl_dataframe_drop` re-raises `canvas_not_found` (the framework's re-stage hint
+would have the caller stage data only to remove it) and `identifier_reserved` (its naming advice is for
+creating a table, not finding one). `chembl_get_bioactivities` re-raises `canvas_capacity_exhausted` at
+its canvas mint: the framework's hint offers "this server's canvas-drop tool", but `chembl_dataframe_drop`
+drops a table and frees no canvas, so the tool's own recovery names the levers it has instead.
+`chembl_dataframe_describe` and `chembl_dataframe_query` keep the framework's hints, which fit them.
 
 ## Output Design Notes
 
 - **Spill envelope.** `chembl_get_bioactivities` returns `{ activities: <preview>, totalCount,
-  potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, canvasDisabled }`.
+  potency_view, spilled, canvas_id, table_name, staged_row_count, truncated, truncated_by,
+  canvasDisabled, nextCursor? }`.
   `totalCount` is the honest full match count spanning both potency views, sourced from a separate
   `limit:1` count request that does NOT apply the `pchembl_value__isnull` filter the stream uses. The
   preview/canvas holds only the selected `potency_view`, echoed back on the output so the agent knows
@@ -427,14 +494,40 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
   not an option: the budget is what decides fit-vs-spill and feeds the overflow sentinel. The handler
   therefore slices the returned rows on both canvas branches, and the canvas-disabled drain breaks at
   `limit`. What differs is where the remainder lives — on a spill it is on the staged table (SQL it via
-  `chembl_dataframe_query`); with the view fit inline or the canvas off nothing is staged, so the rows
-  past `limit` are simply not returned and the notice reports how many of the view's rows came back.
-- **A capped spill says so.** The spill drain is bounded by `caps: { maxRows: CHEMBL_MAX_SPILL_ROWS }`,
-  which also bounds the upstream page walk behind the lazy stream. `staged_row_count` reports the rows
-  actually registered, and `truncated: true` says the cap was hit before upstream ran out — the table is
-  a bounded slice, not the complete view, so aggregates over it are a sample. Both fields are rendered
-  by `format()` as well as carried in `structuredContent`; a cap without that disclosure is the same
-  "capped rows read as complete" trap the canvas-disabled preview already avoids.
+  `chembl_dataframe_query`); whenever nothing is staged — the canvas off, or the view fit inline on a
+  canvas with no `canvas_id` — `nextCursor` reaches the rest a page at a time, and the notice names
+  which rows of the view the page holds; with a `canvas_id` supplied, the whole fit view is re-staged
+  on that canvas, so the rest are on its table and the notice says so.
+- **A canvas is minted only when a view spills, and a supplied one reflects the latest successful call.**
+  Without a `canvas_id`, an inline fit, a zero match, an upstream failure, or a cancellation leaves the
+  tenant's canvas count unchanged — no acquire, no extra request on the fit path — and a spill whose
+  registration fails releases the canvas it minted, rethrowing the original error. With a `canvas_id`,
+  every non-cursor call re-stages the selected view's table: an inline fit returns `spilled: false`
+  alongside the `canvas_id`, `table_name`, and `staged_row_count` it wrote, and a zero match leaves an
+  empty table with the declared schema, so neither `chembl_dataframe_describe` nor a `UNION ALL` of the
+  two views can serve an earlier query's rows as current. A spill onto a supplied canvas replaces the
+  view's table only once it succeeds, so an upstream failure or a cancellation mid-spill leaves the
+  earlier table as it was. The other view's table is never touched.
+- **A cursor page is inline-only.** The canvas-off branch and every cursor page share one path: a
+  count request plus pages of `min(limit, CHEMBL_MAX_PAGE_SIZE)` rows from the decoded offset, on the
+  view's total order. With the canvas on, a supplied `cursor` takes that same path — no canvas is
+  acquired, a supplied `canvas_id` is left as it was, and the notice says the page was not staged. A
+  canvas-on first page that stages — a spill, or a re-stage on a supplied `canvas_id` — mints no
+  cursor; one that fits inline with no `canvas_id` stages nothing, so it mints `nextCursor` at the
+  offset its page ends at whenever rows remain, including a fit the time budget or the row cap cut
+  short, and the next page takes the cursor path. `nextCursor` comes from the view's own
+  `page_meta.total_count`; it is omitted on the last page and on an empty one, and a cursor past the end
+  returns zero rows with a notice that the walk is complete.
+- **A capped spill says so.** The spill is bounded by `caps: { maxRows: CHEMBL_MAX_SPILL_ROWS }` and by
+  `CHEMBL_SPILL_DEADLINE_MS`; the walk requests no page at or past the cap. `staged_row_count` reports
+  the rows actually registered, `truncated` is true exactly when a bound stopped the walk short of the
+  view's `page_meta.total_count`, and `truncated_by` names it — `time_budget` when the budget ended the
+  walk, `row_cap` when the registered rows reached the cap — so the table is read as a bounded slice,
+  not the complete view, and aggregates over it as a sample. A walk that ends on a short page below the
+  cap, before that total, names neither and reports `truncated: false`. All three are rendered by `format()` as well as carried in `structuredContent`; a cap
+  without that disclosure is the same "capped rows read as complete" trap the canvas-disabled preview
+  already avoids. An inline fit the deadline cut short with no `canvas_id` stages nothing, so it reports no truncation, but
+  its notice names the time budget, and `nextCursor` continues the view from the end of its page.
 - **The rendered table has its own budget, disclosed separately.** `chembl_dataframe_query` returns
   every materialized row on `structuredContent.rows`, but `format()` can only put so much of that into
   `content[]` before it becomes a context-destroying wall of text. The bound is a **character budget**
@@ -465,14 +558,28 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 - **No bulk/batch GET.** The ChEMBL data API has no `filter.ids`-style multi-ID endpoint, so per-record
   fetches (`getMolecule`, `getAssay`) are one call each. Acceptable — these are single-target by nature.
 - **Activity sets are huge.** A popular target carries 10⁴–10⁵ measurements; without
-  `CANVAS_PROVIDER_TYPE=duckdb` the flagship degrades to preview-only and cross-set aggregation is
-  unavailable. Hosting must enable canvas for the flagship to fully deliver.
+  `CANVAS_PROVIDER_TYPE=duckdb` the flagship returns them a page at a time (at most 1,000 rows a call,
+  through `cursor` / `nextCursor`) and cross-set aggregation is unavailable. Hosting must enable canvas
+  for the flagship to fully deliver.
 - **The spill is bounded, so the largest sets are sampled.** `CHEMBL_MAX_SPILL_ROWS` (default 50,000)
   caps the staged table and the upstream page walk behind it. Real single-protein targets fit under it
   (EGFR `CHEMBL203` has 21,342 measurements carrying a `pchembl_value`), but ChEMBL's catch-all targets
-  do not — `CHEMBL612545` ("Unchecked") alone has 405,219, which uncapped would be 406 sequential
+  do not — `CHEMBL612545` ("Unchecked") alone has 405,219, which uncapped would be 406
   upstream page fetches in one tool call. Over the cap the response reports `truncated: true`; narrowing
   with `standard_type` / `pchembl_value_min` is what brings a view back under it.
+- **A large spill can outrun its time budget.** ChEMBL takes 3–9 s of server time per 1,000-row page,
+  so even four pages at a time do not fit the 50,000-row cap inside the 45 s `CHEMBL_SPILL_DEADLINE_MS`
+  default. Measured on EGFR `CHEMBL203`'s IC50 view (19,378 ranked rows): four pages at a time staged
+  17,000 rows in the 45 s budget, one at a time 7,000. A view the budget cuts short stages its fetched
+  prefix with `truncated_by: 'time_budget'`; narrowing the filters, or raising the budget for a client
+  that waits past 60 s, reaches the rest.
+- **A page that fails every retry near the budget's end can fail the spill or truncate it.** When its
+  retries run out inside the budget, the call fails as `upstream_unavailable` with nothing staged, as
+  any page that fails after its retries does; when the budget stops them first, the fetched prefix
+  stages with `truncated_by: 'time_budget'`. The retry ladder's three backoffs total 7.9–13.1 s with
+  jitter, so for a page that starts failing that close to the budget's end the jitter decides which: a
+  page-two HTTP 500 under a 10 s `CHEMBL_SPILL_DEADLINE_MS` failed the call in 12 of 42 runs. Under the
+  45 s default the same holds for a page that starts failing about 35 s into the walk.
 - **`pchembl_value` sparsity.** Not every activity row has a derivable `pchembl_value` (non-standard
   types, censored relations). The default `potency_ranked` view excludes them via
   `pchembl_value__isnull=false` on the stream, while the honest `totalCount` (a separate `limit:1` count
@@ -483,11 +590,17 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
   On these rows potency lives only in the raw `value`/`type`/`relation` fields.
 - **Mixed measurement types.** ChEMBL aggregates IC50, Ki, EC50, etc.; comparing across types is a
   scientific error the server can warn about (prominent `standard_type` filter) but not prevent.
-- **In-memory canvas.** Spilled tables are per-session and dropped on restart (DataCanvas v1) — re-fetch
+- **In-memory canvas.** Spilled tables live in a process-local, tenant-scoped canvas and are dropped on restart (DataCanvas v1) — re-fetch
   is cheap for public data, but a `canvas_id` doesn't survive a server restart.
 - **No 3D / conformer data, no document/literature endpoints** in v1.
-- **Live-API latency / rate limits.** Unspecified upstream limits; `withRetry` + modest defaults
-  mitigate but a burst of large spills can be slow.
+- **Live-API latency / rate limits.** Unspecified upstream limits; `withRetry`, modest defaults, and the
+  shared spill-page pacer mitigate, but a burst of large spills queues behind one in-flight ceiling, so
+  each takes longer and the time budget cuts it shorter.
+- **One stalled spill can hold every shared page slot.** A spill whose pages hang keeps up to all
+  `CHEMBL_MAX_CONCURRENT_PAGES` slots of the server-wide pacer until each hung attempt's
+  `CHEMBL_REQUEST_TIMEOUT_MS` timeout or that call's `CHEMBL_SPILL_DEADLINE_MS` deadline, whichever
+  comes first. A concurrent call's spill waits behind it and may be cut short by its own budget
+  (`truncated_by: 'time_budget'`) — the accepted cost of one in-flight ceiling across calls.
 
 ## v1 Scope vs. Deferred
 
@@ -498,13 +611,13 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
   and `chembl_dataframe_drop` (opt-in, `CHEMBL_DATAFRAME_DROP_ENABLED`-gated, conditionally registered —
   the standardized 3-tool DataCanvas surface; drop is off by default since TTL handles cleanup).
 - `ChemblService` (single upstream client) + canvas-accessor; DataCanvas spill on the flagship.
+- `chembl://molecule/{chemblId}` + `chembl://target/{chemblId}` resources.
 - String→number/null numeric coercion; structure search (exact/similarity/substructure) under one tool;
   bidirectional bioactivity; `max_phase` on every molecule row.
 - Cross-server chain guidance + CC BY-SA attribution via `createApp({ instructions })`.
 
 **Deferred**
 
-- `chembl://molecule/{chemblId}` + `chembl://target/{chemblId}` resources — ship if cheap, else next pass.
 - Prompts (no template-worthy workflow yet).
 - A local bulk **MirrorService** index (the corpus is large; revisit if live-API latency bites).
 - 3D/conformer structures, document/literature endpoints, ATC classification, cell-line/tissue resources.
@@ -516,7 +629,7 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 
 | Decision | Why |
 |---|---|
-| 8 tools, not 5 | DataCanvas spill on the flagship pulls in the standardized 3-tool canvas surface: `dataframe_query` (contractually required), `dataframe_describe` (recommended), and the opt-in `dataframe_drop` (off by default, env-gated, conditionally registered — TTL already handles cleanup). `chembl_dataframe_query` was already named in `idea.md`. |
+| 8 tools, not 5 | DataCanvas spill on the flagship pulls in the standardized 3-tool canvas surface: `dataframe_query` (contractually required), `dataframe_describe` (required alongside it), and the opt-in `dataframe_drop` (off by default, env-gated, conditionally registered — TTL already handles cleanup). `chembl_dataframe_query` was already named in `idea.md`. |
 | Structure search = `search_type` enum on `chembl_search_molecules` | Three ChEMBL endpoints, one agent action ("find molecules") — consolidate, don't fan out. |
 | `search_type` defaults to `name` | The most common case is name/ID/InChIKey lookup; callers opt in to structure modes explicitly. |
 | `similarity_threshold` typed as integer 40–100 | ChEMBL's `/similarity` endpoint rejects thresholds below 40; exposing the validated range in the schema prevents silent 400 errors from the upstream. |
@@ -528,11 +641,19 @@ DataCanvas primitive itself with structured `data.reason` (`missing_table`, `inv
 | Numerics coerced once in the service | ChEMBL ships numbers as strings; coercing at the boundary keeps schemas clean and absent→`null` honors scientific-data fidelity (never `0`). |
 | Canvas only for bioactivities | Only that result is both analytical and oversized; search/drug/assay inline. |
 | `potency_view` selects one view per call, never a merged stream | ChEMBL sorts null-`pchembl_value` rows FIRST under `order_by=-pchembl_value`, so any stream carrying both leads with the unrankable rows — the exact defect the potency filter was added to fix. Two calls staging two tables keeps the ranked view honest while making the excluded rows reachable, and a `UNION ALL` across the pair reconstructs the full set in SQL where arrival order does not matter. |
-| The null-potency view paginates on `order_by=activity_id` | Every row in that view has a null `pchembl_value`, so ranking on it is meaningless and leaves the page sequence undefined. The primary key is stable, so the page walk cannot skip or repeat rows. |
+| Each view pages on a total order, walked by offset: `order_by=-pchembl_value&order_by=activity_id` for the ranked view, `order_by=activity_id` for the null-potency view | ChEMBL's order inside a `-pchembl_value` tie is not stable from one request to the next, so a tie group that straddles a page edge repeats some rows and drops others: CHEMBL203's default view (21,342 rows) repeated 138 measurements and dropped 138 before the tie-break, and `pchembl_value_min: 8` staged 5,816 rows holding 5,800 distinct `activity_id`s. The unique `activity_id` makes the order total. ChEMBL reads the two keys only as a repeated param (the comma form is HTTP 400), and `page_meta.next` writes them back as a Python list (`order_by=['-pchembl_value', 'activity_id']`, also HTTP 400), so the walk builds each page's URL from its offset and stops at a short page or the view's `page_meta.total_count`. Every null-potency row has a null `pchembl_value`, so only the primary key orders that view. |
 | A potency floor on the null-potency view is an error, not an empty result | `pchembl_value__gte` and `pchembl_value__isnull=true` can only ever match zero rows. Returning empty would read as "ChEMBL has no such measurements"; silently dropping one filter would mask the caller's mistake. `contradictory_potency_filter` names the conflict and both ways out. |
 | The spill cap is config (`CHEMBL_MAX_SPILL_ROWS`), not a hardcoded constant | The right ceiling is deployment-shaped: a shared hosted instance wants a tighter bound on per-request upstream fanout than a local stdio session doing bulk analysis. It sits alongside `maxPageSize`/`defaultLimit`, the other upstream-tuning knobs, and has a default that needs no attention. |
+| The spill fetches its pages through an ordered window under one service-wide pacer | One page at a time at 3–9 s each outran the 60 s client timeout past about ten pages. Per-call concurrency without a shared limiter would multiply upstream load with concurrent calls, so the pacer bounds pages in flight across the server, and the window yields in offset order, so the staged table and preview match a sequential walk. |
+| The spill's time budget stages the fetched prefix rather than failing | Failing at the deadline discards pages already fetched; a disclosed partial (`truncated_by: 'time_budget'`) follows the row cap's choice of honest truncation over failure or silent incompleteness. A page whose retries `withRetry` stops before an exponential backoff the budget cannot hold counts the same: the budget ended it, though the deadline has not yet expired, and failing it lost the whole prefix (a page-two 500 under a 10 s budget failed at 4.8 s with 0 rows). A page whose retries run out inside the budget still fails the call, so near the budget's end the retry jitter decides which of the two a failing page gets (*Known Limitations*). |
+| The spill walk starts no page the budget would not hold, timing a page by the latest one to land, on its final attempt with its queueing | A page started with less budget left than pages take is abandoned at the deadline after ChEMBL has computed it (4 s stub pages under a 10 s budget: 9 page requests, 4 abandoned; with the stop 5 and none, the same 5,000 rows, 8.2 s instead of 10.0 s). A running maximum let a slow first page stop a 40,000-row walk at 13,000 rows, and counting a retried page's failed attempt and backoff cut a walk from 21,000 rows to 17,000; the cost kept is a first page slower than the budget it leaves, which ends the walk after it however fast later pages would be. |
+| `truncated_by` names a bound only when that bound cut the walk | A walk that ends on a short page below the cap, before the `page_meta.total_count` ChEMBL reported, hit neither bound; labelling it `row_cap` sent the caller to narrow filters under a cap it never reached (90 rows staged under a 100-row cap read "Capped … CHEMBL_MAX_SPILL_ROWS=100"). The cap is read off the registered rows reaching it, not `spillover()`'s own `truncated` flag: the walk requests no page at or past the cap, so a cap hit exactly on a full last page ends the source there and `spillover()` reports nothing cut. |
+| Every other call gets a constant 45 s budget (`CALL_DEADLINE_MS`), passed explicitly from method to method | The client's 60 s timeout is fixed whatever `CHEMBL_REQUEST_TIMEOUT_MS` is set to, so deriving the budget from it would track the wrong number; per-attempt timeouts × retries, and chained requests each with their own, ran past 60 s. A method takes an optional deadline so a caller chaining methods (a count before a page) keeps them on one budget, with no per-context state to hold it. |
 | No auth / no scopes | Public keyless data over stdio — scopes would be empty ceremony. |
 | `chembl_dataframe_query` renders `content[]` against a character budget, not a row cap | A fixed row cut is wrong in both directions: it truncated a 60-row result nobody needed truncated, and it left a wide result over budget anyway. Characters are the quantity that actually bounds context; rows are a proxy that varies by an order of magnitude with column width. |
 | `rendered_rows` is a separate field from `truncated`, not an overload of it | They report different bounds — the renderer's budget vs. the canvas engine's `CANVAS_DEFAULT_ROW_LIMIT` on the SQL result — and either can fire without the other. Collapsing them would make a `truncated: false` response that under-renders `content[]` undetectable from `structuredContent` alone. |
-| SQL `LIMIT`/`OFFSET` is the retrieval path past both bounds — no tool-level pagination parameter | Offsets already reach rows beyond the canvas row cap (verified: `LIMIT 2000 OFFSET 10000` against a 19,378-row staged table returns exactly those 2,000). A second, tool-level knob would duplicate a mechanism the caller's own SQL already has. |
+| `chembl_dataframe_query` takes no pagination parameter — SQL `LIMIT`/`OFFSET` is its retrieval path past both bounds | Offsets already reach rows beyond the canvas row cap (verified: `LIMIT 2000 OFFSET 10000` against a 19,378-row staged table returns exactly those 2,000). A second, tool-level knob would duplicate a mechanism the caller's own SQL already has. |
+| `chembl_get_bioactivities` pages its inline rows with an offset cursor, and a cursor page never stages | With the canvas off, `limit` (max 1,000) was the only bound and nothing reached the rows past it: `totalCount` disclosed the gap but retrieval stopped there. The cursor's resume offset is the only field read back (`encodeCursor`/`decodeCursor`, the search tools' pattern; the minting `limit` rides along unread), redeemed with the filters and `potency_view` that minted it, and each page walks the view's tie-broken total order, so following `nextCursor` returns every `activity_id` once. A cursor page stays inline even with the canvas on: staging it would replace that view's table with one page of rows, while the first, cursor-less call already stages the whole view for SQL. A canvas-on first page that fits inline with no `canvas_id` stages nothing either, so it mints a cursor the same way: a larger `limit` cannot reach rows past a 1,000-row page. |
+| `chembl_get_bioactivities` mints a canvas only on a spill, and re-stages a supplied `canvas_id` on every non-cursor call | Acquiring before fit-or-spill was known held a tenant canvas slot for the 24 h TTL on every inline fit, zero match, failure, and cancellation; under `MCP_AUTH_MODE=none` all callers share one tenant, so small queries exhausted `CANVAS_MAX_CANVASES_PER_TENANT`. Staging only on a spill left a supplied canvas holding the previous query's rows whenever the next one fit inline, which `chembl_dataframe_describe` and SQL then served as current. Re-staging an inline fit costs one in-memory `registerTable` (a 0.6–1.5 ms median for 0–68 rows on DuckDB) and no upstream request. |
+| A spill onto a supplied `canvas_id` registers under a per-call staging table and replaces the view's table only once it succeeds | Registering under the view's own name drops its earlier table before the first row lands, and `spillover()` drops a partly appended table on failure, so an upstream error or a cancellation mid-spill took the earlier rows with it. `registerAs` refuses an existing name, so the swap is drop-then-copy: one copy of the staged rows, measured on DuckDB at medians of 3.7 ms for 70 rows, 4.5 ms for 1,000, 19 ms for 17,000, and 45 ms for 50,000, against upstream pages that take 3–9 s per 1,000 rows. The drop and the copy run without the call's signal, so a cancellation cannot leave the view with no table; an engine fault inside the copy is the one outcome that still can. Swaps onto one table take turns in-process: two that interleaved failed the second in 20 of 20 simultaneous DuckDB trials (`Table with name bioactivities does not exist!`). An inline fit's re-stage of that table takes the same turn: unqueued, a re-stage started across the moment of a swap failed a call in 32 of 62 DuckDB races, the spill in 22 (`register_as_clash`, or the table missing at the copy) and the re-stage itself in 13 (a catalog write-write conflict, or the table dropped mid-append); with the turn, none of 62 failed. |
 | Non-primitive cells render as JSON, pipes escaped and newlines folded | `String()` flattens a DuckDB STRUCT/LIST to `[object Object]`, which drops from `content[]` a value `structuredContent` carries in full — the same parity gap the row cap caused. Escaping keeps one cell from breaking the table row it sits in. |
