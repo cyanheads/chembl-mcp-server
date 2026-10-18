@@ -2,20 +2,23 @@
  * @fileoverview chembl_dataframe_drop — drop a named staged table from a canvas.
  * Opt-in behind CHEMBL_DATAFRAME_DROP_ENABLED (default off) and conditionally
  * registered, so it is absent from tools/list when the flag is off. Off by
- * default because per-table/canvas TTL already reclaims staged tables; the tool
- * only matters when an agent wants to free a large table early in a long session.
+ * default because a staged table lives exactly as long as its canvas — no table
+ * is registered with a TTL of its own — and the canvas expires on its sliding TTL
+ * (CANVAS_TTL_MS, 24 h) or its absolute cap (CANVAS_ABSOLUTE_CAP_MS, 7 d), taking
+ * its tables with it; the tool only matters when an agent wants to free a large
+ * table early in a long session.
  * @module mcp-server/tools/definitions/chembl-dataframe-drop
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor.js';
 
 export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
   title: 'chembl-dataframe-drop',
   description:
-    'Drop a named staged table from a canvas to free its memory early. Returns dropped: true if the table existed and was removed, false if it was already gone (TTL or a prior drop). Rarely needed — per-table and per-canvas TTL reclaim staged tables automatically; reach for this only to free a large table early in a long session. Requires CANVAS_PROVIDER_TYPE=duckdb.',
+    'Drop a named staged table from a canvas to free its memory early. Returns dropped: true if the table existed and was removed, false if the canvas is live but holds no table by that name (never staged on it, or already dropped). An unknown or expired canvas_id fails as canvas_not_found instead — an expired canvas has already freed its tables. Rarely needed — a staged table lasts exactly as long as its canvas, which by default expires 24 hours after its last use and at most 7 days after it was created, freeing every table on it; reach for this only to free a large table early in a long session. Requires CANVAS_PROVIDER_TYPE=duckdb.',
   annotations: {
     readOnlyHint: false,
     destructiveHint: true,
@@ -29,7 +32,9 @@ export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
   output: z.object({
     dropped: z
       .boolean()
-      .describe('True if the table existed and was dropped; false if it was already gone.'),
+      .describe(
+        'True if the table existed and was dropped; false if the live canvas holds no table by that name.',
+      ),
   }),
   errors: [
     {
@@ -39,6 +44,20 @@ export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
       recovery:
         'Set CANVAS_PROVIDER_TYPE=duckdb to enable the canvas; otherwise there is nothing to drop.',
     },
+    {
+      reason: 'canvas_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The canvas_id is unknown or its canvas has expired, taking every table it held with it.',
+      recovery:
+        'Nothing is left to drop: an expired canvas has already freed its tables. If the canvas should still be live, check that canvas_id was copied exactly from the chembl_get_bioactivities response.',
+    },
+    {
+      reason: 'identifier_reserved',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'table_name is a reserved SQL keyword, which the canvas never accepts as a table name.',
+      recovery:
+        'No staged table can carry a reserved SQL keyword as its name, so there is nothing by that name to drop. List the staged tables with chembl_dataframe_describe and pass one of those names.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -46,12 +65,42 @@ export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
     if (!canvas) {
       throw ctx.fail('canvas_disabled');
     }
-    const instance = await canvas.acquire(input.canvas_id, ctx);
-    const dropped = await instance.drop(input.table_name);
-    return { dropped };
+    /**
+     * The framework sets its own recovery hint on these two failures, and a
+     * throw-site hint outranks a contract entry's. Both hints are staging advice
+     * (re-stage the data; pick another table name) that a drop cannot follow, so
+     * they are re-raised under this tool's contract with the original on
+     * `cause`. Every other canvas error passes through unchanged.
+     */
+    try {
+      const instance = await canvas.acquire(input.canvas_id, ctx);
+      return { dropped: await instance.drop(input.table_name) };
+    } catch (error) {
+      const reason = error instanceof McpError ? error.data?.reason : undefined;
+      if (reason === 'canvas_not_found') {
+        throw ctx.fail(
+          'canvas_not_found',
+          'Canvas not found or expired.',
+          { canvasId: input.canvas_id },
+          { cause: error },
+        );
+      }
+      if (reason === 'identifier_reserved') {
+        throw ctx.fail(
+          'identifier_reserved',
+          `Table name "${input.table_name}" is a reserved SQL keyword, so no staged table carries it.`,
+          undefined,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
   },
 
   format: (result) => [
-    { type: 'text', text: result.dropped ? 'Table dropped.' : 'Table was already gone (no-op).' },
+    {
+      type: 'text',
+      text: result.dropped ? 'Table dropped.' : 'No table by that name on this canvas (no-op).',
+    },
   ],
 });

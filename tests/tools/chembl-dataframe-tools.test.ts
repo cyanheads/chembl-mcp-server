@@ -2,16 +2,18 @@
  * @fileoverview Behavior tests for the three DataCanvas consumer tools
  * (chembl_dataframe_query / _describe / _drop). Covers the shared
  * canvas_disabled error contract (ctx.fail when CANVAS_PROVIDER_TYPE is not
- * duckdb), the happy paths through a structural FakeDataCanvas, the
- * row_count/truncated mapping on query, bubbling of canvas-primitive errors
- * (unknown canvas_id, SQL-gate rejection), the dropped:true/false paths, and
- * each tool's pure format().
+ * duckdb), the happy paths through FakeDataCanvas (the framework DataCanvas
+ * over an in-memory provider), the row_count/truncated mapping on query against
+ * the provider's row cap, bubbling of canvas-primitive errors
+ * (unknown canvas_id, SQL-gate rejection), drop's re-raise of canvas_not_found
+ * and identifier_reserved under its own recovery while describe/query keep the
+ * framework's, the dropped:true/false paths, and each tool's pure format().
  * @module tests/tools/chembl-dataframe-tools
  */
 
 import { JsonRpcErrorCode, validationError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, describe, expect, it } from 'vitest';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chemblDataframeDescribe } from '@/mcp-server/tools/definitions/chembl-dataframe-describe.tool.js';
 import { chemblDataframeDrop } from '@/mcp-server/tools/definitions/chembl-dataframe-drop.tool.js';
 import { chemblDataframeQuery } from '@/mcp-server/tools/definitions/chembl-dataframe-query.tool.js';
@@ -79,8 +81,9 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }]);
+    // Under its row cap the provider leaves `truncated` off the result entirely.
     fake.queryResults = [
-      { rows: [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }], truncated: false },
+      { rows: [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }] },
       { rows: [{ column_types: ['VARCHAR', 'DOUBLE'] }] },
     ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
@@ -92,14 +95,16 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     expect(result.row_count).toBe(1);
     expect(result.truncated).toBe(false);
     expect(result.rows[0]).toMatchObject({ molecule_chembl_id: 'CHEMBL1', med: 7.4 });
+    expect(renderQuery(result)).not.toContain('truncated: yes');
   });
 
   it('surfaces truncated:true when the canvas row cap was hit', async () => {
-    const fake = new FakeDataCanvas();
+    const fake = new FakeDataCanvas({ defaultRowLimit: 2 });
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ a: 1 }]);
+    // One row more than the cap: the provider returns the first two and marks the cut.
     fake.queryResults = [
-      { rows: [{ a: 1 }, { a: 2 }], truncated: true },
+      { rows: [{ a: 1 }, { a: 2 }, { a: 3 }] },
       { rows: [{ column_types: ['BIGINT'] }] },
     ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
@@ -110,6 +115,8 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     const result = await chemblDataframeQuery.handler(input, ctx);
     expect(result.truncated).toBe(true);
     expect(result.row_count).toBe(2);
+    expect(result.rows).toEqual([{ a: 1 }, { a: 2 }]);
+    expect(renderQuery(result)).toContain('truncated at the canvas row cap');
   });
 
   it('coerces BIGINT-string aggregates to numbers but preserves VARCHAR columns (#2)', async () => {
@@ -131,7 +138,6 @@ describe('chembl_dataframe_query — happy + boundary', () => {
             avg_p: 7.4,
           },
         ],
-        truncated: false,
       },
       { rows: [{ column_types: ['VARCHAR', 'BIGINT', 'HUGEINT', 'VARCHAR', 'DOUBLE'] }] },
     ];
@@ -160,7 +166,6 @@ describe('chembl_dataframe_query — happy + boundary', () => {
     fake.queryResults = [
       {
         rows: [{ big: '99999999999999999999', n: '7' }],
-        truncated: false,
       },
       { rows: [{ column_types: ['HUGEINT', 'INTEGER'] }] },
     ];
@@ -185,7 +190,7 @@ describe('chembl_dataframe_query — happy + boundary', () => {
       canvas_id: UNHELD_CANVAS_ID,
       sql: 'SELECT 1',
     });
-    // The fake throws NotFound for an unknown id, mirroring the real acquire.
+    // The framework registry behind the fake throws NotFound for an unknown id.
     await expect(chemblDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
     });
@@ -245,7 +250,7 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 1000, molecule_chembl_id: 'CHEMBL0' }]);
     fake.queryResults = [
-      { rows: narrowRows(60), truncated: false },
+      { rows: narrowRows(60) },
       { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
     ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
@@ -271,7 +276,7 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
     fake.queryResults = [
-      { rows: wideRows(200), truncated: false },
+      { rows: wideRows(200) },
       { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
     ];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
@@ -326,7 +331,7 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 1000 }]);
-    fake.queryResults = [{ rows: [], truncated: false }];
+    fake.queryResults = [{ rows: [] }];
     const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
     const input = chemblDataframeQuery.input.parse({
       canvas_id: canvasId,
@@ -353,7 +358,6 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
             n: '5',
           },
         ],
-        truncated: false,
       },
       {
         rows: [
@@ -425,7 +429,7 @@ describe('chembl_dataframe_describe — happy path', () => {
   });
 });
 
-describe('chembl_dataframe_drop — dropped true/false', () => {
+describe('chembl_dataframe_drop — dropped:true', () => {
   it('returns dropped:true when the table existed', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
@@ -437,17 +441,219 @@ describe('chembl_dataframe_drop — dropped true/false', () => {
     );
     expect(result.dropped).toBe(true);
   });
+});
 
-  it('returns dropped:false (idempotent) for a table that was already gone', async () => {
+/** The `content[]` text of a contract result, joined. */
+function resultText(result: Awaited<ReturnType<typeof runToolContract>>): string {
+  return result.content
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
+}
+
+/** The framework's own re-stage advice for a missing canvas. */
+const RESTAGE_HINT = 'Re-run the tool that produced this canvas_id';
+
+/** The contract recovery chembl_dataframe_drop declares for `reason`. */
+function dropRecovery(reason: string): string | undefined {
+  return chemblDataframeDrop.errors?.find((entry) => entry.reason === reason)?.recovery;
+}
+
+const AS_DEFAULT_TENANT = { context: { tenantId: 'default' } };
+
+describe('missing canvas — recovery per tool (#26)', () => {
+  it('chembl_dataframe_describe keeps the framework re-stage hint', async () => {
+    setCanvas(new FakeDataCanvas().cast());
+    const result = await runToolContract(
+      chemblDataframeDescribe,
+      { canvas_id: UNHELD_CANVAS_ID },
+      AS_DEFAULT_TENANT,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'canvas_not_found',
+          recovery: { hint: expect.stringContaining(RESTAGE_HINT) },
+        },
+      },
+    });
+    expect(resultText(result)).toContain(`Recovery: ${RESTAGE_HINT}`);
+  });
+
+  it('chembl_dataframe_query keeps the framework re-stage hint', async () => {
+    setCanvas(new FakeDataCanvas().cast());
+    const result = await runToolContract(
+      chemblDataframeQuery,
+      { canvas_id: UNHELD_CANVAS_ID, sql: 'SELECT 1' },
+      AS_DEFAULT_TENANT,
+    );
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'canvas_not_found',
+          recovery: { hint: expect.stringContaining(RESTAGE_HINT) },
+        },
+      },
+    });
+    expect(resultText(result)).toContain(`Recovery: ${RESTAGE_HINT}`);
+  });
+
+  it('chembl_dataframe_drop answers an unknown canvas_id with drop recovery on both surfaces', async () => {
+    setCanvas(new FakeDataCanvas().cast());
+    const result = await runToolContract(
+      chemblDataframeDrop,
+      { canvas_id: UNHELD_CANVAS_ID, table_name: 'bioactivities' },
+      AS_DEFAULT_TENANT,
+    );
+    const hint = dropRecovery('canvas_not_found');
+    expect(hint).toBeDefined();
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'canvas_not_found', recovery: { hint } },
+      },
+    });
+    const text = resultText(result);
+    expect(text).toContain(`Recovery: ${hint}`);
+    expect(text).toContain('(reason canvas_not_found');
+    expect(JSON.stringify(result.structuredContent)).not.toContain(RESTAGE_HINT);
+    expect(text).not.toContain(RESTAGE_HINT);
+  });
+
+  it('chembl_dataframe_drop re-raises a canvas that expires between acquire and drop', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ a: 1 }]);
-    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeDrop.errors });
-    const result = await chemblDataframeDrop.handler(
-      chemblDataframeDrop.input.parse({ canvas_id: canvasId, table_name: 'never_existed' }),
-      ctx,
+    const acquire = fake.acquire.bind(fake);
+    /**
+     * The canvas goes once the handler holds its instance, so it is the
+     * instance's own drop that finds the canvas missing.
+     */
+    const acquired = vi.spyOn(fake, 'acquire').mockImplementation(async (...args) => {
+      const instance = await acquire(...args);
+      await fake.drop(canvasId, { tenantId: 'default' });
+      return instance;
+    });
+    const result = await runToolContract(
+      chemblDataframeDrop,
+      { canvas_id: canvasId, table_name: 'bioactivities' },
+      AS_DEFAULT_TENANT,
     );
-    expect(result.dropped).toBe(false);
+    expect(acquired).toHaveBeenCalledTimes(1);
+    expect(fake.countForTenant({ tenantId: 'default' })).toBe(0);
+    const hint = dropRecovery('canvas_not_found');
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'canvas_not_found', canvasId, recovery: { hint } },
+      },
+    });
+    expect(resultText(result)).toContain(`Recovery: ${hint}`);
+    expect(resultText(result)).not.toContain(RESTAGE_HINT);
+  });
+
+  it('re-raises with the framework error on cause and the canvas id on data', async () => {
+    setCanvas(new FakeDataCanvas().cast());
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeDrop.errors });
+    const input = chemblDataframeDrop.input.parse({
+      canvas_id: UNHELD_CANVAS_ID,
+      table_name: 'bioactivities',
+    });
+    const error = await Promise.resolve(chemblDataframeDrop.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'canvas_not_found', canvasId: UNHELD_CANVAS_ID },
+    });
+    expect((error as Error).cause).toMatchObject({
+      data: {
+        reason: 'canvas_not_found',
+        recovery: { hint: expect.stringContaining(RESTAGE_HINT) },
+      },
+    });
+  });
+});
+
+describe('chembl_dataframe_drop — table-name rejections (#26)', () => {
+  /** Seed a live canvas on a fresh fake and return its id. */
+  async function liveCanvas(): Promise<string> {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    return await seedCanvas(fake, [{ a: 1 }]);
+  }
+
+  it('answers a reserved SQL keyword with drop recovery and no naming advice', async () => {
+    const canvasId = await liveCanvas();
+    const result = await runToolContract(
+      chemblDataframeDrop,
+      { canvas_id: canvasId, table_name: 'select' },
+      AS_DEFAULT_TENANT,
+    );
+    const hint = dropRecovery('identifier_reserved');
+    expect(hint).toBeDefined();
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'identifier_reserved', recovery: { hint } },
+      },
+    });
+    const surfaces = `${JSON.stringify(result.structuredContent)}\n${resultText(result)}`;
+    expect(resultText(result)).toContain(`Recovery: ${hint}`);
+    expect(surfaces).not.toContain('Choose a name');
+    expect(surfaces).not.toContain('Choose another name');
+  });
+
+  it('passes the shape rejection through with the framework hint', async () => {
+    const canvasId = await liveCanvas();
+    const result = await runToolContract(
+      chemblDataframeDrop,
+      { canvas_id: canvasId, table_name: 'not-a-table' },
+      AS_DEFAULT_TENANT,
+    );
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'identifier_shape',
+          recovery: { hint: expect.stringContaining('Use a name of letters, digits') },
+        },
+      },
+    });
+  });
+
+  it('passes the empty-name rejection through with the framework hint', async () => {
+    const canvasId = await liveCanvas();
+    const result = await runToolContract(
+      chemblDataframeDrop,
+      { canvas_id: canvasId, table_name: '' },
+      AS_DEFAULT_TENANT,
+    );
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'identifier_empty',
+          recovery: { hint: expect.stringContaining('Use a name of letters, digits') },
+        },
+      },
+    });
+  });
+
+  it('reports a missing table on a live canvas as dropped:false on both surfaces', async () => {
+    const canvasId = await liveCanvas();
+    const result = await runToolContract(
+      chemblDataframeDrop,
+      { canvas_id: canvasId, table_name: 'never_existed' },
+      AS_DEFAULT_TENANT,
+    );
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ dropped: false });
+    expect(resultText(result)).toContain('No table by that name on this canvas');
   });
 });
 
@@ -515,7 +721,7 @@ describe('dataframe tools — format()', () => {
       'Table dropped',
     );
     expect((chemblDataframeDrop.format!({ dropped: false })[0] as { text: string }).text).toContain(
-      'already gone',
+      'No table by that name on this canvas',
     );
   });
 });
