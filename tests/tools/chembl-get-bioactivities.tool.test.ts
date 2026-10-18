@@ -1923,6 +1923,25 @@ describe('chembl_get_bioactivities — concurrent spill walk (#16)', () => {
     expect(requestedOffsets()).toHaveLength(sentByFailure);
   });
 
+  it('aborts its pages in flight when the tenant cap refuses the spill a canvas', async () => {
+    vi.useFakeTimers();
+    const fake = new FakeDataCanvas({ maxCanvasesPerTenant: 1 });
+    setCanvas(fake.cast());
+    await fake.acquire(undefined, { tenantId: 'default' });
+    // The view overflows the preview within its first three pages; the pages behind them never answer.
+    const traffic = spillCorpus({ honest: 900, rows: TIED_ROWS, stallAt: [150, 200, 250, 300] });
+    const { error, elapsedMs } = await settleUnderFakeTimers(
+      run({ target_chembl_id: 'CHEMBL203' }),
+    );
+
+    expect(error).toMatchObject({ data: { reason: 'canvas_capacity_exhausted' } });
+    // The refusal ends the call at once, and the walk's stalled pages are released with it.
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(traffic.aborted).toBeGreaterThan(0);
+    expect(traffic.inFlight).toBe(0);
+    expect(fake.countForTenant({ tenantId: 'default' })).toBe(1);
+  });
+
   it('reports a caller abort before the deadline as cancelled, never as a deadline partial', async () => {
     vi.useFakeTimers();
     setCanvas(new FakeDataCanvas().cast());
