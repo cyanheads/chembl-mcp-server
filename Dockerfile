@@ -12,7 +12,7 @@
 # The pin holds only while nothing here compiles a native addon — that would
 # need the target-arch toolchain and could not cross-compile.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
 
 WORKDIR /usr/src/app
 
@@ -38,7 +38,7 @@ RUN bun run build
 # selected explicitly for the target image. Running the scanner under QEMU
 # can abort with a JavaScriptCore MemoryExhaustion assertion.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.2 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
 
 WORKDIR /usr/src/app
 
@@ -94,7 +94,7 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 # The slim target-platform runtime receives only production dependencies and
 # compiled JavaScript. No Bun process runs under emulation during this stage.
 # ==============================================================================
-FROM oven/bun:1.4.2-slim AS production
+FROM oven/bun:1.4.3-slim AS production
 
 WORKDIR /usr/src/app
 
