@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-24
+
+chembl_get_drug_info and chembl_get_bioactivities read a drug's whole salt-form family, ID and code inputs are normalized or refused before any request, and ChEMBL text renders inert in content[]. The DataCanvas is on by default.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-17 · ⚠️ Breaking
 
 chembl_get_bioactivities spills pages concurrently under a time budget, pages inline views with cursors, and mints a canvas only when a view spills. Calls hold upstream requests to 45 s, and chembl_dataframe_query refuses the SQL the mcp-ts-core 0.13.15 gate denies.
