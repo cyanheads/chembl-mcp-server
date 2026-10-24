@@ -2,12 +2,16 @@
  * @fileoverview Tests for ChemblService request building and error-path behavior
  * against a stubbed `fetch` (no live ChEMBL call): the Django-style URL each
  * method builds, leak-free upstream-error sanitization (the pre-public security
- * fix), getDrugInfo's Promise.allSettled composition (a rejected mechanism or
- * indication list degrades to a per-list `failed` state with an unknown count
- * rather than an authoritative empty array, while a failed molecule fetch still
- * tanks the call), the mechanism/indication page envelope and its truncation
- * signal, getAssay/getTarget normalization, empty-page handling, and the one
- * upstream time budget every request of a call draws on.
+ * fix), the unparseable-SMILES rule (#43: only an HTTP 500 carrying ChEMBL's
+ * marker on a similarity or substructure search fails once as
+ * `invalid_structure`), getDrugInfo's Promise.allSettled composition (a rejected
+ * mechanism or indication list degrades to a per-list `failed` state with an
+ * unknown count rather than an authoritative empty array, while a failed
+ * molecule fetch still tanks the call), its parent-family reads (#36: lists keyed by the parent the
+ * anchor record resolves, indications deduplicated across forms), the
+ * mechanism/indication page envelope and its truncation signal,
+ * getAssay/getTarget normalization, empty-page handling, and the one upstream time
+ * budget every request of a call draws on.
  * @module tests/services/chembl-service-fetch
  */
 
@@ -20,6 +24,17 @@ import {
   ChemblService,
   sanitizeUpstreamError,
 } from '@/services/chembl/chembl-service.js';
+import {
+  OVERLOAD_HTML_BODY,
+  SIMILARITY_UNPARSEABLE_BODY,
+  SUBSTRUCTURE_UNPARSEABLE_BODY,
+} from '../_chembl-error-bodies.js';
+import {
+  drugFamilyUpstream,
+  IMATINIB,
+  PRODRUG,
+  RAPACURONIUM,
+} from '../_fake-drug-family-upstream.js';
 
 const config = {
   apiBaseUrl: 'https://www.ebi.ac.uk/chembl/api/data',
@@ -308,6 +323,25 @@ describe('sanitizeUpstreamError — code mapping (security unit)', () => {
     expect(JSON.stringify(clean.data)).not.toContain('secret=k');
   });
 
+  it.each([
+    ['a structure query', 500, { structureQuery: true }, 'invalid_structure'],
+    ['any other request', 500, {}, 'upstream_unavailable'],
+    ['a structure query answered 503', 503, { structureQuery: true }, 'upstream_unavailable'],
+  ])('maps a marker 500 body on %s by its scope (#43)', (_label, status, scope, expectedReason) => {
+    const body = SIMILARITY_UNPARSEABLE_BODY.slice(0, 500);
+    const raw = new McpError(JsonRpcErrorCode.ServiceUnavailable, 'Fetch failed. Status: 500', {
+      status,
+      statusText: 'Internal Server Error',
+      body,
+      statusCode: status,
+      responseBody: body,
+    });
+    const clean = sanitizeUpstreamError(raw, 'ChemblService.structureSearch.similarity', scope);
+    expect((clean.data as { reason?: string }).reason).toBe(expectedReason);
+    expectLeakFree(clean);
+    expect(clean.cause).toBe(raw);
+  });
+
   it('collapses a non-McpError (e.g. JSON parse failure) into a clean ServiceUnavailable', () => {
     const clean = sanitizeUpstreamError(
       new SyntaxError('Unexpected token < in JSON at position 0'),
@@ -427,11 +461,11 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(CALL_DEADLINE_MS);
   });
 
-  it("holds getDrugInfo's three fetches to the one budget it is given, starting none past it", async () => {
+  it('fails getDrugInfo inside its one budget when the anchor stalls, requesting no list', async () => {
     /**
-     * All three fetches stall, and the budget is shorter than the 45 s default, so
-     * a fetch that started a budget of its own would outlive this one. They start
-     * together, which is why only a passed-in budget can tell them apart.
+     * The budget is shorter than the 45 s default, so a fetch that started a budget
+     * of its own would outlive this one. The lists wait on the anchor's parent, so
+     * a stalled anchor leaves them unrequested.
      */
     const starts = recordStarts(neverAnswers);
     const { error, elapsedMs } = await settleUnderFakeTimers(
@@ -442,16 +476,75 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
       code: JsonRpcErrorCode.Timeout,
       data: { reason: 'upstream_timeout' },
     });
-    // One attempt each: the budget ended every ladder at its first timeout.
-    const paths = fetchMock.mock.calls.map((_call, i) => new URL(calledUrl(i)).pathname).sort();
-    expect(paths).toEqual([
-      '/chembl/api/data/drug_indication.json',
-      '/chembl/api/data/mechanism.json',
-      '/chembl/api/data/molecule/CHEMBL25.json',
-    ]);
+    // One attempt: the budget ended the ladder at its first timeout.
+    const paths = fetchMock.mock.calls.map((_call, i) => new URL(calledUrl(i)).pathname);
+    expect(paths).toEqual(['/chembl/api/data/molecule/CHEMBL25.json']);
     expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
     expect(elapsedMs).toBeLessThan(11_000);
     expect(Math.max(...starts)).toBeLessThan(10_000);
+  });
+
+  it("holds getDrugInfo's lists to the budget the anchor left, starting none past it", async () => {
+    /**
+     * The anchor answers after 4 s and both lists then stall: they share what is
+     * left of the one 10 s budget instead of starting a budget of their own, and
+     * settle as failed lists, not a failed call.
+     */
+    const family = drugFamilyUpstream(IMATINIB);
+    const starts = recordStarts((input, init) =>
+      input.includes('/molecule/')
+        ? new Promise((resolve) => setTimeout(() => resolve(family(input)), 4_000))
+        : neverAnswers(input, init),
+    );
+    const { value, elapsedMs } = await settleUnderFakeTimers(
+      service().getDrugInfo('CHEMBL941', ctx(), new CallDeadline(10_000)),
+    );
+    expect(value).toMatchObject({
+      parent_molecule_chembl_id: 'CHEMBL941',
+      mechanisms_status: 'failed',
+      mechanisms_failure: 'timeout',
+      indications_status: 'failed',
+      indications_failure: 'timeout',
+    });
+    const paths = fetchMock.mock.calls.map((_call, i) => new URL(calledUrl(i)).pathname);
+    expect(paths).toEqual([
+      '/chembl/api/data/molecule/CHEMBL941.json',
+      '/chembl/api/data/mechanism.json',
+      '/chembl/api/data/drug_indication.json',
+    ]);
+    expect(starts[1]).toBeGreaterThanOrEqual(4_000);
+    expect(starts[2]).toBeGreaterThanOrEqual(4_000);
+    expect(Math.max(...starts)).toBeLessThan(10_000);
+    expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
+    expect(elapsedMs).toBeLessThan(11_000);
+  });
+
+  it("surfaces a caller abort during getDrugInfo's lists as the abort, never as failed lists", async () => {
+    /**
+     * The anchor answers and both lists then stall until the caller cancels. The
+     * lists settle through Promise.allSettled, which would otherwise read the
+     * cancellation as two failed lists in a successful result.
+     */
+    const family = drugFamilyUpstream(IMATINIB);
+    fetchMock.mockImplementation((input: string, init?: RequestInit) =>
+      input.includes('/molecule/') ? family(input) : neverAnswers(input, init),
+    );
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 2_000);
+    const cancelled = createMockContext({ tenantId: 'default', signal: controller.signal });
+    const { value, error, elapsedMs } = await settleUnderFakeTimers(
+      service().getDrugInfo('CHEMBL941', cancelled),
+    );
+    expect(value).toBeUndefined();
+    expect(error).toMatchObject({ name: 'AbortError' });
+    expect(error).not.toBeInstanceOf(McpError);
+    const paths = fetchMock.mock.calls.map((_call, i) => new URL(calledUrl(i)).pathname);
+    expect(paths).toEqual([
+      '/chembl/api/data/molecule/CHEMBL941.json',
+      '/chembl/api/data/mechanism.json',
+      '/chembl/api/data/drug_indication.json',
+    ]);
+    expect(elapsedMs).toBeLessThan(3_000);
   });
 
   it('sends nothing on a budget a chained call already spent', async () => {
@@ -465,6 +558,60 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
     });
     expect(fetchMock).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  describe('the standard_type case-variant lookup', () => {
+    const opts = { targetChemblId: 'CHEMBL203', standardType: 'ic50' };
+
+    it('gives a never-answering lookup its own 5 s budget, one attempt, and answers null', async () => {
+      const starts = recordStarts(neverAnswers);
+      const { value, error, elapsedMs } = await settleUnderFakeTimers(
+        service().findStandardTypeSpelling(opts, ctx()),
+      );
+      expect(error).toBeUndefined();
+      expect(value).toBeNull();
+      expect(starts).toEqual([0]);
+      expect(elapsedMs).toBeGreaterThanOrEqual(5_000);
+      expect(elapsedMs).toBeLessThanOrEqual(5_250);
+    });
+
+    it('caps that budget at what the call deadline has left', async () => {
+      const starts = recordStarts(neverAnswers);
+      const { value, elapsedMs } = await settleUnderFakeTimers(
+        service().findStandardTypeSpelling(opts, ctx(), new CallDeadline(2_000)),
+      );
+      expect(value).toBeNull();
+      expect(starts).toEqual([0]);
+      expect(elapsedMs).toBeGreaterThanOrEqual(2_000);
+      expect(elapsedMs).toBeLessThanOrEqual(2_250);
+    });
+
+    it('answers a fast 5xx with null on its one attempt, never retrying it', async () => {
+      // The budget would hold the retry ladder's first backoffs; the lookup still makes one attempt.
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(jsonResponse({ error_message: 'boom' }, 503)),
+      );
+      const { value, error } = await settleUnderFakeTimers(
+        service().findStandardTypeSpelling(opts, ctx()),
+      );
+      expect(error).toBeUndefined();
+      expect(value).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('rethrows a caller abort during the lookup rather than answering null', async () => {
+      fetchMock.mockImplementation(neverAnswers);
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 1_000);
+      const cancelled = createMockContext({ tenantId: 'default', signal: controller.signal });
+      const { value, error, elapsedMs } = await settleUnderFakeTimers(
+        service().findStandardTypeSpelling(opts, cancelled),
+      );
+      expect(value).toBeUndefined();
+      expect(error).toMatchObject({ name: 'AbortError' });
+      expect(error).not.toBeInstanceOf(McpError);
+      expect(elapsedMs).toBeLessThan(2_000);
+    });
   });
 
   it('still retries a fast 5xx inside the budget and returns the answer unchanged', async () => {
@@ -500,6 +647,195 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
       expect(elapsedMs).toBeLessThan(abortAtMs + 1_000);
     },
   );
+});
+
+describe('ChemblService — a query SMILES ChEMBL cannot parse (#43)', () => {
+  const INVALID_STRUCTURE_HINT =
+    'Check the SMILES for an atom over its valence (a carbon with five bonds), an unclosed ring-closure digit or parenthesis, or an aromatic ring that cannot be kekulized, then retry.';
+
+  /** An HTTP 500 carrying `body` as `contentType`, a fresh Response per request. */
+  const answer500 = (body: string, contentType: string) => () =>
+    Promise.resolve(new Response(body, { status: 500, headers: { 'Content-Type': contentType } }));
+
+  const structureSearch = (searchType: 'exact' | 'similarity' | 'substructure') =>
+    new ChemblService(config).structureSearch(
+      { structure: 'c1cccc1', searchType, similarityThreshold: 70, limit: 2 },
+      ctx(),
+    );
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ['similarity', SIMILARITY_UNPARSEABLE_BODY],
+    ['substructure', SUBSTRUCTURE_UNPARSEABLE_BODY],
+  ] as const)(
+    'fails a %s search on the first attempt as invalid_structure, the body withheld',
+    async (searchType, body) => {
+      fetchMock.mockImplementation(answer500(body, 'application/json'));
+      const { error } = await settleUnderFakeTimers(structureSearch(searchType));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(error).toBeInstanceOf(McpError);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: 'ChEMBL could not parse the query structure.',
+      });
+      expect((error as McpError).data).toEqual({
+        reason: 'invalid_structure',
+        recovery: { hint: INVALID_STRUCTURE_HINT },
+      });
+      expectLeakFree(error);
+      expect(JSON.stringify((error as McpError).data)).not.toContain('Traceback');
+    },
+  );
+
+  it.each([
+    ['the HTML error page on a similarity search', 'similarity', OVERLOAD_HTML_BODY, 'text/html'],
+    [
+      'JSON naming no unparseable SMILES on a substructure search',
+      'substructure',
+      JSON.stringify({
+        error_message: "'CharField' object has no attribute 'get_related_resource'",
+      }),
+      'application/json',
+    ],
+    [
+      'a marker body on the exact-structure lookup',
+      'exact',
+      SUBSTRUCTURE_UNPARSEABLE_BODY,
+      'application/json',
+    ],
+  ] as const)(
+    'retries %s and fails it as upstream_unavailable',
+    async (_label, searchType, body, contentType) => {
+      fetchMock.mockImplementation(answer500(body, contentType));
+      const { error } = await settleUnderFakeTimers(structureSearch(searchType));
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expectLeakFree(error);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_unavailable' },
+      });
+    },
+  );
+
+  it.each<[string, () => Promise<unknown>]>([
+    [
+      'a target search',
+      () => new ChemblService(config).searchTargets({ query: 'kinase', limit: 2 }, ctx()),
+    ],
+    [
+      'an activity page',
+      async () => {
+        for await (const _row of new ChemblService(config).streamActivities(
+          { targetChemblId: 'CHEMBL203' },
+          ctx(),
+        )) {
+          // drain
+        }
+      },
+    ],
+  ])('retries a marker body on %s as an outage, like any other 500', async (_label, run) => {
+    fetchMock.mockImplementation(answer500(SIMILARITY_UNPARSEABLE_BODY, 'application/json'));
+    const { error } = await settleUnderFakeTimers(run());
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'upstream_unavailable' },
+    });
+  });
+
+  /**
+   * The rule reads the status and the body together: the marker text under any
+   * status but 500 is that status's own failure, retried or not as the status
+   * decides. A 500 without the marker is covered above (the HTML page and the
+   * marker-free JSON); here the same marker bodies arrive under the other statuses.
+   */
+  it.each([
+    [
+      '502',
+      'similarity',
+      502,
+      SIMILARITY_UNPARSEABLE_BODY,
+      4,
+      JsonRpcErrorCode.ServiceUnavailable,
+      'upstream_unavailable',
+    ],
+    [
+      '503',
+      'substructure',
+      503,
+      SUBSTRUCTURE_UNPARSEABLE_BODY,
+      4,
+      JsonRpcErrorCode.ServiceUnavailable,
+      'upstream_unavailable',
+    ],
+    [
+      '504',
+      'similarity',
+      504,
+      SIMILARITY_UNPARSEABLE_BODY,
+      4,
+      JsonRpcErrorCode.Timeout,
+      'upstream_timeout',
+    ],
+    [
+      '400',
+      'substructure',
+      400,
+      SUBSTRUCTURE_UNPARSEABLE_BODY,
+      1,
+      JsonRpcErrorCode.ValidationError,
+      'invalid_query',
+    ],
+    [
+      '404',
+      'similarity',
+      404,
+      SIMILARITY_UNPARSEABLE_BODY,
+      1,
+      JsonRpcErrorCode.NotFound,
+      'not_found',
+    ],
+  ] as const)(
+    'reads a marker body under HTTP %s on a %s search as that status, never invalid_structure',
+    async (_label, searchType, status, body, attempts, code, reason) => {
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(
+          new Response(body, { status, headers: { 'Content-Type': 'application/json' } }),
+        ),
+      );
+      const { error } = await settleUnderFakeTimers(structureSearch(searchType));
+      expect(fetchMock).toHaveBeenCalledTimes(attempts);
+      expectLeakFree(error);
+      expect(error).toMatchObject({ code, data: { reason } });
+    },
+  );
+
+  it('keeps a 400 on a substructure search as invalid_query, one attempt', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error_message: 'bad query' }, 400));
+    const { error } = await settleUnderFakeTimers(structureSearch('substructure'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_query' },
+    });
+  });
+
+  it('keeps a 404 on an exact-structure lookup as not_found, one attempt', async () => {
+    fetchMock.mockResolvedValue(new Response('Not found', { status: 404 }));
+    const { error } = await settleUnderFakeTimers(structureSearch('exact'));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'not_found' },
+    });
+  });
 });
 
 describe('ChemblService.getAssay — normalization', () => {
@@ -560,16 +896,25 @@ describe('ChemblService.getTarget — single fetch + flattening', () => {
 });
 
 describe('ChemblService.getDrugInfo — Promise.allSettled composition', () => {
+  /** Gefitinib's record: ChEMBL files no other form under it. */
+  const GEFITINIB = {
+    molecule_chembl_id: 'CHEMBL939',
+    pref_name: 'GEFITINIB',
+    max_phase: '4',
+    first_approval: 2003,
+    molecule_hierarchy: { parent_chembl_id: 'CHEMBL939' },
+  };
+
   it('degrades both secondary lists to an explicit failed state when they fail', async () => {
-    // 1st fetch = molecule approval (ok); every later one is rejected. A fresh
+    // The molecule record answers; every list request is rejected. A fresh
     // Response per call: a shared one has its body consumed by the first read.
-    fetchMock
-      .mockResolvedValueOnce(
-        jsonResponse({ pref_name: 'GEFITINIB', max_phase: '4', first_approval: 2003 }),
-      )
-      .mockImplementation(() =>
-        Promise.resolve(jsonResponse({ error_message: 'boom' }, REJECTED_STATUS)),
-      );
+    fetchMock.mockImplementation((input: string) =>
+      Promise.resolve(
+        input.includes('/molecule/')
+          ? jsonResponse(GEFITINIB)
+          : jsonResponse({ error_message: 'boom' }, REJECTED_STATUS),
+      ),
+    );
     const info = await new ChemblService(config).getDrugInfo('CHEMBL939', ctx());
     expect(info).toMatchObject({
       molecule_chembl_id: 'CHEMBL939',
@@ -585,51 +930,66 @@ describe('ChemblService.getDrugInfo — Promise.allSettled composition', () => {
     expect(info.indications_status).toBe('failed');
     expect(info.mechanisms_total_count).toBeNull();
     expect(info.indications_total_count).toBeNull();
+    // ChEMBL answered with an error, so neither failure is a timeout.
+    expect(info.mechanisms_failure).toBe('upstream_error');
+    expect(info.indications_failure).toBe('upstream_error');
+    expect(info.indications_rows_fetched).toBeNull();
   });
 
-  it('joins mechanisms + indications when all three calls succeed', async () => {
-    fetchMock
-      .mockResolvedValueOnce(
-        jsonResponse({ pref_name: 'GEFITINIB', max_phase: '4', first_approval: 2003 }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse({
-          mechanisms: [
-            {
-              target_chembl_id: 'CHEMBL203',
-              mechanism_of_action: 'EGFR inhibitor',
-              action_type: 'INHIBITOR',
-            },
-          ],
-        }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse({
-          drug_indications: [
-            {
-              mesh_heading: 'Carcinoma, Non-Small-Cell Lung',
-              efo_term: 'non-small cell lung carcinoma',
-              max_phase_for_ind: '4',
-            },
-          ],
-        }),
-      );
+  it("returns a one-form family's mechanism and indication, each naming the form it is recorded on", async () => {
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({
+        molecules: { CHEMBL939: GEFITINIB },
+        mechanisms: [
+          {
+            molecule_chembl_id: 'CHEMBL939',
+            parent_molecule_chembl_id: 'CHEMBL939',
+            target_chembl_id: 'CHEMBL203',
+            mechanism_of_action: 'EGFR inhibitor',
+            action_type: 'INHIBITOR',
+          },
+        ],
+        indications: [
+          {
+            molecule_chembl_id: 'CHEMBL939',
+            parent_molecule_chembl_id: 'CHEMBL939',
+            mesh_id: 'D002289',
+            mesh_heading: 'Carcinoma, Non-Small-Cell Lung',
+            efo_id: 'EFO:0003060',
+            efo_term: 'non-small cell lung carcinoma',
+            max_phase_for_ind: '4',
+          },
+        ],
+      }),
+    );
     const info = await new ChemblService(config).getDrugInfo('CHEMBL939', ctx());
+    expect(info).toMatchObject({
+      molecule_chembl_id: 'CHEMBL939',
+      parent_molecule_chembl_id: 'CHEMBL939',
+      mechanisms_status: 'complete',
+      mechanisms_total_count: 1,
+      indications_status: 'complete',
+      indications_total_count: 1,
+      indications_rows_fetched: 1,
+    });
     expect(info.mechanisms).toEqual([
       {
+        molecule_chembl_id: 'CHEMBL939',
         target_chembl_id: 'CHEMBL203',
         mechanism_of_action: 'EGFR inhibitor',
         action_type: 'INHIBITOR',
       },
     ]);
-    expect(info.indications[0]?.max_phase_for_ind).toBe(4);
-  });
-
-  it('throws when the anchor molecule fetch fails (404 → the call cannot proceed)', async () => {
-    // All three composed fetches 404; the anchor molecule failure is the one the
-    // handler re-throws (mechanisms/indications would have degraded to []).
-    fetchMock.mockResolvedValue(jsonResponse({ error_message: 'not found' }, 404));
-    await expect(new ChemblService(config).getDrugInfo('CHEMBL000', ctx())).rejects.toThrow();
+    expect(info.indications).toEqual([
+      {
+        mesh_id: 'D002289',
+        mesh_heading: 'Carcinoma, Non-Small-Cell Lung',
+        efo_id: 'EFO:0003060',
+        efo_term: 'non-small cell lung carcinoma',
+        max_phase_for_ind: 4,
+        forms: [{ molecule_chembl_id: 'CHEMBL939', max_phase_for_ind: 4 }],
+      },
+    ]);
   });
 });
 
@@ -647,7 +1007,9 @@ describe('ChemblService.getMechanisms / getIndications — page envelope (#6)', 
     // returns all 167 and next: null. Read the param rather than substring-matching
     // the URL — "limit=1000" contains "limit=100".
     expect(new URL(calledUrl()).searchParams.get('limit')).toBe(String(config.maxPageSize));
+    expect(new URL(calledUrl()).searchParams.get('parent_molecule_chembl_id')).toBe('CHEMBL25');
     expect(page.items).toHaveLength(100);
+    expect(page.rowCount).toBe(100);
     expect(page.totalCount).toBe(167);
   });
 
@@ -678,7 +1040,9 @@ describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
       const url = typeof input === 'string' ? input : String((input as Request).url);
       if (url.includes('/mechanism.json')) return Promise.resolve(mechanisms());
       if (url.includes('/drug_indication.json')) return Promise.resolve(indications());
-      return Promise.resolve(jsonResponse({ pref_name: 'ASPIRIN', max_phase: '4' }));
+      return Promise.resolve(
+        jsonResponse({ molecule_chembl_id: 'CHEMBL25', pref_name: 'ASPIRIN', max_phase: '4' }),
+      );
     });
   }
 
@@ -696,8 +1060,10 @@ describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
     expect(info.mechanisms_status).toBe('failed');
     // Unknown, never 0 — the same fidelity rule the numeric coercion follows.
     expect(info.mechanisms_total_count).toBeNull();
+    expect(info.mechanisms_failure).toBe('upstream_error');
     expect(info.indications_status).toBe('complete');
     expect(info.indications_total_count).toBe(1);
+    expect(info.indications_failure).toBeNull();
   });
 
   it('marks a list truncated when the upstream total exceeds the rows returned', async () => {
@@ -712,8 +1078,10 @@ describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
     const info = await new ChemblService(config).getDrugInfo('CHEMBL25', ctx());
     expect(info.indications_status).toBe('truncated');
     expect(info.indications_total_count).toBe(167);
+    expect(info.indications_rows_fetched).toBe(100);
     expect(info.mechanisms_status).toBe('complete');
     expect(info.mechanisms_total_count).toBe(0);
+    expect(info.mechanisms_failure).toBeNull();
   });
 
   it('marks a list complete when the upstream total equals the rows returned', async () => {
@@ -732,6 +1100,311 @@ describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
     const info = await new ChemblService(config).getDrugInfo('CHEMBL25', ctx());
     expect(info.mechanisms_status).toBe('complete');
     expect(info.indications_status).toBe('complete');
+  });
+});
+
+describe('ChemblService.getDrugInfo — the parent family (#36)', () => {
+  /** The query params of every request to `resource` (e.g. "mechanism.json"), in call order. */
+  function paramsOf(resource: string): URLSearchParams[] {
+    return fetchMock.mock.calls
+      .map((_call, i) => new URL(calledUrl(i)))
+      .filter((url) => url.pathname.endsWith(`/${resource}`))
+      .map((url) => url.searchParams);
+  }
+
+  /**
+   * The CML indication imatinib's fixture records on both forms, at phases 2 and 4:
+   * the family's highest phase on the row, and each form's own phase in `forms`.
+   */
+  const CML = {
+    mesh_id: 'D015464',
+    mesh_heading: 'Leukemia, Myelogenous, Chronic, BCR-ABL Positive',
+    efo_id: 'EFO:0000339',
+    efo_term: 'chronic myelogenous leukemia',
+    max_phase_for_ind: 4,
+    forms: [
+      { molecule_chembl_id: 'CHEMBL941', max_phase_for_ind: 2 },
+      { molecule_chembl_id: 'CHEMBL1642', max_phase_for_ind: 4 },
+    ],
+  };
+
+  it('queries both lists by the parent a salt resolves to, never by the salt', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL1642', ctx());
+
+    expect(info.molecule_chembl_id).toBe('CHEMBL1642');
+    expect(info.parent_molecule_chembl_id).toBe('CHEMBL941');
+    expect(info.pref_name).toBe('IMATINIB MESYLATE');
+    for (const params of [...paramsOf('mechanism.json'), ...paramsOf('drug_indication.json')]) {
+      expect(params.get('parent_molecule_chembl_id')).toBe('CHEMBL941');
+      expect(params.has('molecule_chembl_id')).toBe(false);
+    }
+    expect(paramsOf('mechanism.json')).toHaveLength(1);
+    expect(paramsOf('drug_indication.json')).toHaveLength(1);
+  });
+
+  it('answers a parent and its salt with the same family pharmacology', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const service = new ChemblService(config);
+    const parent = await service.getDrugInfo('CHEMBL941', ctx());
+    const salt = await service.getDrugInfo('CHEMBL1642', ctx());
+
+    expect(parent.parent_molecule_chembl_id).toBe('CHEMBL941');
+    expect(salt.mechanisms).toEqual(parent.mechanisms);
+    expect(salt.indications).toEqual(parent.indications);
+    // The parent ID alone records no mechanism; the family records two, on the salt.
+    expect(parent.mechanisms).toEqual([
+      {
+        molecule_chembl_id: 'CHEMBL1642',
+        target_chembl_id: 'CHEMBL1862',
+        mechanism_of_action: 'Tyrosine-protein kinase ABL inhibitor',
+        action_type: 'INHIBITOR',
+      },
+      {
+        molecule_chembl_id: 'CHEMBL1642',
+        target_chembl_id: 'CHEMBL1936',
+        mechanism_of_action: 'Stem cell growth factor receptor inhibitor',
+        action_type: 'INHIBITOR',
+      },
+    ]);
+    expect(parent.mechanisms_status).toBe('complete');
+    expect(parent.mechanisms_total_count).toBe(2);
+  });
+
+  it('returns an indication recorded on two forms once, at the higher phase, naming both forms', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL941', ctx());
+
+    expect(info.indications).toEqual([
+      CML,
+      {
+        mesh_id: 'D046152',
+        mesh_heading: 'Gastrointestinal Stromal Tumors',
+        efo_id: 'EFO:0000703',
+        efo_term: 'gastrointestinal stromal tumor',
+        max_phase_for_ind: 4,
+        forms: [{ molecule_chembl_id: 'CHEMBL1642', max_phase_for_ind: 4 }],
+      },
+      {
+        mesh_id: 'D001249',
+        mesh_heading: 'Asthma',
+        efo_id: 'EFO:0000270',
+        efo_term: 'asthma',
+        max_phase_for_ind: 2,
+        forms: [{ molecule_chembl_id: 'CHEMBL941', max_phase_for_ind: 2 }],
+      },
+      {
+        mesh_id: null,
+        mesh_heading: 'Unmapped condition',
+        efo_id: null,
+        efo_term: null,
+        max_phase_for_ind: 1,
+        forms: [{ molecule_chembl_id: 'CHEMBL1642', max_phase_for_ind: 1 }],
+      },
+    ]);
+    // Five upstream rows, four distinct: complete reports the deduplicated length.
+    expect(info.indications_status).toBe('complete');
+    expect(info.indications_total_count).toBe(4);
+    expect(info.indications_rows_fetched).toBe(5);
+  });
+
+  it('keeps the higher phase whichever form lists it first', async () => {
+    const [lower, higher, ...rest] = IMATINIB.indications;
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({ ...IMATINIB, indications: [higher!, lower!, ...rest] }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL941', ctx());
+    expect(info.indications[0]).toEqual({
+      ...CML,
+      forms: [
+        { molecule_chembl_id: 'CHEMBL1642', max_phase_for_ind: 4 },
+        { molecule_chembl_id: 'CHEMBL941', max_phase_for_ind: 2 },
+      ],
+    });
+  });
+
+  it("keeps each form's own highest phase, never handing a form the family's", async () => {
+    /**
+     * A sorafenib-shaped family: hepatocellular carcinoma at phase 4 on one form and
+     * at phase 2 on donafenib, a deuterated analog filed under the same parent. The
+     * analog is listed twice for it, at phases 1 and 2, and keeps the higher of its own.
+     */
+    const HCC = {
+      parent_molecule_chembl_id: 'CHEMBL1336',
+      mesh_id: 'D006528',
+      mesh_heading: 'Carcinoma, Hepatocellular',
+      efo_id: 'EFO:0000182',
+      efo_term: 'hepatocellular carcinoma',
+    };
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({
+        molecules: {
+          CHEMBL1336: {
+            molecule_chembl_id: 'CHEMBL1336',
+            pref_name: 'SORAFENIB',
+            max_phase: '4.0',
+            molecule_hierarchy: { parent_chembl_id: 'CHEMBL1336' },
+          },
+        },
+        mechanisms: [],
+        indications: [
+          { ...HCC, molecule_chembl_id: 'CHEMBL4297490', max_phase_for_ind: '1.0' },
+          { ...HCC, molecule_chembl_id: 'CHEMBL1336', max_phase_for_ind: '4.0' },
+          { ...HCC, molecule_chembl_id: 'CHEMBL4297490', max_phase_for_ind: '2.0' },
+        ],
+      }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL1336', ctx());
+    expect(info.indications).toHaveLength(1);
+    expect(info.indications[0]).toMatchObject({
+      max_phase_for_ind: 4,
+      forms: [
+        { molecule_chembl_id: 'CHEMBL4297490', max_phase_for_ind: 2 },
+        { molecule_chembl_id: 'CHEMBL1336', max_phase_for_ind: 4 },
+      ],
+    });
+    expect(info.indications_rows_fetched).toBe(3);
+  });
+
+  it('never merges two rows that carry neither a MeSH nor an EFO ID', async () => {
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({
+        ...IMATINIB,
+        indications: [
+          {
+            parent_molecule_chembl_id: 'CHEMBL941',
+            molecule_chembl_id: 'CHEMBL941',
+            mesh_heading: 'A',
+          },
+          {
+            parent_molecule_chembl_id: 'CHEMBL941',
+            molecule_chembl_id: 'CHEMBL941',
+            mesh_heading: 'B',
+          },
+        ],
+      }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL941', ctx());
+    expect(info.indications.map((i) => i.mesh_heading)).toEqual(['A', 'B']);
+    expect(info.indications_total_count).toBe(2);
+  });
+
+  it('merges rows that share one ID and lack the other', async () => {
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({
+        ...IMATINIB,
+        indications: [
+          {
+            parent_molecule_chembl_id: 'CHEMBL941',
+            molecule_chembl_id: 'CHEMBL941',
+            mesh_id: 'D1',
+            max_phase_for_ind: '3.0',
+          },
+          {
+            parent_molecule_chembl_id: 'CHEMBL941',
+            molecule_chembl_id: 'CHEMBL1642',
+            mesh_id: 'D1',
+            max_phase_for_ind: null,
+          },
+        ],
+      }),
+    );
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL941', ctx());
+    expect(info.indications).toHaveLength(1);
+    expect(info.indications[0]).toMatchObject({
+      mesh_id: 'D1',
+      efo_id: null,
+      max_phase_for_ind: 3,
+      forms: [
+        { molecule_chembl_id: 'CHEMBL941', max_phase_for_ind: 3 },
+        { molecule_chembl_id: 'CHEMBL1642', max_phase_for_ind: null },
+      ],
+    });
+  });
+
+  it('reports a truncated family list by its upstream row total, an upper bound (#6)', async () => {
+    // A three-row page over the family's five rows: the first three dedupe to two.
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const info = await new ChemblService({ ...config, maxPageSize: 3 }).getDrugInfo(
+      'CHEMBL941',
+      ctx(),
+    );
+    expect(info.indications).toHaveLength(2);
+    expect(info.indications_status).toBe('truncated');
+    expect(info.indications_total_count).toBe(5);
+    // Two of the five rows were never fetched, so at most two indications are missing.
+    expect(info.indications_rows_fetched).toBe(3);
+  });
+
+  it('marks a page that held every row complete even when dedup shrinks it below the total', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const info = await new ChemblService({ ...config, maxPageSize: 5 }).getDrugInfo(
+      'CHEMBL941',
+      ctx(),
+    );
+    expect(info.indications_status).toBe('complete');
+    expect(info.indications_total_count).toBe(4);
+  });
+
+  it('takes a molecule with no recorded hierarchy as its own parent', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(RAPACURONIUM));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL1201352', ctx());
+    expect(info.parent_molecule_chembl_id).toBe('CHEMBL1201352');
+    expect(info.mechanisms).toEqual([
+      {
+        molecule_chembl_id: 'CHEMBL1200549',
+        target_chembl_id: 'CHEMBL2362997',
+        mechanism_of_action: 'Muscle-type nicotinic acetylcholine receptor antagonist',
+        action_type: 'ANTAGONIST',
+      },
+    ]);
+    expect(info.mechanisms_status).toBe('complete');
+  });
+
+  it('follows the parent, never the active metabolite', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(PRODRUG));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL900001', ctx());
+    expect(info.parent_molecule_chembl_id).toBe('CHEMBL900002');
+    expect(info.mechanisms.map((m) => m.mechanism_of_action)).toEqual(['Prodrug family mechanism']);
+    const sent = fetchMock.mock.calls.map((_call, i) => calledUrl(i));
+    expect(sent.some((url) => url.includes('CHEMBL900003'))).toBe(false);
+  });
+
+  it('keys the lists and the echoed ID off the record, not the caller string', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const info = await new ChemblService(config).getDrugInfo('chembl1642', ctx());
+    expect(info.molecule_chembl_id).toBe('CHEMBL1642');
+    expect(info.parent_molecule_chembl_id).toBe('CHEMBL941');
+    expect(paramsOf('mechanism.json')[0]?.get('parent_molecule_chembl_id')).toBe('CHEMBL941');
+  });
+
+  it('requests no list until the anchor record has resolved the parent', async () => {
+    const family = drugFamilyUpstream(IMATINIB);
+    const order: string[] = [];
+    fetchMock.mockImplementation(async (input: string) => {
+      const path = new URL(input).pathname.split('/').pop() ?? '';
+      order.push(`start ${path}`);
+      const response = await family(input);
+      order.push(`end ${path}`);
+      return response;
+    });
+    await new ChemblService(config).getDrugInfo('CHEMBL941', ctx());
+    expect(order.slice(0, 2)).toEqual(['start CHEMBL941.json', 'end CHEMBL941.json']);
+    expect(order).toHaveLength(6);
+  });
+
+  it('throws the anchor failure and requests neither list', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const thrown = await captureThrow(() =>
+      new ChemblService(config).getDrugInfo('CHEMBL000', ctx()),
+    );
+    expectLeakFree(thrown);
+    expect(thrown).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'not_found' },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(new URL(calledUrl()).pathname).toBe('/chembl/api/data/molecule/CHEMBL000.json');
   });
 });
 

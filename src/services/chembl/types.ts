@@ -32,6 +32,13 @@ export interface Molecule {
   mw_freebase: number | null;
   /** Lipinski rule-of-five violation count. */
   num_ro5_violations: number | null;
+  /**
+   * The parent of the molecule's family — the ID ChEMBL files the salts and other
+   * alternate forms under: `molecule_hierarchy.parent_chembl_id`, or the record's
+   * own ID when ChEMBL records no hierarchy (it is then its family's parent). Never
+   * `active_chembl_id`, which can name a different molecule (a prodrug's metabolite).
+   */
+  parent_chembl_id: string;
   /** Preferred name, e.g. "ASPIRIN". `null` for many research compounds. */
   pref_name: string | null;
   /** QED weighted drug-likeness score, 0–1. */
@@ -47,6 +54,8 @@ export interface Molecule {
  * the normalized comparable view; the raw upstream fields are carried alongside.
  */
 export interface Activity {
+  /** Depositor or curator comment on the result, e.g. "Not Active" — often the only result when `standard_value` is null. */
+  activity_comment: string | null;
   /** ChEMBL activity row ID. */
   activity_id: number;
   /** ChEMBL assay ID — pass to chembl_get_assay for provenance. */
@@ -55,6 +64,16 @@ export interface Activity {
   assay_description: string | null;
   /** Assay type: B=binding, F=functional, A=ADMET, T=toxicity, P=physicochemical, U=unclassified. */
   assay_type: string | null;
+  /** UniProt accession of the assay's variant protein. `null` when no variant is recorded, and for "UNDEFINED MUTATION". */
+  assay_variant_accession: string | null;
+  /** The assay's recorded variant, e.g. "T315I", "L858R,T790M", "UNDEFINED MUTATION". `null` when none is recorded. */
+  assay_variant_mutation: string | null;
+  /** ChEMBL's data-validity annotation, e.g. "Outside typical range". `null` when unannotated. */
+  data_validity_comment: string | null;
+  /** ChEMBL document ID of the measurement's source publication or deposited dataset. */
+  document_chembl_id: string | null;
+  /** Publication year of the source document. `null` when it has none, as for deposited datasets. */
+  document_year: number | null;
   /** ChEMBL molecule ID for the measured compound. */
   molecule_chembl_id: string;
   /** Compound preferred name. `null` for many research compounds. */
@@ -113,18 +132,37 @@ export interface Mechanism {
   action_type: string | null;
   /** Mechanism of action, e.g. "Epidermal growth factor receptor erbB1 inhibitor". */
   mechanism_of_action: string | null;
+  /** The form of the drug's family the mechanism is recorded on, e.g. a salt. */
+  molecule_chembl_id: string | null;
   /** ChEMBL target ID the mechanism acts on. */
   target_chembl_id: string | null;
 }
 
-/** A clinical indication for a drug. */
+/** One form of a family an indication is recorded on, at that form's own highest phase for it. */
+export interface IndicationForm {
+  /** Max clinical phase this form reached for the indication. */
+  max_phase_for_ind: number | null;
+  /** The form's ChEMBL molecule ID — the parent, a salt, or another alternate form. */
+  molecule_chembl_id: string;
+}
+
+/**
+ * A clinical indication for a drug's family: one per (`mesh_id`, `efo_id`) pair
+ * across its forms, at the highest phase any form reached for it.
+ */
 export interface Indication {
+  /** EFO ontology ID, e.g. "EFO:0003060". */
+  efo_id: string | null;
   /** EFO term, e.g. "non-small cell lung carcinoma". */
   efo_term: string | null;
-  /** Max clinical phase reached for THIS indication. */
+  /** The forms of the family the indication is recorded on, in upstream order, each at its own phase. */
+  forms: IndicationForm[];
+  /** Max clinical phase reached for THIS indication, the highest across `forms`. */
   max_phase_for_ind: number | null;
   /** MeSH heading, e.g. "Carcinoma, Non-Small-Cell Lung". */
   mesh_heading: string | null;
+  /** MeSH descriptor ID, e.g. "D002289". */
+  mesh_id: string | null;
 }
 
 /**
@@ -135,33 +173,70 @@ export interface Indication {
  *   fact about the molecule.
  * - `truncated` — the single-request page cap bounded the list, so the array is a
  *   prefix of `*_total_count` rows.
- * - `failed` — the upstream request was rejected, so the empty array is unknown
- *   data, NOT evidence that no rows exist.
+ * - `failed` — the upstream request did not succeed ({@link ListFailure} says
+ *   why), so the empty array is unknown data, NOT evidence that no rows exist.
  */
 export type ListStatus = 'complete' | 'truncated' | 'failed';
 
-/** Drug pharmacology — mechanisms + indications joined for one molecule. */
+/**
+ * Why a `failed` list failed: `timeout` — the request ran out of time (its
+ * per-attempt timeout or the call's budget) before ChEMBL returned the list;
+ * `upstream_error` — ChEMBL answered with an error, or could not be reached.
+ */
+export type ListFailure = 'timeout' | 'upstream_error';
+
+/**
+ * Drug pharmacology for one molecule: its own record, joined to the mechanisms and
+ * indications ChEMBL records across its family (the parent and its alternate forms).
+ */
 export interface DrugInfo {
   /** Year of first approval, from the molecule record. `null` if unapproved/unknown. */
   first_approval: number | null;
   /** Clinical indication(s). Empty is authoritative only when `indications_status` is `complete`. */
   indications: Indication[];
+  /** Why `indications` failed; `null` unless `indications_status` is `failed`. */
+  indications_failure: ListFailure | null;
+  /**
+   * Upstream indication rows fetched, before deduplication. When `truncated`, the
+   * rows not fetched (`indications_total_count` minus this) bound the indications
+   * missing. `null` when the fetch failed.
+   */
+  indications_rows_fetched: number | null;
   /** Retrieval state of `indications`. */
   indications_status: ListStatus;
-  /** Upstream indication total. `null` when the fetch failed — unknown, never 0. */
+  /**
+   * The distinct indications when `complete`; ChEMBL's indication row total for the
+   * family when `truncated`, an upper bound. `null` when the fetch failed — unknown,
+   * never 0.
+   */
   indications_total_count: number | null;
   /** Max clinical phase across all indications. */
   max_phase: number | null;
   /** Mechanism(s) of action. Empty is authoritative only when `mechanisms_status` is `complete`. */
   mechanisms: Mechanism[];
+  /** Why `mechanisms` failed; `null` unless `mechanisms_status` is `failed`. */
+  mechanisms_failure: ListFailure | null;
   /** Retrieval state of `mechanisms`. */
   mechanisms_status: ListStatus;
   /** Upstream mechanism total. `null` when the fetch failed — unknown, never 0. */
   mechanisms_total_count: number | null;
-  /** ChEMBL molecule ID. */
+  /** ChEMBL molecule ID, as the molecule's own record writes it. */
   molecule_chembl_id: string;
+  /** The family parent both lists were requested by ({@link Molecule.parent_chembl_id}). */
+  parent_molecule_chembl_id: string;
   /** Preferred name. */
   pref_name: string | null;
+}
+
+/**
+ * One page of a drug-info list: its normalized items, how many upstream rows they
+ * came from, and the upstream `page_meta.total_count`. `rowCount` is what the
+ * truncation check reads, since deduplication can leave fewer items than rows.
+ */
+export interface ListPage<T> {
+  items: T[];
+  rowCount: number;
+  totalCount: number;
 }
 
 /** Assay provenance behind a bioactivity row. */
@@ -190,6 +265,15 @@ export interface Page<T> {
   items: T[];
   /** Upstream `page_meta.total_count` — total matches before the limit. */
   totalCount: number;
+}
+
+/** A page of a molecule search, whose route may stop counting at a ceiling. */
+export interface MoleculePage extends Page<Molecule> {
+  /**
+   * `totalCount` is the search route's ceiling rather than a count: at least that
+   * many compounds match, and ChEMBL serves no row past it.
+   */
+  totalCountCapped: boolean;
 }
 
 /** Options for `searchMolecules` (name / ID / InChIKey lookup mode). */
@@ -238,6 +322,13 @@ export interface SearchTargetsOptions {
 export type PotencyView = 'potency_ranked' | 'null_potency';
 
 /**
+ * The assay-variant filter of a bioactivity query: the rows that record no variant,
+ * or the rows whose recorded variant equals `mutation` case-insensitively — the
+ * whole recorded string, so "L858R" never matches "L858R,T790M".
+ */
+export type VariantFilter = { kind: 'wild_type' } | { kind: 'mutation'; mutation: string };
+
+/**
  * Options for `streamActivities` / `countActivities` — at least one of molecule/target
  * id is set by the caller. Both together is legal and ANDs upstream, narrowing the
  * query to the measurements of that one compound against that one target. The count
@@ -245,7 +336,13 @@ export type PotencyView = 'potency_ranked' | 'null_potency';
  */
 export interface GetActivitiesOptions {
   assayType?: string | undefined;
-  moleculeChemblId?: string | undefined;
+  /**
+   * The molecule scope: one form's own measurements (`form`, the
+   * `molecule_chembl_id` filter), or every form's under a family parent (`family`,
+   * the `parent_molecule_chembl_id` filter — pass a resolved
+   * {@link Molecule.parent_chembl_id}; a salt's ID there matches nothing).
+   */
+  molecule?: { scope: 'form' | 'family'; id: string } | undefined;
   /**
    * Zero-based row of the view the stream starts at. Defaults to 0. The tool
    * derives it from a redeemed cursor; validate it before it gets here — ChEMBL
@@ -264,4 +361,5 @@ export interface GetActivitiesOptions {
   potencyView?: PotencyView | undefined;
   standardType?: string | undefined;
   targetChemblId?: string | undefined;
+  variant?: VariantFilter | undefined;
 }

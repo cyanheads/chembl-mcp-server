@@ -10,7 +10,12 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { decodeCursor, encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { clampLimit, LIMIT_CEILING, optionalCodeInput } from '@/mcp-server/input-normalization.js';
+import { mdInline } from '@/mcp-server/markdown-text.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
+
+/** The most targets one call returns; a larger `limit` is served at this cap. */
+const MAX_LIMIT = 100;
 
 const TargetComponentSchema = z
   .object({
@@ -69,12 +74,9 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
       .describe(
         'Free-text name match against the target preferred name, e.g. "kinase" or "growth factor receptor".',
       ),
-    accession: z
-      .string()
-      .optional()
-      .describe(
-        'UniProt accession of a target component, e.g. "P00533". The most precise resolver — from the uniprot/protein server.',
-      ),
+    accession: optionalCodeInput.describe(
+      'UniProt accession of a target component, e.g. "P00533". The most precise resolver — from the uniprot/protein server.',
+    ),
     gene_symbol: z
       .string()
       .optional()
@@ -85,17 +87,18 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
       .describe(
         'Restrict to a source organism, e.g. "Homo sapiens" (case-insensitive exact match).',
       ),
-    target_type: z
-      .string()
-      .optional()
-      .describe('Restrict to a target class, e.g. "SINGLE PROTEIN" or "PROTEIN COMPLEX".'),
+    target_type: optionalCodeInput.describe(
+      'Restrict to a target class, e.g. "SINGLE PROTEIN" or "PROTEIN COMPLEX".',
+    ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(100)
+      .max(LIMIT_CEILING)
       .optional()
-      .describe('Maximum targets to return. Defaults to the server default (25) when omitted.'),
+      .describe(
+        'Maximum targets to return, up to 100 — a larger value is served at 100, with a notice saying so. Defaults to the server default (25) when omitted.',
+      ),
     cursor: z
       .string()
       .optional()
@@ -123,7 +126,7 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
       .string()
       .optional()
       .describe(
-        'Guidance when no target matched — echoes the filters and suggests how to broaden.',
+        'Guidance when no target matched — echoes the filters and suggests how to broaden — and the disclosure that a limit above the maximum was served at the maximum.',
       ),
   },
   errors: [
@@ -156,29 +159,35 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
     // gate lives here. Any combination is valid — the three AND upstream, so extra
     // ones narrow. Guard for empty strings (form clients send "" not undefined).
     const query = input.query?.trim() || undefined;
-    const accession = input.accession?.trim() || undefined;
+    // Every accession and target type ChEMBL records is uppercase; the schema has trimmed and uppercased both.
+    const accession = input.accession;
     const geneSymbol = input.gene_symbol?.trim() || undefined;
     if (!query && !accession && !geneSymbol) {
       throw ctx.fail('missing_input');
     }
 
-    const limit = input.limit ?? getServerConfig().defaultLimit;
+    const { limit, notice: limitNotice } = clampLimit(
+      input.limit ?? getServerConfig().defaultLimit,
+      MAX_LIMIT,
+    );
     /**
      * Decoding here is the boundary check: ChEMBL substitutes 0 for an offset it
      * dislikes and answers 200, so a corrupted cursor forwarded unchecked would
      * return page one dressed as a later page. `decodeCursor` throws InvalidParams
      * (-32602) — the code the MCP pagination spec mandates — and that propagates
      * unwrapped. Only the offset is read back: `limit` stays this call's, so a
-     * client never has to re-send the page size to keep paging.
+     * client never has to re-send the page size to keep paging. A blank cursor
+     * counts as omitted.
      */
-    const offset = input.cursor ? decodeCursor(input.cursor, ctx).offset : 0;
+    const cursor = input.cursor?.trim() || undefined;
+    const offset = cursor ? decodeCursor(cursor, ctx).offset : 0;
     const page = await getChemblService().searchTargets(
       {
         query,
         accession,
         geneSymbol,
         organism: input.organism?.trim() || undefined,
-        targetType: input.target_type?.trim() || undefined,
+        targetType: input.target_type,
         limit,
         offset,
       },
@@ -195,27 +204,36 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
      * cap that withholds nothing — which would contradict the absent nextCursor.
      */
     if (page.items.length >= limit && hasMore) {
-      ctx.enrich.truncated({ shown: page.items.length, cap: limit });
+      ctx.enrich.truncated({
+        shown: page.items.length,
+        cap: limit,
+        // A clamped limit is already the maximum, so the default "raise the cap" advice would not hold.
+        ...(limitNotice && {
+          guidance: `${limitNotice} Showing ${page.items.length} of ${page.totalCount}; pass nextCursor back as cursor for the next page.`,
+        }),
+      });
     } else {
       ctx.enrich({ truncated: false, shown: page.items.length, cap: limit });
-    }
-    if (page.items.length === 0) {
-      const filters = [
-        accession && `accession="${accession}"`,
-        geneSymbol && `gene_symbol="${geneSymbol}"`,
-        query && `query="${query}"`,
-      ]
-        .filter(Boolean)
-        .join(', ');
-      /**
-       * A paged call that runs off the end matched fine — saying otherwise would
-       * send the caller chasing a bad accession that isn't there.
-       */
-      ctx.enrich.notice(
-        offset > 0 && page.totalCount > 0
-          ? `That cursor starts past the end of the ${page.totalCount} targets matching ${filters} — the walk is complete.`
-          : `No target matched ${filters}. Verify the accession/symbol, or broaden with a free-text query.`,
-      );
+      let notice = limitNotice;
+      if (page.items.length === 0) {
+        const filters = [
+          accession && `accession="${accession}"`,
+          geneSymbol && `gene_symbol="${geneSymbol}"`,
+          query && `query="${query}"`,
+        ]
+          .filter(Boolean)
+          .join(', ');
+        /**
+         * A paged call that runs off the end matched fine — saying otherwise would
+         * send the caller chasing a bad accession that isn't there.
+         */
+        const empty =
+          offset > 0 && page.totalCount > 0
+            ? `That cursor starts past the end of the ${page.totalCount} targets matching ${filters} — the walk is complete.`
+            : `No target matched ${filters}. Verify the accession/symbol, or broaden with a free-text query.`;
+        notice = notice ? `${notice} ${empty}` : empty;
+      }
+      if (notice) ctx.enrich.notice(notice);
     }
 
     /**
@@ -235,12 +253,12 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
     }
     const lines = result.targets.map((t) => {
       const parts = [
-        `**${t.target_chembl_id}** — ${t.pref_name ?? '(unnamed)'}`,
-        `Type: ${t.target_type ?? '—'} | Organism: ${t.organism ?? '—'}`,
+        `**${mdInline(t.target_chembl_id)}** — ${mdInline(t.pref_name ?? '(unnamed)')}`,
+        `Type: ${mdInline(t.target_type ?? '—')} | Organism: ${mdInline(t.organism ?? '—')}`,
       ];
       for (const c of t.components) {
-        const genes = c.gene_symbols.length > 0 ? c.gene_symbols.join(', ') : '—';
-        parts.push(`  • accession ${c.accession ?? '—'} | genes: ${genes}`);
+        const genes = c.gene_symbols.length > 0 ? c.gene_symbols.map(mdInline).join(', ') : '—';
+        parts.push(`  • accession ${mdInline(c.accession ?? '—')} | genes: ${genes}`);
       }
       return parts.join('\n');
     });

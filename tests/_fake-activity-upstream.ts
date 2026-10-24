@@ -10,8 +10,9 @@
  * `order_by` value that is not one bare field name — the comma form, or the
  * Python list repr below — is answered with HTTP 400. `page_meta.next` and
  * `page_meta.previous` re-serialize the received order the way ChEMBL does: one
- * key passes through, several become that Python list repr. The corpus is the
- * view itself; the fake applies no filters.
+ * key passes through, several become that Python list repr. A view page honors an
+ * `only=` field selection, silently dropping names it cannot serve. The corpus is
+ * the view itself; the fake applies no filters.
  *
  * For the concurrent spill walk a view page can also answer late (so requests
  * overlap and complete out of order), never answer, or answer with an HTTP error
@@ -94,6 +95,18 @@ function orderView(rows: RawRow[], order: string[], offset: number): RawRow[] {
     (a, b) =>
       Number(b.pchembl_value) - Number(a.pchembl_value) ||
       (tieBroken ? byId(a, b) : tieShuffleKey(a, offset) - tieShuffleKey(b, offset)),
+  );
+}
+
+/**
+ * A row trimmed to the `only=` field selection, as ChEMBL serves it: a named field the
+ * row lacks, or a name ChEMBL does not know, is left out rather than refused. No
+ * selection serves the whole row.
+ */
+function select(row: RawRow, only: readonly string[] | undefined): RawRow {
+  if (!only) return row;
+  return Object.fromEntries(
+    only.filter((key) => Object.hasOwn(row, key)).map((key) => [key, row[key]]),
   );
 }
 
@@ -188,12 +201,15 @@ export function activityCorpus(
     }
     const offset = Number(params.get('offset') ?? 0);
     const limit = Number(params.get('limit') ?? UPSTREAM_DEFAULT_LIMIT);
+    const only = params.get('only')?.split(',');
     const answer = () => {
       if (opts.failAt?.offset === offset && failuresLeft > 0) {
         failuresLeft -= 1;
         return jsonResponse({ error_message: 'upstream failure' }, opts.failAt.status);
       }
-      const activities = orderView(opts.rows, order, offset).slice(offset, offset + limit);
+      const activities = orderView(opts.rows, order, offset)
+        .slice(offset, offset + limit)
+        .map((row) => select(row, only));
       return jsonResponse({
         activities,
         page_meta: {

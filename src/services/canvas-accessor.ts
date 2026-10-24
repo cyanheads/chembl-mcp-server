@@ -1,8 +1,9 @@
 /**
  * @fileoverview Module-level holder for the optional DataCanvas wired in
  * `createApp({ setup })`. The framework attaches `core.canvas` only when
- * `CANVAS_PROVIDER_TYPE=duckdb`; `getCanvas()` returns `undefined` otherwise,
- * and the bioactivity spill + dataframe tools degrade accordingly.
+ * `CANVAS_PROVIDER_TYPE=duckdb`, which `src/index.ts` defaults on; under `none`,
+ * `getCanvas()` returns `undefined` and the bioactivity spill + dataframe tools
+ * degrade accordingly.
  * @module services/canvas-accessor
  */
 

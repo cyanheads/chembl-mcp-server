@@ -15,6 +15,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { mdInline } from '@/mcp-server/markdown-text.js';
 import { getCanvas } from '@/services/canvas-accessor.js';
 
 /**
@@ -45,13 +46,15 @@ const INTEGER_TYPES = new Set([
 /**
  * One cell as markdown-table-safe text. Structs and lists render as JSON —
  * `String()` flattens them to "[object Object]", dropping from `content[]` a value
- * `structuredContent` carries in full. Pipes are escaped and newlines folded so no
- * single cell can break the row it sits in.
+ * `structuredContent` carries in full. Cells hold upstream text (assay
+ * descriptions, comments), so each takes the shared escape, which also writes a
+ * line break as a character reference; pipes are escaped after it, so no single
+ * cell can break the row it sits in.
  */
 function renderCell(value: unknown): string {
   const text =
     typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '');
-  return text.replaceAll('|', '\\|').replaceAll(/\r?\n/g, ' ');
+  return mdInline(text).replaceAll('|', '\\|');
 }
 
 /** One result row as a markdown table line, in header column order. */
@@ -112,7 +115,7 @@ function coerceIntegerStrings(
 export const chemblDataframeQuery = tool('chembl_dataframe_query', {
   title: 'chembl-dataframe-query',
   description:
-    "Run a read-only SQL SELECT over the bioactivity rows chembl_get_bioactivities staged on a canvas — rank, group, dedupe, and aggregate across the FULL set, not the inline preview. Reference each staged table by the name chembl_get_bioactivities returned — bioactivities for its potency_ranked view, bioactivities_null_potency for null_potency; discover the staged tables and their columns with chembl_dataframe_describe. Compute honest aggregates here (e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities WHERE standard_type = 'IC50' GROUP BY 1 ORDER BY 2 DESC). Two independent bounds apply, each reported on its own field: truncated is true when the SQL result exceeded the canvas row cap, and rendered_rows says how many of the returned rows the markdown table holds once its character budget is reached (below row_count on a wide or long result). Page past either bound with SQL LIMIT/OFFSET — append e.g. LIMIT 500 OFFSET 500 and re-call; offsets reach rows beyond the canvas row cap. Requires CANVAS_PROVIDER_TYPE=duckdb.",
+    "Run a read-only SQL SELECT over the bioactivity rows chembl_get_bioactivities staged on a canvas — rank, group, dedupe, and aggregate across the FULL set, not the inline preview. Reference each staged table by the name chembl_get_bioactivities returned — bioactivities for its potency_ranked view, bioactivities_null_potency for null_potency; discover the staged tables and their columns with chembl_dataframe_describe. Compute honest aggregates here (e.g. SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities WHERE standard_type = 'IC50' GROUP BY 1 ORDER BY 2 DESC). Two independent bounds apply, each reported on its own field: truncated is true when the SQL result exceeded the canvas row cap, and rendered_rows says how many of the returned rows the markdown table holds once its character budget is reached (below row_count on a wide or long result). Page past either bound with SQL LIMIT/OFFSET — append e.g. LIMIT 500 OFFSET 500 and re-call; offsets reach rows beyond the canvas row cap. Unavailable when the server sets CANVAS_PROVIDER_TYPE=none.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     canvas_id: CanvasIdSchema.describe(
@@ -144,9 +147,9 @@ export const chemblDataframeQuery = tool('chembl_dataframe_query', {
     {
       reason: 'canvas_disabled',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Called while CANVAS_PROVIDER_TYPE is not duckdb, so no canvas exists.',
+      when: 'The server runs with the canvas off (CANVAS_PROVIDER_TYPE=none), so no canvas exists.',
       recovery:
-        'Set CANVAS_PROVIDER_TYPE=duckdb to enable the SQL path; otherwise read the inline preview from chembl_get_bioactivities.',
+        'The SQL path is off on this server; read the inline rows from chembl_get_bioactivities and page with its nextCursor.',
     },
   ],
 

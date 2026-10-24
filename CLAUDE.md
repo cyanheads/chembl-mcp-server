@@ -19,10 +19,10 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 
 | Tool | Purpose |
 |:-----|:--------|
-| `chembl_search_molecules` | Discovery entry point — find compounds by name / ChEMBL ID / InChIKey, or structure search (exact / similarity / substructure) from a SMILES |
+| `chembl_search_molecules` | Discovery entry point — find compounds by name / ChEMBL ID / InChIKey, or structure search (exact / similarity / substructure) from a SMILES; every row names its family `parent_chembl_id`; a total at ChEMBL's name (10,000) or substructure (30,000) search ceiling comes back `totalCountCapped`; an unparseable similarity or substructure SMILES fails fast as `invalid_structure` |
 | `chembl_search_targets` | Resolve a protein / gene / UniProt accession to the ChEMBL target ID `chembl_get_bioactivities` needs |
-| `chembl_get_bioactivities` | Flagship compound↔target bridge — bioactivity measurements for a molecule, a target, or both (which narrows to that compound–target pair); `potency_view` picks the measurements with a derivable `pchembl_value` (default) or exactly those without one; large sets spill to a per-view DataCanvas table SQL'd via `chembl_dataframe_query`; whenever a call stages nothing (canvas off, or an inline fit with no `canvas_id`), `cursor` / `nextCursor` page through the view, and a cursor page never stages |
-| `chembl_get_drug_info` | Drug pharmacology — mechanism(s) of action, target(s), first-approval year, clinical indications |
+| `chembl_get_bioactivities` | Flagship compound↔target bridge — bioactivity measurements for a molecule, a target, or both (which narrows to that compound–target pair); `include_alternate_forms` widens the molecule to its family by parent; `variant` keeps wild-type measurements or one recorded mutant; `potency_view` picks the measurements with a derivable `pchembl_value` (default) or exactly those without one; large sets spill to a per-view DataCanvas table SQL'd via `chembl_dataframe_query`; whenever a call stages nothing (canvas off, or an inline fit with no `canvas_id`), `cursor` / `nextCursor` page through the view, and a cursor page never stages |
+| `chembl_get_drug_info` | Drug pharmacology — mechanism(s) of action, target(s), first-approval year, clinical indications, read across the molecule's family (the parent its record resolves to, and that parent's salts and alternate forms) |
 | `chembl_get_assay` | Assay provenance behind a bioactivity row — type, target, organism, 1–9 confidence score |
 | `chembl_dataframe_query` | Read-only SQL SELECT over the staged bioactivity rows (canvas) |
 | `chembl_dataframe_describe` | List tables/columns staged on a canvas before querying |
@@ -30,11 +30,11 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 
 **Resources** (`src/mcp-server/resources/definitions/`): `chembl://molecule/{chemblId}` and `chembl://target/{chemblId}` — injectable-context mirrors of the per-record fetch.
 
-**Service** (`src/services/chembl/chembl-service.ts`): the single upstream client. Builds Django-style filtered `.json` URLs, walks a bioactivity view by offset on a total order (`-pchembl_value` then `activity_id`, or `activity_id` alone for the null-potency view — never `page_meta.next`), coerces string numerics → `number | null` at the boundary (absent → `null`, never `0` — the scientific-fidelity rule), flattens nested upstream structures into the flat domain types in `types.ts`. Every fetch routes through `fetchJson`, which wraps the framework HTTP utility in `withRetry` under the call's one deadline (`CallDeadline`), started at each public method's entry or passed in by a caller chaining methods: 45 s (`CALL_DEADLINE_MS`) by default, or `CHEMBL_SPILL_DEADLINE_MS` (default 45 s) for a canvas-on `chembl_get_bioactivities` call without a cursor. At the defaults every request of a call — chained, concurrent, or retried — settles before an MCP client's 60 s timeout. The bioactivity spill walks its pages concurrently, in offset order, through one service-wide `createPacer({ maxConcurrent })`, so one spill whose pages hang can hold every slot until each attempt's timeout or its deadline, and a concurrent spill waits behind it (an accepted limitation, `docs/design.md` § Known Limitations).
+**Service** (`src/services/chembl/chembl-service.ts`): the single upstream client. Builds Django-style filtered `.json` URLs, walks a bioactivity view by offset on a total order (`-pchembl_value` then `activity_id`, or `activity_id` alone for the null-potency view — never `page_meta.next`), asks every activity page for only the fields `normalizeActivity` reads (`only=` from `ACTIVITY_FIELDS`, derived from a field set that `satisfies` ties to `RawActivity` both ways, with a test that the list equals the keys `normalizeActivity` reads — ChEMBL drops an unknown name silently, so a new field goes in the type, the set, and the normalizer or the typecheck or test fails), coerces string numerics → `number | null` at the boundary (absent → `null`, never `0` — the scientific-fidelity rule), flattens nested upstream structures into the flat domain types in `types.ts`. Every fetch routes through `fetchJson`, which wraps the framework HTTP utility in `withRetry` under the call's one deadline (`CallDeadline`), started at each public method's entry or passed in by a caller chaining methods: 45 s (`CALL_DEADLINE_MS`) by default, or `CHEMBL_SPILL_DEADLINE_MS` (default 45 s) for a canvas-on `chembl_get_bioactivities` call without a cursor. At the defaults every request of a call — chained, concurrent, or retried — settles before an MCP client's 60 s timeout. The bioactivity spill walks its pages concurrently, in offset order, through one service-wide `createPacer({ maxConcurrent })`, so one spill whose pages hang can hold every slot until each attempt's timeout or its deadline, and a concurrent spill waits behind it (an accepted limitation, `docs/design.md` § Known Limitations).
 
 **Security invariant — upstream errors are sanitized at `fetchJson`.** The framework's `fetchWithTimeout` throws status-mapped `McpError` values with upstream diagnostics such as response bodies. `McpError.data` reaches the client verbatim. `fetchJson` rethrows clean domain errors through `sanitizeUpstreamError`, preserving only a reason and recovery hint; the raw error stays on `cause`. Every upstream tool and resource declares the service's non-baseline `not_found` and `rate_limited` reasons with `thrownBy: 'service'`. Never bypass this boundary with a direct fetch from a handler. Regression coverage lives in `tests/services/chembl-service-fetch.test.ts`.
 
-**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table when `CANVAS_PROVIDER_TYPE=duckdb` — one per `potency_view` (`bioactivities` / `bioactivities_null_potency`), so both can coexist on one canvas and `UNION ALL` back into the honest full set; otherwise it inlines a page that `nextCursor` continues, and the `chembl_dataframe_*` tools return a `canvas_disabled` error. A canvas is minted only when a view spills: without a `canvas_id`, `spillover()` gets a stand-in that acquires on its first `registerTable` and releases the canvas if that registration fails, so an inline fit, a zero match, an upstream failure, or a cancellation holds no tenant slot (remove the stand-in once cyanheads/mcp-ts-core#501 ships). A supplied `canvas_id` is never released, and every non-cursor call re-stages the selected view's table on it — inline fits and zero matches included — so the table always holds the latest successful call's rows. A spill onto a supplied canvas registers under a per-call `<view table>_staging_<hex>` table and replaces the view's table only once it succeeds: drop the table, copy the staging table in with `query('SELECT * FROM <staging>', { registerAs })` (which refuses an existing name rather than replacing it), drop the staging table. The swap takes no signal, every write to a supplied canvas's view table (the swap, and the inline-fit or zero-match re-stage) takes its turn on it, and a spill that fails or is cancelled leaves the earlier table. A `cursor` call is always served inline: it acquires no canvas and leaves a supplied `canvas_id` untouched. A canvas-on inline fit with no `canvas_id` stages nothing either, so it mints `nextCursor` as the canvas-off page does. The spill passes `caps: { maxRows: config.maxSpillRows }`, and the walk requests no page at or past the cap or the view total; `CHEMBL_SPILL_DEADLINE_MS` bounds its count and walk together, and at expiry the fetched prefix stages; a page whose retries the budget stops short (`retry_deadline_exceeded` on the sanitized error's `cause`) counts as expiry, and so does a walk that stops starting pages once the budget left would not hold another (timed by the latest page to land, on its final attempt), ending after the pages in flight. A table either bound cut short reports `truncated: true`, `staged_row_count`, and `truncated_by` (`row_cap` / `time_budget`) on both response surfaces rather than passing itself off as complete; `row_cap` means the registered rows reached the cap, and a walk that ends on a short page below it names no bound. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`. Both views pass an explicit canvas schema: `standard_value` and `pchembl_value` are nullable `DOUBLE` columns, `activity_id` is `BIGINT`, and text fields stay `VARCHAR`. Never infer these types from preview rows; sparse or integer-only previews can silently narrow later fractional measurements.
+**Canvas:** `chembl_get_bioactivities` spills large rowsets to a DataCanvas table under `CANVAS_PROVIDER_TYPE=duckdb`, the default `src/index.ts` sets (§ Server identity and instructions) — one per `potency_view` (`bioactivities` / `bioactivities_null_potency`), so both can coexist on one canvas and `UNION ALL` back into the honest full set; under `none` it inlines a page that `nextCursor` continues, and the `chembl_dataframe_*` tools return a `canvas_disabled` error. A canvas is minted only when a view spills: without a `canvas_id`, `spillover()` gets a stand-in that acquires on its first `registerTable` and releases the canvas if that registration fails, so an inline fit, a zero match, an upstream failure, or a cancellation holds no tenant slot (remove the stand-in once cyanheads/mcp-ts-core#501 ships). A supplied `canvas_id` is never released, and every non-cursor call re-stages the selected view's table on it — inline fits and zero matches included — so the table always holds the latest successful call's rows. A spill onto a supplied canvas registers under a per-call `<view table>_staging_<hex>` table and replaces the view's table only once it succeeds: drop the table, copy the staging table in with `query('SELECT * FROM <staging>', { registerAs })` (which refuses an existing name rather than replacing it), drop the staging table. The swap takes no signal, every write to a supplied canvas's view table (the swap, and the inline-fit or zero-match re-stage) takes its turn on it, and a spill that fails or is cancelled leaves the earlier table. A `cursor` call is always served inline: it acquires no canvas and leaves a supplied `canvas_id` untouched. A canvas-on inline fit with no `canvas_id` stages nothing either, so it mints `nextCursor` as the canvas-off page does. The spill passes `caps: { maxRows: config.maxSpillRows }`, and the walk requests no page at or past the cap or the view total; `CHEMBL_SPILL_DEADLINE_MS` bounds its count and walk together, and at expiry the fetched prefix stages; a page whose retries the budget stops short (`retry_deadline_exceeded` on the sanitized error's `cause`) counts as expiry, and so does a walk that stops starting pages once the budget left would not hold another (timed by the latest page to land, on its final attempt), ending after the pages in flight. A table either bound cut short reports `truncated: true`, `staged_row_count`, and `truncated_by` (`row_cap` / `time_budget`) on both response surfaces rather than passing itself off as complete; `row_cap` means the registered rows reached the cap, and a walk that ends on a short page below it names no bound. `getCanvas()` (`src/services/canvas-accessor.ts`) returns the framework-wired canvas or `undefined`. Both views pass an explicit canvas schema: `standard_value` and `pchembl_value` are nullable `DOUBLE` columns, `activity_id` is `BIGINT`, `document_year` is a nullable `INTEGER`, and text fields stay `VARCHAR`. Never infer these types from preview rows; sparse or integer-only previews can silently narrow later fractional measurements.
 
 ---
 
@@ -58,6 +58,7 @@ Real shape, condensed from `chembl-get-assay.tool.ts` (a keyless read-only tool 
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { chemblIdInput } from '@/mcp-server/input-normalization.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 export const chemblGetAssay = tool('chembl_get_assay', {
@@ -65,7 +66,10 @@ export const chemblGetAssay = tool('chembl_get_assay', {
   description: 'Assay provenance behind a bioactivity row: type, target, organism, 1–9 confidence score.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    assay_chembl_id: z.string().min(1).describe("ChEMBL assay ID, e.g. \"CHEMBL674637\"."),
+    // Parses any case and surrounding whitespace to the canonical ID; the advertised
+    // pattern spells those variants out, since JSON Schema `pattern` takes no flags.
+    assay_chembl_id: chemblIdInput('Must be a ChEMBL assay ID like CHEMBL674637 — …')
+      .describe("ChEMBL assay ID, e.g. \"CHEMBL674637\"."),
   }),
   output: z.object({
     assay_chembl_id: z.string().describe('The ChEMBL assay ID queried.'),
@@ -75,7 +79,7 @@ export const chemblGetAssay = tool('chembl_get_assay', {
 
   // Service throws sanitized domain errors; the handler stays a thin pure call.
   async handler(input, ctx) {
-    return await getChemblService().getAssay(input.assay_chembl_id.trim(), ctx);
+    return await getChemblService().getAssay(input.assay_chembl_id, ctx);
   },
 
   // format() populates content[] — the markdown twin of structuredContent.
@@ -92,6 +96,7 @@ Real shape — `chembl-molecule.resource.ts`. The handler is a thin pass-through
 
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
+import { chemblIdInput } from '@/mcp-server/input-normalization.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 export const chemblMoleculeResource = resource('chembl://molecule/{chemblId}', {
@@ -100,7 +105,7 @@ export const chemblMoleculeResource = resource('chembl://molecule/{chemblId}', {
   description: 'A molecule record by ChEMBL ID — the chembl_search_molecules row shape.',
   mimeType: 'application/json',
   params: z.object({
-    chemblId: z.string().regex(/^CHEMBL\d+$/, 'Must be a ChEMBL ID like CHEMBL25.').describe('ChEMBL molecule ID.'),
+    chemblId: chemblIdInput('Must be a ChEMBL ID like CHEMBL25 — …').describe('ChEMBL molecule ID.'),
   }),
   handler(params, ctx) {
     return getChemblService().getMolecule(params.chemblId, ctx);
@@ -169,6 +174,10 @@ For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("
 Real shape — `src/index.ts`. **`title` is the hyphenated repo name** (`chembl-mcp-server`), never a Title-Case display name — humans and agents both see the machine identity. The identity block is `name` + `title` only — don't add `description` or `websiteUrl` (`description` derives from `package.json`, the canonical source):
 
 ```ts
+parseConfig();                                             // loads .env first, so a .env value wins
+process.env.CANVAS_PROVIDER_TYPE ||= 'duckdb';             // DataCanvas on unless set to none
+resetConfig();                                             // the framework logger parsed config at import; drop that cache
+
 await createApp({
   name: 'chembl-mcp-server',
   title: 'chembl-mcp-server',                              // display identity = repo name
@@ -183,7 +192,7 @@ await createApp({
 });
 ```
 
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Here it carries the canonical cross-server chains (UniProt → `chembl_search_targets` → `chembl_get_bioactivities`), the ranking trap (`pchembl_value` is comparable only within one `standard_type`), and the ChEMBL CC BY-SA attribution — instead of repeating that context across tool descriptions.
+`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Here it carries the canonical cross-server chains (UniProt → `chembl_search_targets` → `chembl_get_bioactivities`), the ranking trap (`pchembl_value` is comparable only within one `standard_type`), the coverage trap (measurements without a `pchembl_value` sit in the `null_potency` view), the salt trap (a drug's measurements split across its alternate forms), and the ChEMBL CC BY-SA attribution — instead of repeating that context across tool descriptions.
 
 ### Session posture and shutdown
 
@@ -269,13 +278,15 @@ src/
       chembl-service.ts                 # Single upstream client + sanitizeUpstreamError (the leak chokepoint)
       types.ts                          # Flat domain types (Molecule, Activity, Target, DrugInfo, Assay, …)
   mcp-server/
+    input-normalization.ts              # Shared input-edge parsing: ChEMBL IDs, molecule refs, assay_type, codes, limit clamp
+    markdown-text.ts                    # The format() escape: upstream strings render inert in content[] (mdInline / mdLineStart)
     tools/definitions/
       chembl-search-molecules.tool.ts   # …and 7 more (search-targets, get-bioactivities, get-drug-info,
       …                                 #   get-assay, dataframe-query, dataframe-describe, dataframe-drop)
     resources/definitions/
       chembl-molecule.resource.ts       # chembl://molecule/{chemblId}
       chembl-target.resource.ts         # chembl://target/{chemblId}
-tests/                                  # Vitest — services/, tools/, resources/ (no prompts)
+tests/                                  # Vitest — services/, tools/, resources/, mcp-server/ (no prompts)
 ```
 
 No `prompts/` directory — this server defines no prompts.
@@ -374,7 +385,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. This server uses DataCanvas, so it ships a portable bundle without the DuckDB native. `@duckdb/node-api` is a direct dependency, not an optional peer, but with its native binding stripped the canvas cannot start: under `CANVAS_PROVIDER_TYPE=duckdb` every `chembl_get_bioactivities` call whose view spills fails with `-32008` (`Install "@duckdb/node-api"…`) while inline fits and cursor pages still answer, and no canvas is ever staged for the `chembl_dataframe_*` tools to read. The bundle therefore runs canvas-off, and `manifest.json` leaves the canvas-only options out of `user_config`: `CANVAS_PROVIDER_TYPE`, `CHEMBL_DATAFRAME_DROP_ENABLED` (it only registers a tool that needs a canvas), `CHEMBL_MAX_SPILL_ROWS` (it bounds only what a canvas stages), and `CHEMBL_MAX_CONCURRENT_PAGES` and `CHEMBL_SPILL_DEADLINE_MS` (they shape only the spill walk). Both plugin manifests offer them: they install through `npx`, which brings the native binding with `@duckdb/node-api`. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. This server uses DataCanvas, so it ships a portable bundle without the DuckDB native. `@duckdb/node-api` is a direct dependency, not an optional peer, but with its native binding stripped the canvas cannot start: under `CANVAS_PROVIDER_TYPE=duckdb` every `chembl_get_bioactivities` call whose view spills fails with `-32008` (`Install "@duckdb/node-api"…`) while inline fits and cursor pages still answer, and no canvas is ever staged for the `chembl_dataframe_*` tools to read. The bundle therefore runs canvas-off: `manifest.json` fixes `CANVAS_PROVIDER_TYPE` to `"none"` in `mcp_config.env`, overriding the server's `duckdb` default, and leaves the canvas-only options out of `user_config`: `CANVAS_PROVIDER_TYPE` itself, `CHEMBL_DATAFRAME_DROP_ENABLED` (it only registers a tool that needs a canvas), `CHEMBL_MAX_SPILL_ROWS` (it bounds only what a canvas stages), and `CHEMBL_MAX_CONCURRENT_PAGES` and `CHEMBL_SPILL_DEADLINE_MS` (they shape only the spill walk). Both plugin manifests offer them: they install through `npx`, which brings the native binding with `@duckdb/node-api`. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding a user-settable env var touches four files:** `server.json` (registry discovery, `environmentVariables[]` — the source of each option's description), `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`, unless the option needs the canvas), `.claude-plugin/plugin.json` (`userConfig` + `"KEY": "${user_config.KEY}"` in `env`), and `.codex-plugin/mcp.json` (`env_vars`). Each option keys on its env var name; `manifest.json` and `.claude-plugin/plugin.json` give it the same `title` and its `server.json` `description`, and `.codex-plugin/mcp.json` lists the name in `env_vars`. `lint:packaging` (run by `devcheck`) checks `manifest.json` against `server.json` — every `${user_config.…}` reference in `mcp_config.env` names a stdio env var `server.json` lists, every required one there reaches `mcp_config.env`, every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else but its own path placeholders — `"${X}"` reaches the server as that literal string), and an optional string option carries `"default": ""`. It checks the plugin manifests for identity, version, non-empty descriptions, `""` env values, and undeclared `${user_config.…}` references, but not their option lists, so keep those lists and their wording in step with `server.json` by hand.
 

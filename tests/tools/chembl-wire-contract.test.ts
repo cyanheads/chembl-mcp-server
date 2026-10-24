@@ -1,7 +1,7 @@
 /**
  * @fileoverview Wire-contract characterization for the tool surface — the shape a
  * client actually receives, as opposed to the handler return value the other tool
- * tests assert. Two properties are pinned here because they live in the framework
+ * tests assert. These properties are pinned here because they live in the framework
  * rather than in any definition file, so nothing else in this suite would notice
  * them changing:
  *
@@ -16,6 +16,9 @@
  *   3. Both consumption surfaces carry the same payload. `structuredContent` and
  *      `content[]` are read by different clients, on success (domain fields +
  *      enrichment trailer) and on failure (the declared `error` envelope).
+ *   4. The advertised JSON Schema admits every raw form a handler normalizes (#41),
+ *      checked as whole argument objects against `required`, `additionalProperties`,
+ *      and each property's keywords.
  *
  * `runToolContract` runs a definition through the production contract boundary —
  * input validation, handler, `format()`, enrichment merge, error envelope — so
@@ -290,6 +293,23 @@ describe('tool argument representation repairs', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('clamps a limit above the cap instead of rejecting it, and reports the applied cap on both surfaces', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ targets: [], page_meta: { total_count: 0, next: null } }),
+    );
+    const result = await runToolContract(chemblSearchTargets, { query: 'kinase', limit: 101 });
+
+    expect(result.isError).toBeFalsy();
+    const notice =
+      'limit 101 is above the maximum of 100, so 100 was applied. No target matched query="kinase". Verify the accession/symbol, or broaden with a free-text query.';
+    expect(result.structuredContent).toMatchObject({ targets: [], cap: 100, shown: 0, notice });
+    const lines = contentText(result).split('\n');
+    expect(lines).toContain('**cap:** 100');
+    expect(lines).toContain(`> ${notice}`);
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('limit')).toBe('100');
+  });
+
   it('keeps a non-numeric limit string rejected before the upstream call', async () => {
     // @ts-expect-error Deliberately invalid wire input must fail argument validation.
     const result = await runToolContract(chemblSearchTargets, { query: 'kinase', limit: 'many' });
@@ -301,6 +321,229 @@ describe('tool argument representation repairs', () => {
       },
     });
     expect(contentText(result)).toContain('limit');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The JSON Schema one input property advertises in `tools/list` — the keywords
+ * {@link admitsValue} models. `description` and `default` constrain nothing, and
+ * any other keyword fails the check rather than being skipped.
+ */
+interface AdvertisedProperty {
+  default?: unknown;
+  description?: string;
+  maximum?: number;
+  minimum?: number;
+  minLength?: number;
+  pattern?: string;
+  type?: string;
+}
+
+/** The input object schema `tools/list` advertises for a tool, as the SDK projects it. */
+interface AdvertisedInput {
+  additionalProperties?: boolean;
+  properties: Record<string, AdvertisedProperty>;
+  required?: string[];
+}
+
+function advertisedInput(def: { input: { '~standard': unknown } }): AdvertisedInput {
+  const standard = def.input['~standard'] as {
+    jsonSchema: { input: (options: { target: string }) => unknown };
+  };
+  return standard.jsonSchema.input({ target: 'draft-2020-12' }) as AdvertisedInput;
+}
+
+const MODELED_KEYWORDS = new Set([
+  'default',
+  'description',
+  'maximum',
+  'minimum',
+  'minLength',
+  'pattern',
+  'type',
+]);
+
+/**
+ * Whether a JSON-Schema-validating client accepts `value` for one property: the
+ * type, `minLength` in code points, `minimum` / `maximum`, and `pattern` as an
+ * unanchored ECMA-262 regex under the `u` flag, the way JSON Schema validators
+ * compile it. A keyword outside that set throws, so a constraint added to the
+ * schema later cannot pass here unchecked.
+ */
+function admitsValue(property: AdvertisedProperty, value: string | number): boolean {
+  const unmodeled = Object.keys(property).filter((keyword) => !MODELED_KEYWORDS.has(keyword));
+  if (unmodeled.length > 0) throw new Error(`admitsValue does not model ${unmodeled.join(', ')}`);
+  if (typeof value === 'number') {
+    const typed =
+      property.type === 'integer' ? Number.isInteger(value) : property.type === 'number';
+    return (
+      typed &&
+      (property.minimum === undefined || value >= property.minimum) &&
+      (property.maximum === undefined || value <= property.maximum)
+    );
+  }
+  return (
+    property.type === 'string' &&
+    (property.minLength === undefined || [...value].length >= property.minLength) &&
+    (property.pattern === undefined || new RegExp(property.pattern, 'u').test(value))
+  );
+}
+
+/**
+ * Whether a JSON-Schema-validating client accepts a whole arguments object: every
+ * `required` key present, no key outside `properties` while `additionalProperties`
+ * is false, and each value admitted by its property.
+ */
+function admits(schema: AdvertisedInput, args: Record<string, string | number>): boolean {
+  return (
+    (schema.required ?? []).every((key) => Object.hasOwn(args, key)) &&
+    Object.entries(args).every(([key, value]) => {
+      const property = schema.properties[key];
+      return property ? admitsValue(property, value) : schema.additionalProperties !== false;
+    })
+  );
+}
+
+/**
+ * Every raw form a handler normalizes is one a schema-validating client must be
+ * able to send (#41): JSON Schema `pattern` takes no flags, so a pattern stating
+ * only the canonical form would have such a client refuse the variants the
+ * server maps. The refused column is what the advertised schema rules out.
+ */
+const ADVERTISED_FORMS = [
+  {
+    def: chemblGetBioactivities,
+    field: 'molecule_chembl_id',
+    admitted: [
+      'chembl941',
+      '  CHEMBL941  ',
+      'CHEMBL941',
+      '',
+      '   ',
+      'KTUFNOKKBVMGRW-UHFFFAOYSA-N',
+      'CC(=O)Oc1ccccc1C(=O)O',
+    ],
+    refused: [],
+  },
+  {
+    def: chemblGetBioactivities,
+    field: 'target_chembl_id',
+    admitted: ['chembl203', '  CHEMBL203  ', 'CHEMBL203', '', '   '],
+    refused: ['imatinib', 'CHEMBL', 'P00533'],
+  },
+  {
+    def: chemblGetBioactivities,
+    field: 'assay_type',
+    admitted: ['B', ' B ', 'b', 'binding', 'Binding', 'ADMET', 'adme', 'Unclassified', '', '  '],
+    refused: ['X', 'bind', 'B F'],
+  },
+  {
+    def: chemblGetBioactivities,
+    field: 'standard_type',
+    admitted: ['IC50', 'ic50', 'Kd'],
+    refused: [],
+  },
+  {
+    def: chemblGetBioactivities,
+    field: 'limit',
+    admitted: [1, 1000, 1001, 10_000],
+    refused: [0, 10_001],
+  },
+  {
+    def: chemblGetDrugInfo,
+    field: 'molecule_chembl_id',
+    admitted: [
+      'chembl25',
+      '  CHEMBL25  ',
+      'CHEMBL25',
+      'KTUFNOKKBVMGRW-UHFFFAOYSA-N',
+      'ktufnokkbvmgrw-uhfffaoysa-n',
+      'CC(=O)Oc1ccccc1C(=O)O',
+    ],
+    refused: [''],
+  },
+  {
+    def: chemblGetAssay,
+    field: 'assay_chembl_id',
+    admitted: ['chembl674637', '  CHEMBL674637  ', 'CHEMBL674637'],
+    refused: ['imatinib', '', '   '],
+  },
+  {
+    def: chemblSearchTargets,
+    field: 'accession',
+    admitted: ['p00533', ' P00533 ', ''],
+    refused: [],
+  },
+  {
+    def: chemblSearchTargets,
+    field: 'target_type',
+    admitted: ['single protein', 'SINGLE PROTEIN', ''],
+    refused: [],
+  },
+  { def: chemblSearchTargets, field: 'limit', admitted: [100, 101, 10_000], refused: [0, 10_001] },
+  { def: chemblSearchMolecules, field: 'query', admitted: ['chembl25', 'CHEMBL25'], refused: [] },
+  {
+    def: chemblSearchMolecules,
+    field: 'limit',
+    admitted: [100, 101, 10_000],
+    refused: [0, 10_001],
+  },
+] as const;
+
+describe('advertised input schemas admit every raw form the handlers normalize (#41)', () => {
+  /**
+   * Each form is checked as the whole arguments object a client would send, `{ [field]: value }`,
+   * so `required` and `additionalProperties` are applied along with the property. That object
+   * is a complete call for every tool listed: none requires an argument besides the field.
+   */
+  it.each(ADVERTISED_FORMS.map((c) => [`${c.def.name}.${c.field}`, c] as const))(
+    '%s',
+    (_label, { def, field, admitted, refused }) => {
+      const schema = advertisedInput(def);
+      expect(schema.properties[field], `${def.name} advertises ${field}`).toBeDefined();
+      expect((schema.required ?? []).filter((key) => key !== field)).toEqual([]);
+      for (const value of admitted) {
+        expect(admits(schema, { [field]: value }), `${JSON.stringify(value)} admitted`).toBe(true);
+      }
+      for (const value of refused) {
+        expect(admits(schema, { [field]: value }), `${JSON.stringify(value)} refused`).toBe(false);
+      }
+    },
+  );
+
+  it('applies the object keywords every tool advertises: required keys and no undeclared ones', () => {
+    const advertised = TOOLS.map(({ def }) => {
+      const { required, additionalProperties } = advertisedInput(def);
+      return [def.name, { required, additionalProperties }];
+    });
+    expect(Object.fromEntries(advertised)).toEqual({
+      chembl_search_molecules: { required: undefined, additionalProperties: false },
+      chembl_get_bioactivities: { required: undefined, additionalProperties: false },
+      chembl_search_targets: { required: undefined, additionalProperties: false },
+      chembl_get_drug_info: { required: ['molecule_chembl_id'], additionalProperties: false },
+      chembl_get_assay: { required: ['assay_chembl_id'], additionalProperties: false },
+      chembl_dataframe_query: { required: ['canvas_id', 'sql'], additionalProperties: false },
+      chembl_dataframe_describe: { required: ['canvas_id'], additionalProperties: false },
+      chembl_dataframe_drop: {
+        required: ['canvas_id', 'table_name'],
+        additionalProperties: false,
+      },
+    });
+    const assay = advertisedInput(chemblGetAssay);
+    expect(admits(assay, { assay_chembl_id: 'CHEMBL674637' })).toBe(true);
+    expect(admits(assay, {})).toBe(false);
+    expect(admits(assay, { assay_chembl_id: 'CHEMBL674637', querry: 'typo' })).toBe(false);
+  });
+
+  it('rejects a target ID that is no ChEMBL ID with -32602 before any request, routing to the search tool', async () => {
+    const result = await runToolContract(chemblGetBioactivities, { target_chembl_id: 'imatinib' });
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams, data: { reason: 'invalid_arguments' } },
+    });
+    expect(contentText(result).split('\n')).toContain(
+      'Error: Input validation error: Invalid arguments for tool chembl_get_bioactivities: target_chembl_id: Must be a ChEMBL target ID like CHEMBL203 — find one with chembl_search_targets.',
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

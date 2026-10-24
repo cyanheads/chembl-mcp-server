@@ -20,6 +20,7 @@
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
         "NODE_ENV": "production",
+        "CANVAS_PROVIDER_TYPE": "none",
         "CHEMBL_API_BASE_URL": "${user_config.CHEMBL_API_BASE_URL}",
         "CHEMBL_REQUEST_TIMEOUT_MS": "${user_config.CHEMBL_REQUEST_TIMEOUT_MS}",
         "CHEMBL_MAX_PAGE_SIZE": "${user_config.CHEMBL_MAX_PAGE_SIZE}",

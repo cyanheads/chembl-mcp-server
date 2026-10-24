@@ -23,10 +23,10 @@
       "environmentVariables": [
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable the bioactivity DataCanvas spill and the chembl_dataframe_* SQL tools. When 'none', large bioactivity sets inline a preview but never spill.",
+          "description": "DataCanvas provider for the bioactivity spill and the chembl_dataframe_* SQL tools; DuckDB is the default. Set to 'none' to disable it: large bioactivity sets then inline a preview but never spill.",
           "format": "string",
           "isRequired": false,
-          "default": "none"
+          "default": "duckdb"
         },
         {
           "name": "CHEMBL_API_BASE_URL",
@@ -146,10 +146,10 @@
         },
         {
           "name": "CANVAS_PROVIDER_TYPE",
-          "description": "Set to 'duckdb' to enable the bioactivity DataCanvas spill and the chembl_dataframe_* SQL tools. When 'none', large bioactivity sets inline a preview but never spill.",
+          "description": "DataCanvas provider for the bioactivity spill and the chembl_dataframe_* SQL tools; DuckDB is the default. Set to 'none' to disable it: large bioactivity sets then inline a preview but never spill.",
           "format": "string",
           "isRequired": false,
-          "default": "none"
+          "default": "duckdb"
         },
         {
           "name": "CHEMBL_API_BASE_URL",

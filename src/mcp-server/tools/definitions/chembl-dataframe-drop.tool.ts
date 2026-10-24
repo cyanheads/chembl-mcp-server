@@ -18,7 +18,7 @@ import { getCanvas } from '@/services/canvas-accessor.js';
 export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
   title: 'chembl-dataframe-drop',
   description:
-    'Drop a named staged table from a canvas to free its memory early. Returns dropped: true if the table existed and was removed, false if the canvas is live but holds no table by that name (never staged on it, or already dropped). An unknown or expired canvas_id fails as canvas_not_found instead — an expired canvas has already freed its tables. Rarely needed — a staged table lasts exactly as long as its canvas, which by default expires 24 hours after its last use and at most 7 days after it was created, freeing every table on it; reach for this only to free a large table early in a long session. Requires CANVAS_PROVIDER_TYPE=duckdb.',
+    'Drop a named staged table from a canvas to free its memory early. Returns dropped: true if the table existed and was removed, false if the canvas is live but holds no table by that name (never staged on it, or already dropped). An unknown or expired canvas_id fails as canvas_not_found instead — an expired canvas has already freed its tables. Rarely needed — a staged table lasts exactly as long as its canvas, which by default expires 24 hours after its last use and at most 7 days after it was created, freeing every table on it; reach for this only to free a large table early in a long session. Unavailable when the server sets CANVAS_PROVIDER_TYPE=none.',
   annotations: {
     readOnlyHint: false,
     destructiveHint: true,
@@ -40,9 +40,9 @@ export const chemblDataframeDrop = tool('chembl_dataframe_drop', {
     {
       reason: 'canvas_disabled',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Called while CANVAS_PROVIDER_TYPE is not duckdb, so no canvas exists.',
+      when: 'The server runs with the canvas off (CANVAS_PROVIDER_TYPE=none), so no canvas exists.',
       recovery:
-        'Set CANVAS_PROVIDER_TYPE=duckdb to enable the canvas; otherwise there is nothing to drop.',
+        'The canvas is off on this server, so no table was ever staged and there is nothing to drop.',
     },
     {
       reason: 'canvas_not_found',

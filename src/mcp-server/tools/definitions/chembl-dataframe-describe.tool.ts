@@ -12,7 +12,7 @@ import { getCanvas } from '@/services/canvas-accessor.js';
 export const chemblDataframeDescribe = tool('chembl_dataframe_describe', {
   title: 'chembl-dataframe-describe',
   description:
-    'List the tables and columns staged on a canvas by chembl_get_bioactivities — inspect before calling chembl_dataframe_query to write correct SQL. Returns each table with its row count, kind (table | view), and column names + types. Requires CANVAS_PROVIDER_TYPE=duckdb.',
+    'List the tables and columns staged on a canvas by chembl_get_bioactivities — inspect before calling chembl_dataframe_query to write correct SQL. Returns each table with its row count, kind (table | view), and column names + types. Unavailable when the server sets CANVAS_PROVIDER_TYPE=none.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     canvas_id: CanvasIdSchema.describe(
@@ -52,9 +52,9 @@ export const chemblDataframeDescribe = tool('chembl_dataframe_describe', {
     {
       reason: 'canvas_disabled',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Called while CANVAS_PROVIDER_TYPE is not duckdb, so no canvas exists.',
+      when: 'The server runs with the canvas off (CANVAS_PROVIDER_TYPE=none), so no canvas exists.',
       recovery:
-        'Set CANVAS_PROVIDER_TYPE=duckdb to enable the SQL path; otherwise read the inline preview from chembl_get_bioactivities.',
+        'The SQL path is off on this server; read the inline rows from chembl_get_bioactivities and page with its nextCursor.',
     },
   ],
 

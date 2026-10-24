@@ -11,12 +11,14 @@
  * non-throwing flag read `src/index.ts` gates on at module load, and `index.ts`
  * itself loaded with `createApp` stubbed — an invalid server env value must not
  * throw at import, and must instead fail the full parse inside `setup()`, where
- * the framework turns it into the configuration banner.
+ * the framework turns it into the configuration banner. Last, the DataCanvas
+ * default `index.ts` applies at import: an unset or empty CANVAS_PROVIDER_TYPE
+ * reads as duckdb, and an explicit value is kept.
  * @module tests/tools/chembl-registration-gate
  */
 
 import { disabledTool, z } from '@cyanheads/mcp-ts-core';
-import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
+import { parseConfig, parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { isDataframeDropEnabled } from '@/config/server-config.js';
@@ -309,5 +311,28 @@ describe('src/index.ts — server config parsed in setup() (#30)', () => {
     const { options } = await loadIndex();
     expect(runSetup(options)).toBeUndefined();
     expect(initChemblServiceMock.mock.calls[0]?.[0]).toMatchObject(parsed);
+  });
+});
+
+describe('src/index.ts — DataCanvas on by default', () => {
+  beforeEach(() => {
+    for (const name of SERVER_VARS) vi.stubEnv(name, '');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ['unset', 'duckdb', undefined],
+    ['empty', 'duckdb', ''],
+    ['none', 'none', 'none'],
+    ['duckdb', 'duckdb', 'duckdb'],
+  ])('reads CANVAS_PROVIDER_TYPE %s as %s at import', async (_label, expected, value) => {
+    vi.stubEnv('CANVAS_PROVIDER_TYPE', value as string);
+    await loadIndex();
+    expect(process.env.CANVAS_PROVIDER_TYPE).toBe(expected);
+    // The framework config createApp() reads is parsed from the same env.
+    expect(parseConfig().canvas.providerType).toBe(expected);
   });
 });

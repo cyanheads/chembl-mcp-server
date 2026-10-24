@@ -2,10 +2,11 @@
  * @fileoverview Tests for the inline-preview boundary of chembl_get_bioactivities —
  * `limit` bounds the rows returned inline on ALL THREE response branches, not just
  * the two that happened to enforce it. `spillover()` sizes its preview buffer by a
- * character budget (`max(40_000, limit * 600)`), so the canvas-enabled branch where
- * the view fits inline drains ~68 rows regardless of how small `limit` is; the cap
- * is applied to the returned slice, never to the budget (which is what drives the
- * fit-vs-spill decision and its overflow sentinel).
+ * character budget (`max(50_000, limit * 800)`), so the canvas-enabled branch where
+ * the view fits inline drains ~67 rows regardless of how small `limit` is; the cap
+ * is applied to the returned rows, never to the budget (which is what drives the
+ * fit-vs-spill decision and its overflow sentinel), and a spill's rows are the
+ * walk's first `limit`, however few the buffer held.
  *
  * Covered: the boundary on each branch with `limit` above and below the row count,
  * schema bounds on `limit`, both `potency_view`s, a multi-page drain that must stay
@@ -33,7 +34,7 @@ function jsonResponse(body: unknown): Response {
 }
 
 /**
- * A row serializing to ~585 chars, so ~68 of them fill the 40 KB preview budget.
+ * A row serializing to ~745 chars, so ~67 of them fill the 50,000-character preview budget.
  * `FITS_INLINE` rows therefore exhaust the stream under budget (no spill) while
  * still being far more rows than a small `limit` asks for — the exact shape the
  * live CHEMBL941 × CHEMBL385 pair produces.
@@ -67,7 +68,7 @@ function rawNullActivity(i: number): Record<string, unknown> {
   return { ...rest, standard_relation: '>', relation: '>' };
 }
 
-/** Rows that fit the 40 KB preview budget whole — the branch under test. */
+/** Rows that fit the 50,000-character preview budget whole — the branch under test. */
 const FITS_INLINE = 58;
 /** Rows that overflow the budget and force a spill. */
 const SPILLS = 120;
@@ -162,7 +163,7 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
       c,
     );
 
-    // The whole view fit under the 40 KB budget, so nothing spilled — and the
+    // The whole view fit under the 50,000-character budget, so nothing spilled — and the
     // rows past `limit` are reached through nextCursor, exactly as with no canvas.
     expect(result.spilled).toBe(false);
     expect(result.canvas_id).toBeNull();
@@ -239,7 +240,8 @@ describe('chembl_get_bioactivities — inline preview bounded by limit', () => {
   });
 
   it('rejects a limit outside the schema bounds before the handler runs', () => {
-    for (const limit of [0, -1, 1001, 2.5]) {
+    // 1001–10000 are served at 1000 with a notice (#41); past the 10000 ceiling is rejected.
+    for (const limit of [0, -1, 10_001, 2.5]) {
       expect(() =>
         chemblGetBioactivities.input.parse({ target_chembl_id: 'CHEMBL203', limit }),
       ).toThrow();
@@ -419,7 +421,9 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
     );
     expect(result.activities).toHaveLength(4);
     const notice = noticeOf(c);
-    expect(notice).toContain('Canvas disabled');
+    expect(notice).toBe(
+      'Canvas disabled on this server (CANVAS_PROVIDER_TYPE=none): Showing rows 1–4 of the 58 rows in this view; pass nextCursor back as cursor, with the same filters and potency_view, for the next page. Nothing spilled, so SQL over the staged set is unavailable here.',
+    );
     expect(notice).toContain(`Showing rows 1–4 of the ${FITS_INLINE} rows`);
     // The canvas-off page continues by cursor (#17), not by a wider re-call.
     expect(notice).toContain('pass nextCursor back as cursor');
@@ -464,4 +468,129 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
     // A content[]-only client reaches the rest the same way.
     expect(text).toContain(`cursor="${result.nextCursor}"`);
   });
+});
+
+describe('chembl_get_bioactivities — a spill shows limit rows of real width', () => {
+  /**
+   * A row as wide as a real EGFR binding measurement with its comment, variant, and
+   * source document: ~1,320 serialized characters, past the budget's 800 per row, so
+   * once `limit` lifts the budget above its 50,000 floor the drain buffer holds fewer
+   * rows than `limit`, and the preview still shows `limit`.
+   */
+  function wideActivity(i: number): Record<string, unknown> {
+    return {
+      ...rawActivity(i),
+      assay_description:
+        `Inhibition of recombinant human EGFR L858R/T790M double mutant kinase domain expressed in baculovirus-infected Sf9 cells, using poly(Glu,Tyr) 4:1 as substrate after 60 mins by ELISA, replicate ${i}; `.repeat(
+          3,
+        ),
+      activity_comment: 'Not Active',
+      data_validity_comment: 'Outside typical range',
+      assay_variant_mutation: 'L858R,T790M',
+      assay_variant_accession: 'P00533',
+      document_chembl_id: `CHEMBL${1_100_000 + i}`,
+      document_year: 2012,
+    };
+  }
+
+  /**
+   * A row far wider than any per-row factor the budget could carry (an assay
+   * description of ~2,700 characters, as the longest real EGFR functional assays
+   * run): a spill must still show `limit` of them, so the preview cannot depend on
+   * how many rows the drain buffer held.
+   */
+  function veryWideActivity(i: number): Record<string, unknown> {
+    return {
+      ...wideActivity(i),
+      assay_description:
+        `Inhibition of EGFR L858R/T790M/C797S triple mutant autophosphorylation in Ba/F3 cells, replicate ${i}; `.repeat(
+          27,
+        ),
+    };
+  }
+
+  /** Each row shape at the serialized width its doc names, with a limit and a view size that spills. */
+  it.each([
+    { width: '~1,320', build: wideActivity, min: 1250, max: 1400, limit: 1000, rows: 1500 },
+    { width: '~1,320', build: wideActivity, min: 1250, max: 1400, limit: 200, rows: 1500 },
+    { width: '~1,320', build: wideActivity, min: 1250, max: 1400, limit: 25, rows: 1500 },
+    { width: '~3,500', build: veryWideActivity, min: 3300, max: 3700, limit: 100, rows: 300 },
+    { width: '~3,500', build: veryWideActivity, min: 3300, max: 3700, limit: 1000, rows: 1100 },
+  ])(
+    'shows the first $limit of $rows $width-character rows inline when the view spills',
+    async ({ build, min, max, limit, rows }) => {
+      fetchMock.mockImplementation(
+        activityCorpus({ honest: rows, rows: Array.from({ length: rows }, (_, i) => build(i)) }),
+      );
+      const { result } = await withCanvas({ target_chembl_id: 'CHEMBL203', limit });
+      const width = JSON.stringify(result.activities[0]).length;
+      expect(width).toBeGreaterThan(min);
+      expect(width).toBeLessThan(max);
+      expect(result.spilled).toBe(true);
+      expect(result.staged_row_count).toBe(rows);
+      // The preview is the view's first `limit` rows, in view order.
+      expect(result.activities.map((a) => a.activity_id)).toEqual(
+        Array.from({ length: limit }, (_, i) => 1000 + i),
+      );
+    },
+  );
+});
+
+describe('chembl_get_bioactivities — fit-vs-spill line sits at about limit average rows', () => {
+  /**
+   * `rawActivity` serializes to ~745 characters, inside the 690–870 average of real
+   * rows. A view of 1.5 × `limit` such rows has to spill, so the whole view is
+   * SQL-queryable from the canvas_id it returns; returning `limit` rows plus a
+   * cursor with nothing staged would leave the caller no way to query the view.
+   */
+  it('builds its rows at an average real width', async () => {
+    fetchMock.mockImplementation(
+      activityCorpus({
+        honest: 1500,
+        rows: Array.from({ length: 1500 }, (_, i) => rawActivity(i)),
+      }),
+    );
+    const { result } = await withCanvas({ target_chembl_id: 'CHEMBL203', limit: 1000 });
+    const widths = result.activities.map((a) => JSON.stringify(a).length);
+    expect(Math.min(...widths)).toBeGreaterThanOrEqual(690);
+    expect(Math.max(...widths)).toBeLessThanOrEqual(870);
+  });
+
+  it.each([
+    [1000, 1500],
+    [100, 150],
+  ])('at limit %i, spills a view of %i average-width rows', async (limit, rows) => {
+    fetchMock.mockImplementation(
+      activityCorpus({
+        honest: rows,
+        rows: Array.from({ length: rows }, (_, i) => rawActivity(i)),
+      }),
+    );
+    const { result, fake } = await withCanvas({ target_chembl_id: 'CHEMBL203', limit });
+    expect(result.spilled).toBe(true);
+    expect(result.canvas_id).not.toBeNull();
+    expect(result.table_name).toBe('bioactivities');
+    expect(result.staged_row_count).toBe(rows);
+    expect(result.activities).toHaveLength(limit);
+    expect(result.nextCursor).toBeUndefined();
+    expect(fake.canvases.size).toBe(1);
+  });
+
+  it.each([1000, 100])(
+    'keeps a view of exactly limit (%i) average-width rows inline, nothing staged',
+    async (limit) => {
+      fetchMock.mockImplementation(
+        activityCorpus({
+          honest: limit,
+          rows: Array.from({ length: limit }, (_, i) => rawActivity(i)),
+        }),
+      );
+      const { result, fake } = await withCanvas({ target_chembl_id: 'CHEMBL203', limit });
+      expect(result.spilled).toBe(false);
+      expect(result.canvas_id).toBeNull();
+      expect(result.activities).toHaveLength(limit);
+      expect(result.nextCursor).toBeUndefined();
+      expect(fake.canvases.size).toBe(0);
+    },
+  );
 });

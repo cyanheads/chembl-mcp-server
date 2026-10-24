@@ -3,17 +3,26 @@
  * controlled upstream payloads — including a sparse payload with omitted fields,
  * verifying absence is preserved as null rather than fabricated — plus the
  * exact-shape routing of a name query (ChEMBL ID / InChIKey → the by-resource
- * lookup, everything else → the fuzzy endpoint), the search modes that do and do
- * not carry a Tanimoto percent, and the bioactivity view walks — the inline
- * stream and the concurrent spill — over a fake `/activity` corpus. `fetch` is
- * stubbed so no live ChEMBL call is made.
+ * lookup, everything else → the fuzzy endpoint), the search ceilings that flag a
+ * capped total (#42), the search modes that do and do not carry a Tanimoto
+ * percent, the parent every molecule record resolves to (#36, #37), and the
+ * bioactivity view walks — the inline stream and the concurrent spill — over a
+ * fake `/activity` corpus, with their family scope, variant filter, comment and
+ * document fields, and `only=` field selection (#34, #37–#39). `fetch` is stubbed
+ * so no live ChEMBL call is made.
  * @module tests/services/chembl-service
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CallDeadline, ChemblService } from '@/services/chembl/chembl-service.js';
+import {
+  ACTIVITY_FIELDS,
+  CallDeadline,
+  ChemblService,
+  normalizeActivity,
+} from '@/services/chembl/chembl-service.js';
+import type { GetActivitiesOptions } from '@/services/chembl/types.js';
 import {
   type ActivityCorpusOptions,
   activityCorpus,
@@ -225,6 +234,73 @@ describe('ChemblService — the upstream search window', () => {
 });
 
 /**
+ * ChEMBL stops a name search at 10000 hits and a substructure search at 30000, and
+ * reports the ceiling as `page_meta.total_count` (#42). The flag rides beside the
+ * upstream total, which is passed through unchanged.
+ */
+describe('ChemblService — search ceilings flag a capped totalCount (#42)', () => {
+  const ctx = () => createMockContext({ tenantId: 'default' });
+
+  /** One page of `rows` molecules over an upstream total of `total`. */
+  function answer(total: number, rows = 2) {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        molecules: Array.from({ length: rows }, (_, i) => ({ molecule_chembl_id: `CHEMBL${i}` })),
+        page_meta: { total_count: total },
+      }),
+    );
+  }
+
+  const substructure = (svc: ChemblService, searchType: 'similarity' | 'substructure') =>
+    svc.structureSearch(
+      { structure: 'c1ccncc1', searchType, similarityThreshold: 40, limit: 2 },
+      ctx(),
+    );
+
+  it.each([
+    ['a substructure search at its 30000 ceiling', 30_000, 'substructure', true],
+    ['a substructure search under it', 29_999, 'substructure', false],
+    ['a similarity search, which has no ceiling', 30_000, 'similarity', false],
+  ] as const)('flags %s', async (_label, total, searchType, capped) => {
+    answer(total);
+    const page = await substructure(new ChemblService(config), searchType);
+    expect(page).toMatchObject({ totalCount: total, totalCountCapped: capped });
+  });
+
+  it.each([
+    ['a name search at its 10000 ceiling', 10_000, undefined, true],
+    ['a phase-filtered name search at it', 10_000, 4, true],
+    ['a name search under it', 2539, undefined, false],
+  ])('flags %s', async (_label, total, maxPhaseMin, capped) => {
+    answer(total);
+    const page = await new ChemblService(config).searchMolecules(
+      { query: 'acid', maxPhaseMin, limit: 2 },
+      ctx(),
+    );
+    expect(page).toMatchObject({ totalCount: total, totalCountCapped: capped });
+  });
+
+  it('never flags an exact structure hit or an identifier lookup', async () => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonResponse({ molecule_chembl_id: 'CHEMBL25' })),
+    );
+    const svc = new ChemblService(config);
+    const exact = await svc.structureSearch(
+      {
+        structure: 'CC(=O)Oc1ccccc1C(=O)O',
+        searchType: 'exact',
+        similarityThreshold: 70,
+        limit: 2,
+      },
+      ctx(),
+    );
+    const byId = await svc.searchMolecules({ query: 'CHEMBL25', limit: 2 }, ctx());
+    expect(exact).toMatchObject({ totalCount: 1, totalCountCapped: false });
+    expect(byId).toMatchObject({ totalCount: 1, totalCountCapped: false });
+  });
+});
+
+/**
  * Routing a `search_type=name` query by input shape (#7). A ChEMBL ID and an
  * InChIKey are unique identifiers, so each resolves through the by-resource
  * lookup instead of the fuzzy full-text endpoint, whose Elasticsearch result
@@ -366,7 +442,11 @@ describe('ChemblService.searchMolecules — exact-shape routing', () => {
    */
   it('returns the empty-result shape for a well-formed but unknown ChEMBL ID', async () => {
     stub({ error_message: 'not found' }, 404);
-    await expect(search('CHEMBL999999999')).resolves.toEqual({ items: [], totalCount: 0 });
+    await expect(search('CHEMBL999999999')).resolves.toEqual({
+      items: [],
+      totalCount: 0,
+      totalCountCapped: false,
+    });
   });
 
   it('returns the empty-result shape for a well-formed but unknown InChIKey', async () => {
@@ -374,6 +454,7 @@ describe('ChemblService.searchMolecules — exact-shape routing', () => {
     await expect(search('AAAAAAAAAAAAAA-BBBBBBBBBB-C')).resolves.toEqual({
       items: [],
       totalCount: 0,
+      totalCountCapped: false,
     });
   });
 
@@ -392,7 +473,11 @@ describe('ChemblService.searchMolecules — exact-shape routing', () => {
    */
   it('reports an offset past the single exact hit as an exhausted walk', async () => {
     stub(aspirinRecord);
-    await expect(search('CHEMBL25', { offset: 3 })).resolves.toEqual({ items: [], totalCount: 1 });
+    await expect(search('CHEMBL25', { offset: 3 })).resolves.toEqual({
+      items: [],
+      totalCount: 1,
+      totalCountCapped: false,
+    });
   });
 
   it('returns the record at offset 0', async () => {
@@ -454,6 +539,84 @@ describe('ChemblService.structureSearch — similarity rides only the similarity
   });
 });
 
+/**
+ * One parent rule on every molecule the service normalizes (#36, #37): the
+ * hierarchy's parent, or the record's own ID when ChEMBL records none — never the
+ * active metabolite.
+ */
+describe('ChemblService — parent_chembl_id on every molecule record', () => {
+  const ctx = () => createMockContext({ tenantId: 'default' });
+  const hierarchy = (id: string, parent: string | null, active: string | null = parent) => ({
+    molecule_chembl_id: id,
+    molecule_hierarchy: {
+      molecule_chembl_id: id,
+      parent_chembl_id: parent,
+      active_chembl_id: active,
+    },
+  });
+  const salt = hierarchy('CHEMBL1079742', 'CHEMBL553');
+  const parent = hierarchy('CHEMBL553', 'CHEMBL553');
+  const unrecorded = { molecule_chembl_id: 'CHEMBL1201352', molecule_hierarchy: null };
+  const prodrug = hierarchy('CHEMBL900001', 'CHEMBL900002', 'CHEMBL900003');
+  const sparse = { molecule_chembl_id: 'CHEMBL7' };
+  const parentless = hierarchy('CHEMBL8', null, 'CHEMBL9');
+  const rows = [salt, parent, unrecorded, prodrug, sparse, parentless];
+  const expected = [
+    'CHEMBL553',
+    'CHEMBL553',
+    'CHEMBL1201352',
+    'CHEMBL900002',
+    'CHEMBL7',
+    'CHEMBL8',
+  ];
+  const list = { molecules: rows, page_meta: { total_count: rows.length } };
+  const service = () => new ChemblService(config);
+
+  it('resolves the parent on each getMolecule record', async () => {
+    const parents: string[] = [];
+    for (const row of rows) {
+      fetchMock.mockResolvedValueOnce(jsonResponse(row));
+      parents.push((await service().getMolecule(row.molecule_chembl_id, ctx())).parent_chembl_id);
+    }
+    expect(parents).toEqual(expected);
+  });
+
+  it.each([
+    ['name search', () => service().searchMolecules({ query: 'erlotinib', limit: 25 }, ctx())],
+    [
+      'similarity search',
+      () =>
+        service().structureSearch(
+          { structure: 'C', searchType: 'similarity', similarityThreshold: 70, limit: 25 },
+          ctx(),
+        ),
+    ],
+    [
+      'substructure search',
+      () =>
+        service().structureSearch(
+          { structure: 'C', searchType: 'substructure', similarityThreshold: 70, limit: 25 },
+          ctx(),
+        ),
+    ],
+  ])('resolves the parent on every %s row', async (_mode, run) => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(list)));
+    const page = await run();
+    expect(page.items.map((m) => m.parent_chembl_id)).toEqual(expected);
+  });
+
+  it('resolves the parent on an identifier lookup and an exact structure hit', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(salt)));
+    const byId = await service().searchMolecules({ query: 'CHEMBL1079742', limit: 25 }, ctx());
+    const exact = await service().structureSearch(
+      { structure: 'C', searchType: 'exact', similarityThreshold: 70, limit: 25 },
+      ctx(),
+    );
+    expect(byId.items[0]?.parent_chembl_id).toBe('CHEMBL553');
+    expect(exact.items[0]?.parent_chembl_id).toBe('CHEMBL553');
+  });
+});
+
 describe('ChemblService.streamActivities — potency view selects the isnull filter', () => {
   /** Drain one scripted page and hand back the stream URL the service built. */
   async function streamUrlFor(potencyView?: 'potency_ranked' | 'null_potency'): Promise<string> {
@@ -462,7 +625,7 @@ describe('ChemblService.streamActivities — potency view selects the isnull fil
     );
     const svc = new ChemblService(config);
     for await (const _row of svc.streamActivities(
-      { moleculeChemblId: 'CHEMBL25', ...(potencyView && { potencyView }) },
+      { molecule: { scope: 'form', id: 'CHEMBL25' }, ...(potencyView && { potencyView }) },
       createMockContext({ tenantId: 'default' }),
     )) {
       // drain
@@ -493,7 +656,7 @@ describe('ChemblService.streamActivities — potency view selects the isnull fil
       );
       const svc = new ChemblService(config);
       const total = await svc.countActivities(
-        { moleculeChemblId: 'CHEMBL25', potencyView },
+        { molecule: { scope: 'form', id: 'CHEMBL25' }, potencyView },
         createMockContext({ tenantId: 'default' }),
       );
       expect(total).toBe(4087);
@@ -1068,7 +1231,7 @@ describe('ChemblService — molecule × target pair filters', () => {
     const svc = new ChemblService(config);
     for await (const _row of svc.streamActivities(
       {
-        moleculeChemblId: 'CHEMBL941',
+        molecule: { scope: 'form', id: 'CHEMBL941' },
         targetChemblId: 'CHEMBL385',
         ...(opts.potencyView && { potencyView: opts.potencyView }),
       },
@@ -1097,13 +1260,46 @@ describe('ChemblService — molecule × target pair filters', () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ page_meta: { total_count: 116 } }));
     const svc = new ChemblService(config);
     const total = await svc.countActivities(
-      { moleculeChemblId: 'CHEMBL941', targetChemblId: 'CHEMBL385' },
+      { molecule: { scope: 'form', id: 'CHEMBL941' }, targetChemblId: 'CHEMBL385' },
       createMockContext({ tenantId: 'default' }),
     );
     const url = String(fetchMock.mock.calls[0]?.[0]);
     expect(url).toContain('molecule_chembl_id=CHEMBL941');
     expect(url).toContain('target_chembl_id=CHEMBL385');
     expect(total).toBe(116);
+  });
+
+  it('swaps the molecule filter for the parent filter on a family scope, on every request (#37)', async () => {
+    const svc = new ChemblService(config);
+    const c = createMockContext({ tenantId: 'default' });
+    const opts = {
+      molecule: { scope: 'family', id: 'CHEMBL941' },
+      targetChemblId: 'CHEMBL385',
+    } as const;
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonResponse({ activities: [], page_meta: { total_count: 0, next: null } })),
+    );
+    await svc.countActivities(opts, c);
+    for (const potencyView of ['potency_ranked', 'null_potency'] as const) {
+      for await (const _row of svc.streamActivities({ ...opts, potencyView }, c)) {
+        // drain
+      }
+    }
+    for await (const _row of svc.spillActivities(opts, c, {
+      deadline: new CallDeadline(10_000),
+      maxRows: 1000,
+      onTotal: () => {},
+      onDeadline: () => {},
+    })) {
+      // drain
+    }
+    const sent = fetchMock.mock.calls.map((call) => new URL(String(call[0])).searchParams);
+    expect(sent).toHaveLength(4);
+    for (const params of sent) {
+      expect(params.get('parent_molecule_chembl_id')).toBe('CHEMBL941');
+      expect(params.has('molecule_chembl_id')).toBe(false);
+      expect(params.get('target_chembl_id')).toBe('CHEMBL385');
+    }
   });
 });
 
@@ -1162,5 +1358,347 @@ describe('ChemblService.streamActivities — coercion + raw passthrough', () => 
     // Sparse row: missing potency is null, not 0.
     expect(rows[1]?.standard_value).toBeNull();
     expect(rows[1]?.pchembl_value).toBeNull();
+  });
+});
+
+describe('ChemblService activities — comments, variant, and source document (#38, #39)', () => {
+  const FIELDS = [
+    'activity_comment',
+    'data_validity_comment',
+    'assay_variant_mutation',
+    'assay_variant_accession',
+    'document_chembl_id',
+    'document_year',
+  ] as const;
+
+  async function normalized(raw: Record<string, unknown>) {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ activities: [raw], page_meta: { total_count: 1, next: null } }),
+    );
+    const svc = new ChemblService(config);
+    for await (const row of svc.streamActivities(
+      { targetChemblId: 'CHEMBL203' },
+      createMockContext({ tenantId: 'default' }),
+    )) {
+      return Object.fromEntries(FIELDS.map((key) => [key, row[key]]));
+    }
+    throw new Error('the stream yielded no row');
+  }
+
+  it.each([
+    [
+      'a commented, flagged mutant row',
+      {
+        activity_comment: 'Not Active',
+        data_validity_comment: 'Outside typical range',
+        assay_variant_mutation: 'T315I',
+        assay_variant_accession: 'P00519',
+        document_chembl_id: 'CHEMBL1145828',
+        document_year: 2003,
+      },
+      {
+        activity_comment: 'Not Active',
+        data_validity_comment: 'Outside typical range',
+        assay_variant_mutation: 'T315I',
+        assay_variant_accession: 'P00519',
+        document_chembl_id: 'CHEMBL1145828',
+        document_year: 2003,
+      },
+    ],
+    [
+      'a year shipped as a string',
+      { document_chembl_id: 'CHEMBL1124610', document_year: '1989' },
+      {
+        activity_comment: null,
+        data_validity_comment: null,
+        assay_variant_mutation: null,
+        assay_variant_accession: null,
+        document_chembl_id: 'CHEMBL1124610',
+        document_year: 1989,
+      },
+    ],
+    [
+      'an unspecified mutant from a deposited dataset',
+      {
+        assay_variant_mutation: 'UNDEFINED MUTATION',
+        assay_variant_accession: null,
+        document_chembl_id: 'CHEMBL4507235',
+        document_year: null,
+      },
+      {
+        activity_comment: null,
+        data_validity_comment: null,
+        assay_variant_mutation: 'UNDEFINED MUTATION',
+        assay_variant_accession: null,
+        document_chembl_id: 'CHEMBL4507235',
+        document_year: null,
+      },
+    ],
+    [
+      'blank strings',
+      {
+        activity_comment: '  ',
+        data_validity_comment: '',
+        assay_variant_mutation: ' ',
+        assay_variant_accession: '',
+        document_chembl_id: '',
+        document_year: '',
+      },
+      {
+        activity_comment: null,
+        data_validity_comment: null,
+        assay_variant_mutation: null,
+        assay_variant_accession: null,
+        document_chembl_id: null,
+        document_year: null,
+      },
+    ],
+    [
+      'fields absent from the payload',
+      {},
+      {
+        activity_comment: null,
+        data_validity_comment: null,
+        assay_variant_mutation: null,
+        assay_variant_accession: null,
+        document_chembl_id: null,
+        document_year: null,
+      },
+    ],
+  ])('normalizes %s', async (_name, fields, expected) => {
+    const row = await normalized({
+      activity_id: 676633,
+      molecule_chembl_id: 'CHEMBL1',
+      target_chembl_id: 'CHEMBL203',
+      assay_chembl_id: 'CHEMBL2',
+      ...fields,
+    });
+    expect(row).toEqual(expected);
+  });
+
+  /**
+   * Every request one call can make — the honest count, a page of either view, and
+   * every page of the spill walk — under one set of filters, as its query params.
+   */
+  async function requestsUnder(variant: GetActivitiesOptions['variant']) {
+    fetchMock.mockImplementation(
+      activityCorpus({
+        rows: Array.from({ length: 10 }, (_, i) => ({
+          activity_id: 1 + i,
+          pchembl_value: '7.00',
+        })),
+      }),
+    );
+    const svc = new ChemblService({ ...config, maxPageSize: 4 });
+    const ctx = createMockContext({ tenantId: 'default' });
+    const filters: GetActivitiesOptions = { targetChemblId: 'CHEMBL203', variant };
+    await svc.countActivities(filters, ctx);
+    for (const potencyView of ['potency_ranked', 'null_potency'] as const) {
+      for await (const _row of svc.streamActivities({ ...filters, potencyView, offset: 4 }, ctx)) {
+        // drain
+      }
+    }
+    for await (const _row of svc.spillActivities(filters, ctx, {
+      deadline: new CallDeadline(45_000),
+      maxRows: 50_000,
+      onTotal: () => {},
+      onDeadline: () => {},
+    })) {
+      // drain
+    }
+    return fetchMock.mock.calls.map((call) => new URL(String(call[0])).searchParams);
+  }
+
+  it.each([
+    ['omitted', undefined, null, null],
+    ['wild type', { kind: 'wild_type' } as const, 'true', null],
+    [
+      'one recorded variant',
+      { kind: 'mutation', mutation: 'l858r,T790M' } as const,
+      null,
+      'l858r,T790M',
+    ],
+  ])(
+    'sends the %s variant filter on the count and every page of both walks',
+    async (_name, variant, isnull, iexact) => {
+      const requests = await requestsUnder(variant);
+      // 1 count + 2 pages per view (offsets 4, 8) + the 3-page spill (0, 4, 8).
+      expect(requests).toHaveLength(8);
+      for (const params of requests) {
+        expect(params.get('assay_variant_mutation__isnull')).toBe(isnull);
+        expect(params.get('assay_variant_mutation__iexact')).toBe(iexact);
+        expect(params.get('target_chembl_id')).toBe('CHEMBL203');
+      }
+    },
+  );
+});
+
+describe('ChemblService activities — only= field selection (#34)', () => {
+  /** The raw activity fields the server reads, written out independently of the service. */
+  const READ_FIELDS = [
+    'activity_comment',
+    'activity_id',
+    'assay_chembl_id',
+    'assay_description',
+    'assay_type',
+    'assay_variant_accession',
+    'assay_variant_mutation',
+    'data_validity_comment',
+    'document_chembl_id',
+    'document_year',
+    'molecule_chembl_id',
+    'molecule_pref_name',
+    'pchembl_value',
+    'relation',
+    'standard_relation',
+    'standard_type',
+    'standard_units',
+    'standard_value',
+    'target_chembl_id',
+    'target_organism',
+    'target_pref_name',
+    'type',
+    'units',
+    'value',
+  ];
+
+  /** A full ChEMBL activity row: every field `/activity.json` returns, the unread ones included. */
+  const fullRow = (activity_id: number, pchembl_value: string | null) => ({
+    action_type: null,
+    activity_comment: 'Not Active',
+    activity_id,
+    activity_properties: [],
+    activity_supplementary_data: null,
+    assay_chembl_id: 'CHEMBL674637',
+    assay_description: 'Inhibition of EGFR',
+    assay_type: 'B',
+    assay_variant_accession: 'P00533',
+    assay_variant_mutation: 'L858R',
+    bao_endpoint: 'BAO_0000190',
+    bao_format: 'BAO_0000357',
+    bao_label: 'single protein format',
+    canonical_smiles: 'CCO',
+    data_validity_comment: 'Outside typical range',
+    data_validity_description: 'Values for this activity type are unusually large/small',
+    document_chembl_id: 'CHEMBL1145828',
+    document_journal: 'J Med Chem',
+    document_year: 2003,
+    ligand_efficiency: { bei: '20.1', le: '0.4', lle: '3.2', sei: '9.9' },
+    molecule_chembl_id: 'CHEMBL68920',
+    molecule_pref_name: 'GEFITINIB',
+    parent_molecule_chembl_id: 'CHEMBL68920',
+    pchembl_value,
+    potential_duplicate: 0,
+    qudt_units: 'http://www.openphacts.org/units/Nanomolar',
+    record_id: 1,
+    relation: '=',
+    src_id: 1,
+    standard_flag: 1,
+    standard_relation: '=',
+    standard_text_value: null,
+    standard_type: 'IC50',
+    standard_units: 'nM',
+    standard_upper_value: null,
+    standard_value: '41.0',
+    target_chembl_id: 'CHEMBL203',
+    target_organism: 'Homo sapiens',
+    target_pref_name: 'Epidermal growth factor receptor erbB1',
+    target_tax_id: '9606',
+    text_value: null,
+    toid: null,
+    type: 'IC50',
+    units: 'uM',
+    upper_value: null,
+    uo_units: 'UO_0000065',
+    value: '0.041',
+  });
+
+  it('names exactly the read fields on every view page — inline, cursor, and spill — and none on the count', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => fullRow(1 + i, '7.00'));
+    fetchMock.mockImplementation(activityCorpus({ rows }));
+    const svc = new ChemblService({ ...config, maxPageSize: 4 });
+    const ctx = createMockContext({ tenantId: 'default' });
+    const filters: GetActivitiesOptions = { targetChemblId: 'CHEMBL203' };
+    expect(await svc.countActivities(filters, ctx)).toBe(10);
+    const inline = [];
+    for await (const row of svc.streamActivities({ ...filters, pageSize: 4 }, ctx)) {
+      inline.push(row);
+      if (inline.length === 4) break;
+    }
+    for await (const _row of svc.streamActivities(
+      { ...filters, potencyView: 'null_potency', offset: 4 },
+      ctx,
+    )) {
+      // drain the cursor page walk
+    }
+    const spilled = [];
+    for await (const row of svc.spillActivities(filters, ctx, {
+      deadline: new CallDeadline(45_000),
+      maxRows: 50_000,
+      onTotal: () => {},
+      onDeadline: () => {},
+    })) {
+      spilled.push(row);
+    }
+
+    const requests = fetchMock.mock.calls.map((call) => new URL(String(call[0])).searchParams);
+    const [count, ...pages] = requests;
+    expect(count?.has('order_by')).toBe(false);
+    expect(count?.has('only')).toBe(false);
+    // 1 inline page + 2 cursor pages (offsets 4, 8) + the 3-page spill (0, 4, 8).
+    expect(pages).toHaveLength(6);
+    for (const params of pages) {
+      expect(params.getAll('only')).toHaveLength(1);
+      expect(params.get('only')?.split(',').sort()).toEqual(READ_FIELDS);
+    }
+    // Rows arrive trimmed to the selection and still normalize whole.
+    expect(spilled).toHaveLength(10);
+    expect(spilled[0]).toEqual({
+      activity_comment: 'Not Active',
+      activity_id: 1,
+      assay_chembl_id: 'CHEMBL674637',
+      assay_description: 'Inhibition of EGFR',
+      assay_type: 'B',
+      assay_variant_accession: 'P00533',
+      assay_variant_mutation: 'L858R',
+      data_validity_comment: 'Outside typical range',
+      document_chembl_id: 'CHEMBL1145828',
+      document_year: 2003,
+      molecule_chembl_id: 'CHEMBL68920',
+      molecule_pref_name: 'GEFITINIB',
+      pchembl_value: 7,
+      relation: '=',
+      standard_relation: '=',
+      standard_type: 'IC50',
+      standard_units: 'nM',
+      standard_value: 41,
+      target_chembl_id: 'CHEMBL203',
+      target_organism: 'Homo sapiens',
+      target_pref_name: 'Epidermal growth factor receptor erbB1',
+      type: 'IC50',
+      units: 'uM',
+      value: '0.041',
+    });
+    expect(inline).toEqual(spilled.slice(0, 4));
+  });
+
+  it('lists exactly the raw fields normalizeActivity reads, no more and no fewer', () => {
+    const read = new Set<string>();
+    /** A raw row that records every key read from it, answering each with `value`. */
+    const recording = (value: unknown) =>
+      new Proxy(
+        {},
+        {
+          get(_target, key) {
+            if (typeof key === 'string') read.add(key);
+            return value;
+          },
+        },
+      );
+    // Absent fields and present ones, in case a read is ever conditional on a value.
+    normalizeActivity(recording(undefined));
+    normalizeActivity(recording('7.5'));
+    expect([...read].sort()).toEqual([...ACTIVITY_FIELDS].sort());
+    expect([...ACTIVITY_FIELDS].sort()).toEqual(READ_FIELDS);
   });
 });

@@ -8,6 +8,7 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { chemblIdInput } from '@/mcp-server/input-normalization.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 export const chemblTargetResource = resource('chembl://target/{chemblId}', {
@@ -17,10 +18,9 @@ export const chemblTargetResource = resource('chembl://target/{chemblId}', {
     'A target record by ChEMBL target ID — pref_name, type, organism, and component UniProt accessions + gene symbols. Convenience injectable-context mirror of the per-target fetch.',
   mimeType: 'application/json',
   params: z.object({
-    chemblId: z
-      .string()
-      .regex(/^CHEMBL\d+$/, 'Must be a ChEMBL ID like CHEMBL203.')
-      .describe('ChEMBL target ID, e.g. "CHEMBL203".'),
+    chemblId: chemblIdInput(
+      'Must be a ChEMBL target ID like CHEMBL203 — find one with chembl_search_targets.',
+    ).describe('ChEMBL target ID, e.g. "CHEMBL203".'),
   }),
 
   errors: [

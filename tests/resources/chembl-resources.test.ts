@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tests for the chembl://molecule/{chemblId} and
  * chembl://target/{chemblId} resources: the handler returns the same normalized
- * shape the tool surface carries (against a stubbed upstream), and the CHEMBL\d+
- * param regex rejects malformed IDs at the schema boundary before any fetch.
+ * shape the tool surface carries (against a stubbed upstream), the molecule's
+ * resolved parent, and the ID param, which reads a ChEMBL ID in any case as the
+ * canonical one and rejects a malformed ID at the schema boundary before any fetch.
  * @module tests/resources/chembl-resources
  */
 
@@ -77,10 +78,48 @@ describe('chembl://molecule/{chemblId}', () => {
     });
   });
 
+  it('carries the parent a salt resolves to, and a record with no hierarchy as its own', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          molecule_chembl_id: 'CHEMBL1079742',
+          molecule_hierarchy: {
+            active_chembl_id: 'CHEMBL553',
+            molecule_chembl_id: 'CHEMBL1079742',
+            parent_chembl_id: 'CHEMBL553',
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ molecule_chembl_id: 'CHEMBL1201352', molecule_hierarchy: null }),
+      );
+    const read = async (chemblId: string) =>
+      chemblMoleculeResource.handler(chemblMoleculeResource.params!.parse({ chemblId }), ctx());
+    expect(await read('CHEMBL1079742')).toMatchObject({
+      molecule_chembl_id: 'CHEMBL1079742',
+      parent_chembl_id: 'CHEMBL553',
+    });
+    expect(await read('CHEMBL1201352')).toMatchObject({
+      molecule_chembl_id: 'CHEMBL1201352',
+      parent_chembl_id: 'CHEMBL1201352',
+    });
+  });
+
   it('rejects a malformed ChEMBL ID at the param schema (no fetch)', () => {
     expect(() => chemblMoleculeResource.params!.parse({ chemblId: 'not-an-id' })).toThrow();
     expect(() => chemblMoleculeResource.params!.parse({ chemblId: 'CHEMBL' })).toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('resolves a lowercase ChEMBL ID as the canonical one (#41)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ molecule_chembl_id: 'CHEMBL25' }));
+    const params = chemblMoleculeResource.params!.parse({ chemblId: 'chembl25' });
+    expect(params).toEqual({ chemblId: 'CHEMBL25' });
+    const result = await chemblMoleculeResource.handler(params, ctx());
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      'https://www.ebi.ac.uk/chembl/api/data/molecule/CHEMBL25.json',
+    );
+    expect(result).toMatchObject({ molecule_chembl_id: 'CHEMBL25' });
   });
 });
 
@@ -116,8 +155,11 @@ describe('chembl://target/{chemblId}', () => {
     });
   });
 
-  it('rejects a lowercase/malformed ChEMBL ID at the param schema', () => {
-    expect(() => chemblTargetResource.params!.parse({ chemblId: 'chembl203' })).toThrow();
+  it('reads a lowercase ChEMBL ID as the canonical one (#41), and rejects a malformed one', () => {
+    expect(chemblTargetResource.params!.parse({ chemblId: 'chembl203' })).toEqual({
+      chemblId: 'CHEMBL203',
+    });
     expect(() => chemblTargetResource.params!.parse({ chemblId: 'CHEMBL203x' })).toThrow();
+    expect(() => chemblTargetResource.params!.parse({ chemblId: 'P00533' })).toThrow();
   });
 });

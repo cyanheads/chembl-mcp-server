@@ -8,6 +8,8 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { chemblIdInput } from '@/mcp-server/input-normalization.js';
+import { mdInline, mdLineStart } from '@/mcp-server/markdown-text.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 export const chemblGetAssay = tool('chembl_get_assay', {
@@ -16,10 +18,9 @@ export const chemblGetAssay = tool('chembl_get_assay', {
     "Assay provenance behind a bioactivity row: description, type (binding / functional / ADMET / toxicity), the target it measures, organism, and ChEMBL's 1–9 confidence score (9 = direct assay on the protein target, lower = homologous or indirect). Supply assay_chembl_id from a chembl_get_bioactivities row. Call this to judge whether two measurements are comparable before ranking them together.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    assay_chembl_id: z
-      .string()
-      .min(1)
-      .describe('ChEMBL assay ID from a bioactivity row\'s assay_chembl_id, e.g. "CHEMBL674637".'),
+    assay_chembl_id: chemblIdInput(
+      'Must be a ChEMBL assay ID like CHEMBL674637 — take one from a chembl_get_bioactivities row.',
+    ).describe('ChEMBL assay ID from a bioactivity row\'s assay_chembl_id, e.g. "CHEMBL674637".'),
   }),
   output: z.object({
     assay_chembl_id: z.string().describe('The ChEMBL assay ID queried.'),
@@ -74,17 +75,19 @@ export const chemblGetAssay = tool('chembl_get_assay', {
   ],
 
   async handler(input, ctx) {
-    return await getChemblService().getAssay(input.assay_chembl_id.trim(), ctx);
+    // The schema has trimmed and uppercased the ID.
+    return await getChemblService().getAssay(input.assay_chembl_id, ctx);
   },
 
   format: (result) => {
-    const lines = [`**${result.assay_chembl_id}**`];
-    if (result.description) lines.push(result.description);
+    const lines = [`**${mdInline(result.assay_chembl_id)}**`];
+    // The description begins its line, where a leading `#` or `1.` would open a block.
+    if (result.description) lines.push(mdLineStart(result.description));
     lines.push(
-      `Type: ${result.assay_type_description ?? '—'} (${result.assay_type ?? '—'}) | Target: ${result.target_chembl_id ?? '—'} | Organism: ${result.organism ?? '—'}`,
+      `Type: ${mdInline(result.assay_type_description ?? '—')} (${mdInline(result.assay_type ?? '—')}) | Target: ${mdInline(result.target_chembl_id ?? '—')} | Organism: ${mdInline(result.organism ?? '—')}`,
     );
     lines.push(
-      `Confidence: ${result.confidence_score ?? '—'} (${result.confidence_description ?? '—'})`,
+      `Confidence: ${result.confidence_score ?? '—'} (${mdInline(result.confidence_description ?? '—')})`,
     );
     return [{ type: 'text', text: lines.join('\n') }];
   },

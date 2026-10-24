@@ -1,8 +1,8 @@
 /**
  * @fileoverview Behavior tests for the three DataCanvas consumer tools
  * (chembl_dataframe_query / _describe / _drop). Covers the shared
- * canvas_disabled error contract (ctx.fail when CANVAS_PROVIDER_TYPE is not
- * duckdb), the happy paths through FakeDataCanvas (the framework DataCanvas
+ * canvas_disabled error contract (ctx.fail when the server runs with
+ * CANVAS_PROVIDER_TYPE=none), the happy paths through FakeDataCanvas (the framework DataCanvas
  * over an in-memory provider), the row_count/truncated mapping on query against
  * the provider's row cap, bubbling of canvas-primitive errors
  * (unknown canvas_id, SQL-gate rejection), drop's re-raise of canvas_not_found
@@ -18,6 +18,7 @@ import { chemblDataframeDescribe } from '@/mcp-server/tools/definitions/chembl-d
 import { chemblDataframeDrop } from '@/mcp-server/tools/definitions/chembl-dataframe-drop.tool.js';
 import { chemblDataframeQuery } from '@/mcp-server/tools/definitions/chembl-dataframe-query.tool.js';
 import { setCanvas } from '@/services/canvas-accessor.js';
+import { markupNodes, parseMarkdown } from '../_commonmark.js';
 import { FakeDataCanvas } from '../_fake-canvas.js';
 
 afterEach(() => {
@@ -74,6 +75,27 @@ describe('canvas_disabled error contract (all three tools)', () => {
       data: { reason: 'canvas_disabled' },
     });
   });
+
+  const SQL_PATH_OFF =
+    'The SQL path is off on this server; read the inline rows from chembl_get_bioactivities and page with its nextCursor.';
+  it.each([
+    ['chembl_dataframe_query', chemblDataframeQuery, SQL_PATH_OFF],
+    ['chembl_dataframe_describe', chemblDataframeDescribe, SQL_PATH_OFF],
+    [
+      'chembl_dataframe_drop',
+      chemblDataframeDrop,
+      'The canvas is off on this server, so no table was ever staged and there is nothing to drop.',
+    ],
+  ] as const)(
+    '%s declares canvas_disabled for the server running with the canvas off, not for an unset provider',
+    (_name, definition, recovery) => {
+      const entry = definition.errors?.find((e) => e.reason === 'canvas_disabled');
+      expect(entry?.when).toBe(
+        'The server runs with the canvas off (CANVAS_PROVIDER_TYPE=none), so no canvas exists.',
+      );
+      expect(entry?.recovery).toBe(recovery);
+    },
+  );
 });
 
 describe('chembl_dataframe_query — happy + boundary', () => {
@@ -302,6 +324,38 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     expect(text).not.toContain('canvas row cap');
   });
 
+  /**
+   * The budget measures the lines format() emits, escapes included, so text dense
+   * in markup characters still fits the 40,000-character table.
+   */
+  it('counts the escapes a cell takes against the render budget', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
+    fake.queryResults = [
+      {
+        rows: Array.from({ length: 200 }, (_, i) => ({
+          activity_id: 2000 + i,
+          assay_description: '*'.repeat(1000),
+        })),
+      },
+      { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
+    ];
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const result = await chemblDataframeQuery.handler(
+      chemblDataframeQuery.input.parse({
+        canvas_id: canvasId,
+        sql: 'SELECT activity_id, assay_description FROM bioactivities',
+      }),
+      ctx,
+    );
+    // Each escaped row is 2,011 characters plus its newline: 19 fit in 40,000 (39 unescaped).
+    expect(result.rendered_rows).toBe(19);
+    const dataLines = tableDataLines(renderQuery(result));
+    expect(dataLines).toHaveLength(19);
+    expect(dataLines.join('\n').length).toBeLessThanOrEqual(40_000);
+  });
+
   it('discloses the canvas row cap without a render note when the table fits', () => {
     const text = renderQuery({
       rows: narrowRows(60),
@@ -385,6 +439,10 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     expect(text).not.toContain('[object Object]');
   });
 
+  /**
+   * A line break is written as a character reference rather than folded to a space
+   * (#44), so the cell reads back as the value with the row intact.
+   */
   it('keeps a pipe or newline inside a cell from breaking the table', () => {
     const text = renderQuery({
       rows: [{ assay_description: 'Inhibition of EGFR | mutant\nsecond line' }],
@@ -392,8 +450,40 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
       rendered_rows: 1,
       truncated: false,
     });
-    expect(tableDataLines(text)).toHaveLength(1);
-    expect(text).toContain('Inhibition of EGFR \\| mutant second line');
+    expect(tableDataLines(text)).toEqual(['| Inhibition of EGFR \\| mutant&#10;second line |']);
+  });
+
+  /** #44: upstream free text in a cell reads back as the value, inert, pipes and all. */
+  it('renders upstream text in every cell as the value recorded', () => {
+    const description =
+      'Affinity in displacing [125I](R)-DOI *x* <br>\n# forged | piped \\| already';
+    const text = renderQuery({
+      rows: [
+        {
+          assay_description: description,
+          nested: { comment: '_Not_ [Active](x)' },
+          n: 5,
+          missing: null,
+        },
+      ],
+      row_count: 1,
+      rendered_rows: 1,
+      truncated: false,
+    });
+    const [line = ''] = tableDataLines(text);
+    const { text: shown, nodes } = parseMarkdown(line);
+    expect(shown).toBe(`| ${description} | {"comment":"_Not_ [Active](x)"} | 5 |  |`);
+    expect(markupNodes(nodes)).toEqual([]);
+  });
+
+  it('renders markup-free cells unescaped', () => {
+    const text = renderQuery({
+      rows: [{ molecule_chembl_id: 'CHEMBL25', pchembl_value: 7.39, ids: ['CHEMBL2'] }],
+      row_count: 1,
+      rendered_rows: 1,
+      truncated: false,
+    });
+    expect(tableDataLines(text)).toEqual(['| CHEMBL25 | 7.39 | ["CHEMBL2"] |']);
   });
 
   it('carries the declared recovery hint on canvas_disabled', async () => {
@@ -404,7 +494,11 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
       sql: 'SELECT 1',
     });
     await expect(chemblDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
-      data: { recovery: { hint: expect.stringContaining('CANVAS_PROVIDER_TYPE=duckdb') } },
+      data: {
+        recovery: {
+          hint: 'The SQL path is off on this server; read the inline rows from chembl_get_bioactivities and page with its nextCursor.',
+        },
+      },
     });
   });
 });

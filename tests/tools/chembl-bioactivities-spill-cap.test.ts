@@ -28,8 +28,8 @@ import { activityCorpus, viewRequests } from '../_fake-activity-upstream.js';
 import { FakeDataCanvas } from '../_fake-canvas.js';
 
 /**
- * Cap for this file. A `rawActivity` row serializes to ~585 chars, so the 40 KB
- * preview budget buffers ~68 rows before the overflow sentinel — a cap of 100
+ * Cap for this file. A `rawActivity` row serializes to ~745 chars, so the 50,000-character
+ * preview budget buffers ~67 rows before the overflow sentinel — a cap of 100
  * therefore trips in the spill tail, after a normal preview, exactly as a real
  * over-cap drain does.
  */
@@ -295,7 +295,7 @@ describe('chembl_get_bioactivities — spill row cap (#14)', () => {
   it('stages every row and reports truncated:false when the spill fits under the cap', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
-    // 90 rows overflows the 40 KB preview budget (spills) but stays under the cap.
+    // 90 rows overflows the 50,000-character preview budget (spills) but stays under the cap.
     mockUpstream({ honest: 500, viewTotal: 90, rows: 90 });
     const c = ctx();
     const result = await chemblGetBioactivities.handler(
@@ -434,7 +434,7 @@ describe('chembl_get_bioactivities — truncated_by names only the bound that cu
 
   /**
    * 60 rows behind 50-row pages while every page reports 1000: the walk fits the
-   * 40 KB budget a limit of 25 buys and is re-staged on the supplied canvas whole.
+   * 50,000-character budget a limit of 25 buys and is re-staged on the supplied canvas whole.
    */
   it('names no bound when an inline-fit re-stage walk ends on a short page', async () => {
     const fake = new FakeDataCanvas();

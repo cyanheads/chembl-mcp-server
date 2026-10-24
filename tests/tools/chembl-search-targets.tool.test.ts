@@ -1,8 +1,9 @@
 /**
  * @fileoverview Behavior tests for chembl_search_targets beyond the input gate:
  * the happy path through a stubbed upstream, the empty-result notice that echoes
- * the filters, truncation enrichment, and the pure format() rendering components
- * and gene symbols (with — fallbacks).
+ * the filters, truncation enrichment, input normalization (#41: uppercased codes,
+ * the limit clamp), cursor pagination, and the pure format() rendering components
+ * and gene symbols (with — fallbacks) and upstream text as recorded (#44).
  * @module tests/tools/chembl-search-targets.tool
  */
 
@@ -13,6 +14,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { getServerConfig } from '@/config/server-config.js';
 import { chemblSearchTargets } from '@/mcp-server/tools/definitions/chembl-search-targets.tool.js';
 import { initChemblService } from '@/services/chembl/chembl-service.js';
+import { markupNodes, parseMarkdown } from '../_commonmark.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -95,6 +97,112 @@ describe('chembl_search_targets — resolution', () => {
       c,
     );
     expect(getEnrichment(c)).toMatchObject({ truncated: true, shown: 3, cap: 3 });
+  });
+});
+
+describe('chembl_search_targets — input normalization (#41)', () => {
+  const sentParams = () => new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams;
+  const stubPage = (total: number, count = total) =>
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse({
+          targets: Array.from({ length: count }, (_, i) => ({
+            ...egfrRaw,
+            target_chembl_id: `CHEMBL${i}`,
+          })),
+          page_meta: { total_count: total },
+        }),
+      ),
+    );
+
+  it('sends accession and target_type uppercased and trimmed, the form every ChEMBL record holds', async () => {
+    stubPage(1);
+    const c = ctx();
+    await chemblSearchTargets.handler(
+      chemblSearchTargets.input.parse({ accession: ' p00533 ', target_type: 'single protein' }),
+      c,
+    );
+    expect(sentParams().get('target_components__accession')).toBe('P00533');
+    expect(sentParams().get('target_type')).toBe('SINGLE PROTEIN');
+  });
+
+  it('echoes the canonical accession in the zero-hit notice', async () => {
+    stubPage(0);
+    const c = ctx();
+    await chemblSearchTargets.handler(chemblSearchTargets.input.parse({ accession: 'p99999' }), c);
+    expect(getEnrichment(c)).toMatchObject({
+      notice:
+        'No target matched accession="P99999". Verify the accession/symbol, or broaden with a free-text query.',
+    });
+  });
+
+  it('leaves gene_symbol, organism, and query as sent — those match case-insensitively upstream', async () => {
+    stubPage(1);
+    await chemblSearchTargets.handler(
+      chemblSearchTargets.input.parse({
+        gene_symbol: 'egfr',
+        organism: 'homo sapiens',
+        query: 'Kinase',
+      }),
+      ctx(),
+    );
+    expect(
+      sentParams().get('target_components__target_component_synonyms__component_synonym__iexact'),
+    ).toBe('egfr');
+    expect(sentParams().get('organism__iexact')).toBe('homo sapiens');
+    expect(sentParams().get('pref_name__icontains')).toBe('Kinase');
+  });
+
+  it('reads a blank target_type as unset', async () => {
+    stubPage(1);
+    await chemblSearchTargets.handler(
+      chemblSearchTargets.input.parse({ accession: 'P00533', target_type: '  ' }),
+      ctx(),
+    );
+    expect(sentParams().has('target_type')).toBe(false);
+  });
+
+  it('clamps a limit above 100 to 100 with a notice, cap reporting the applied value', async () => {
+    stubPage(250, 100);
+    const c = ctx();
+    const result = await chemblSearchTargets.handler(
+      chemblSearchTargets.input.parse({ query: 'kinase', limit: 500 }),
+      c,
+    );
+    expect(sentParams().get('limit')).toBe('100');
+    expect(result.targets).toHaveLength(100);
+    expect(getEnrichment(c)).toMatchObject({
+      truncated: true,
+      shown: 100,
+      cap: 100,
+      notice:
+        'limit 500 is above the maximum of 100, so 100 was applied. Showing 100 of 250; pass nextCursor back as cursor for the next page.',
+    });
+    expect(result.nextCursor && decodeCursor(result.nextCursor, c)).toMatchObject({
+      offset: 100,
+      limit: 100,
+    });
+  });
+
+  it('discloses the clamp beside the zero-hit notice', async () => {
+    stubPage(0);
+    const c = ctx();
+    await chemblSearchTargets.handler(
+      chemblSearchTargets.input.parse({ accession: 'P99999', limit: 101 }),
+      c,
+    );
+    expect(getEnrichment(c)).toMatchObject({
+      truncated: false,
+      cap: 100,
+      notice:
+        'limit 101 is above the maximum of 100, so 100 was applied. No target matched accession="P99999". Verify the accession/symbol, or broaden with a free-text query.',
+    });
+  });
+
+  it('rejects a limit above the 10000 ceiling at the schema', () => {
+    expect(chemblSearchTargets.input.safeParse({ query: 'kinase', limit: 10_001 }).success).toBe(
+      false,
+    );
   });
 });
 
@@ -259,6 +367,19 @@ describe('chembl_search_targets — cursor pagination', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it.each(['', '   ', '\t\n'])(
+    'reads the blank cursor %j as omitted: the first page',
+    async (cursor) => {
+      stubTargetCorpus(7);
+      const result = await chemblSearchTargets.handler(
+        chemblSearchTargets.input.parse({ query: 'kinase', limit: 3, cursor }),
+        ctx(),
+      );
+      expect(idsOf(result.targets)).toEqual(['CHEMBL0', 'CHEMBL1', 'CHEMBL2']);
+      expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('offset')).toBe('0');
+    },
+  );
+
   it('keeps the missing-input gate ahead of cursor decoding', async () => {
     // A cursor is a resume position, not a query — it must not satisfy the gate.
     await expect(
@@ -345,5 +466,52 @@ describe('chembl_search_targets format()', () => {
     });
     const text = blocks.map((b) => (b as { text: string }).text).join('\n');
     expect(text.toLowerCase()).not.toContain('cursor');
+  });
+
+  it('renders every row line of markup-free values unescaped', () => {
+    const blocks = chemblSearchTargets.format!({
+      targets: [
+        {
+          target_chembl_id: 'CHEMBL203',
+          pref_name: 'Epidermal growth factor receptor',
+          target_type: 'SINGLE PROTEIN',
+          organism: 'Homo sapiens',
+          components: [
+            { accession: 'P00533', gene_symbols: ['EGFR', 'ERBB1'] },
+            { accession: null, gene_symbols: [] },
+          ],
+        },
+      ],
+    });
+    expect((blocks[0] as { text: string }).text.split('\n')).toEqual([
+      '**CHEMBL203** — Epidermal growth factor receptor',
+      'Type: SINGLE PROTEIN | Organism: Homo sapiens',
+      '  • accession P00533 | genes: EGFR, ERBB1',
+      '  • accession — | genes: —',
+    ]);
+  });
+
+  /** #44: every upstream string reads back as recorded, around the server's bold ID and bullets. */
+  it('renders upstream names, types, organisms, accessions, and genes as the text recorded', () => {
+    const blocks = chemblSearchTargets.format!({
+      targets: [
+        {
+          target_chembl_id: 'CHEMBL_1*',
+          pref_name: 'Receptor [125I](R) *mutant*',
+          target_type: '_SINGLE_ PROTEIN',
+          organism: 'Homo <i>sapiens</i>',
+          components: [{ accession: 'P0\\*', gene_symbols: ['HLA-A*02', 'GENE\n# H'] }],
+        },
+      ],
+    });
+    const { text, nodes } = parseMarkdown((blocks[0] as { text: string }).text);
+    expect(text).toBe(
+      [
+        'CHEMBL_1* — Receptor [125I](R) *mutant*',
+        'Type: _SINGLE_ PROTEIN | Organism: Homo <i>sapiens</i>',
+        '• accession P0\\* | genes: HLA-A*02, GENE\n# H',
+      ].join('\n'),
+    );
+    expect(markupNodes(nodes)).toEqual([]);
   });
 });

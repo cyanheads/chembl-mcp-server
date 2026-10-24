@@ -71,6 +71,24 @@ describe('chembl_get_bioactivities — molecule/target filter gate', () => {
     expect(result.totalCount).toBe(0);
   });
 
+  it('rejects include_alternate_forms without molecule_chembl_id before any request', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    for (const ids of [
+      { target_chembl_id: 'CHEMBL1862' },
+      { molecule_chembl_id: '  ', target_chembl_id: 'CHEMBL1862' },
+    ]) {
+      const ctx = createMockContext({ tenantId: 'default', errors: chemblGetBioactivities.errors });
+      const input = chemblGetBioactivities.input.parse({ ...ids, include_alternate_forms: true });
+      await expectFail(
+        chemblGetBioactivities.handler(input, ctx),
+        JsonRpcErrorCode.InvalidParams,
+        'alternate_forms_without_molecule',
+      );
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('treats blank-string ids as absent (form-client guard)', async () => {
     const ctx = createMockContext({ tenantId: 'default', errors: chemblGetBioactivities.errors });
     const input = chemblGetBioactivities.input.parse({

@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-10-18 04:07:16
+Generated on: 2026-10-24 11:17:13
 
 ```text
 chembl-mcp-server/
@@ -147,16 +147,18 @@ chembl-mcp-server/
 │   │   │   └── definitions/
 │   │   │       ├── chembl-molecule.resource.ts
 │   │   │       └── chembl-target.resource.ts
-│   │   └── tools/
-│   │       └── definitions/
-│   │           ├── chembl-dataframe-describe.tool.ts
-│   │           ├── chembl-dataframe-drop.tool.ts
-│   │           ├── chembl-dataframe-query.tool.ts
-│   │           ├── chembl-get-assay.tool.ts
-│   │           ├── chembl-get-bioactivities.tool.ts
-│   │           ├── chembl-get-drug-info.tool.ts
-│   │           ├── chembl-search-molecules.tool.ts
-│   │           └── chembl-search-targets.tool.ts
+│   │   ├── tools/
+│   │   │   └── definitions/
+│   │   │       ├── chembl-dataframe-describe.tool.ts
+│   │   │       ├── chembl-dataframe-drop.tool.ts
+│   │   │       ├── chembl-dataframe-query.tool.ts
+│   │   │       ├── chembl-get-assay.tool.ts
+│   │   │       ├── chembl-get-bioactivities.tool.ts
+│   │   │       ├── chembl-get-drug-info.tool.ts
+│   │   │       ├── chembl-search-molecules.tool.ts
+│   │   │       └── chembl-search-targets.tool.ts
+│   │   ├── input-normalization.ts
+│   │   └── markdown-text.ts
 │   ├── services/
 │   │   ├── chembl/
 │   │   │   ├── chembl-service.ts
@@ -164,6 +166,9 @@ chembl-mcp-server/
 │   │   └── canvas-accessor.ts
 │   └── index.ts
 ├── tests/
+│   ├── mcp-server/
+│   │   ├── input-normalization.test.ts
+│   │   └── markdown-text.test.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   └── chembl-resources.test.ts
@@ -185,8 +190,11 @@ chembl-mcp-server/
 │   │   ├── chembl-search-molecules.tool.test.ts
 │   │   ├── chembl-search-targets.tool.test.ts
 │   │   └── chembl-wire-contract.test.ts
+│   ├── _chembl-error-bodies.ts
+│   ├── _commonmark.ts
 │   ├── _fake-activity-upstream.ts
-│   └── _fake-canvas.ts
+│   ├── _fake-canvas.ts
+│   └── _fake-drug-family-upstream.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
