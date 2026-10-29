@@ -65,7 +65,7 @@ const IndicationSchema = z
       .number()
       .nullable()
       .describe(
-        'Max clinical phase reached for THIS indication (1–4), the highest across the forms it is recorded on. Null when unknown.',
+        'Max clinical phase reached for THIS indication (4 = approved, 3–1 = trial phase, 0.5 = early phase 1, −1 = phase unknown), the highest across the forms it is recorded on. Null when unknown.',
       ),
     forms: z
       .array(
@@ -250,7 +250,9 @@ export const chemblGetDrugInfo = tool('chembl_get_drug_info', {
     max_phase: z
       .number()
       .nullable()
-      .describe('Max clinical phase across indications: 4 = marketed. Null when unknown.'),
+      .describe(
+        'Max clinical phase across indications: 4 = approved, 3–1 = trial phase, 0.5 = early phase 1, −1 = clinical with the phase unknown. Null when ChEMBL records no clinical development.',
+      ),
     first_approval: z
       .number()
       .nullable()

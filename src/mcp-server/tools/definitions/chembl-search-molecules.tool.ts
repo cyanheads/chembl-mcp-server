@@ -67,7 +67,7 @@ const MoleculeSchema = z
       .number()
       .nullable()
       .describe(
-        'Max clinical phase: 4 = marketed drug, 0 = research compound. Null when unknown. The cheap druggability signal.',
+        'Max clinical phase: 4 = approved, 3–1 = clinical trial phase, 0.5 = early phase 1, −1 = clinical with the phase unknown. Null when ChEMBL records no clinical development (a preclinical or research compound). The cheap druggability signal.',
       ),
     molecule_type: z
       .string()

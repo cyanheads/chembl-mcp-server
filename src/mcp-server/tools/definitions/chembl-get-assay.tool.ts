@@ -41,7 +41,12 @@ export const chemblGetAssay = tool('chembl_get_assay', {
       .describe(
         'ChEMBL target ID the assay measures — chain to chembl_search_targets/chembl_get_bioactivities. Null when unassigned.',
       ),
-    organism: z.string().nullable().describe('Assay organism. Null when unspecified.'),
+    organism: z
+      .string()
+      .nullable()
+      .describe(
+        "Organism ChEMBL records for the assay itself, not its target's organism. Null when the assay records none, even when the target is a human protein.",
+      ),
     confidence_score: z
       .number()
       .nullable()

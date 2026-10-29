@@ -161,7 +161,7 @@ interface Molecule {
   alogp: number | null;              // 1.31
   num_ro5_violations: number | null; // Lipinski rule-of-five violations
   qed_weighted: number | null;       // 0.55  drug-likeness
-  max_phase: number | null;          // 4 = marketed, 0/null = research — the cheap "druggability" signal
+  max_phase: number | null;          // 4 = approved, 3–1 trial, 0.5 early phase 1, −1 phase unknown, null = no clinical record
   molecule_type: string | null;      // "Small molecule"
   parent_chembl_id: string;          // family parent — see the parent rule below
   similarity?: number | null;        // percent — present only on search_type=similarity
@@ -510,8 +510,8 @@ target `CHEMBL203`) + indications (non-small-cell lung carcinoma, max phase 4). 
   strings (`"180.16"`, `"5.90"`, `max_phase: "4.0"`). Coercing once in the service means schemas/output
   are clean numbers; a missing/non-numeric value becomes `null` (never `0`) — a potency the agent must
   see as absent, not zero. Honors the scientific-data fidelity rule.
-- **`max_phase` on every molecule row.** The cheap druggability signal — lets the agent tell a marketed
-  drug (phase 4) from a research compound (phase 0/null) without a follow-up call. `max_phase_min` is an
+- **`max_phase` on every molecule row.** The cheap druggability signal — lets the agent tell an approved
+  drug (phase 4) from a research compound (null; ChEMBL records no phase 0) without a follow-up call. `max_phase_min` is an
   optional search filter for the same reason.
 - **No auth, no scopes.** Public keyless data over stdio; `MCP_AUTH_MODE=none`. Adding scopes would be
   ceremony with no security value.
