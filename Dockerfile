@@ -4,13 +4,15 @@
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
 #
-# Pinned to $BUILDPLATFORM because `bun run build` emits platform-independent
-# JavaScript, so this stage must never be emulated. Without the pin, the
-# linux/amd64 leg of a multi-arch `buildx` run on an arm64 host executes under
-# QEMU, where Bun 1.4.0 aborts during the build with a JavaScriptCore
-# MemoryExhaustion assertion (exit 134) and the multi-arch push fails outright.
-# The pin holds only while nothing here compiles a native addon — that would
-# need the target-arch toolchain and could not cross-compile.
+# Pinned to $BUILDPLATFORM rather than the target platform: `bun run build` emits
+# JavaScript, and only `dist/` crosses into the production stage. Built for the
+# target instead, the non-native leg of a `--platform linux/amd64,linux/arm64`
+# build runs under QEMU, where bun >= 1.4 aborts with a JavaScriptCore allocator
+# assertion and fails the multi-arch push.
+#
+# The constraint this assumes: the build stage produces platform-independent
+# output. A stage that compiles a native addon needs the target-arch toolchain
+# and cannot cross-compile this way — drop the flag there.
 # ==============================================================================
 FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS build
 
@@ -27,6 +29,11 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # Copy the rest of the source code
 COPY . .
 
+# The skills a server publishes (`createApp({ skills: 'skills' })`) are read at
+# runtime from the application root. Created when the project has none, so the
+# production stage's copy below holds with or without one.
+RUN mkdir -p skills
+
 # Build the application
 RUN bun run build
 
@@ -34,46 +41,56 @@ RUN bun run build
 # ==============================================================================
 # Production Dependencies Stage
 #
-# Bun and the security scanner run natively; optional native packages are
-# selected explicitly for the target image. Running the scanner under QEMU
-# can abort with a JavaScriptCore MemoryExhaustion assertion.
+# Installs the production dependency tree for the target platform. Every step
+# here can run JavaScript — bunfig.toml's security scanner runs as a Bun
+# program, and so do the OTel and musl-prune scripts — so the stage runs on
+# $BUILDPLATFORM and cross-installs with `--os`/`--cpu`, which pick each
+# platform-specific optional dependency (native bindings such as DuckDB's) for
+# the target. Only `node_modules` leaves this stage.
+#
+# A clean image rather than `FROM build`: the build stage's node_modules holds
+# devDependencies.
 # ==============================================================================
 FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS deps
 
 WORKDIR /usr/src/app
 
-ARG TARGETARCH
-ARG TARGETOS
-
-# Preserve the release-age gate and scanner for production installs.
+# Copy dependency manifests. `bunfig.toml` rides along so every install below
+# passes its release-age gate and security scanner, as a local install does.
 COPY package.json bun.lock bunfig.toml ./
 
-# The scanner is a devDependency, so seed it before the production-only install.
+# The scanner bunfig.toml names is a devDependency, and Bun installs a missing
+# scanner through the same production-filtered install, which omits it and
+# aborts. Seed it from the build stage's full install instead. Remove this line,
+# and the `rm` at the end of this stage, if bunfig.toml stops naming a scanner.
 COPY --from=build /usr/src/app/node_modules/@socketsecurity/bun-security-scanner ./node_modules/@socketsecurity/bun-security-scanner
 
-# Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
-# that are not needed in the final production image.
-# `--omit=peer` drops the framework's optional peer tiers (test runner, service
-# SDKs, parsers) that Bun would otherwise auto-install. Anything this server
-# actually imports is in its own `dependencies` — @duckdb/node-api included — so
-# nothing needed at runtime is lost. The OTEL step below carries the same flag:
-# without it, that install re-resolves the graph and pulls every peer back in.
-#
-# @duckdb/node-bindings selects its prebuilt native binary through optional
-# dependencies. Both installs must use the target OS/CPU, never the builder's
-# defaults. Only the scanner seed comes from the build dependency tree.
-# OTEL peers remain opt-out and use the installed framework's declared ranges.
+# Docker names the target architecture `amd64`/`arm64`; Bun's `--cpu` takes
+# `x64`/`arm64`. Mapped once here, read by both installs below. `oven/bun`
+# publishes only these two architectures, so any other target fails here.
+ARG TARGETOS
+ARG TARGETARCH
 RUN case "$TARGETARCH" in \
       amd64) echo x64 ;; \
       arm64) echo arm64 ;; \
       *) echo "Unsupported TARGETARCH '$TARGETARCH': expected amd64 or arm64" >&2; exit 1 ;; \
     esac > .bun-cpu
 
+# Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
+# that are not needed in the final production image.
+# `--omit=peer` drops the framework's optional peer tiers (test runner, service
+# SDKs, parsers) that Bun would otherwise auto-install. Anything this server
+# actually imports belongs in its own `dependencies`, so nothing needed at
+# runtime is lost.
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --production --omit=peer --frozen-lockfile --ignore-scripts \
       --os="$TARGETOS" --cpu="$(cat .bun-cpu)"
 
-# Read every OTel peer range from the installed framework.
+# Conditionally install OpenTelemetry optional peer dependencies (Tier 3).
+# Installed by default. Omit them for a leaner image at build time
+# with: docker build --build-arg OTEL_ENABLED=false
+# The script reads the list and each range from the installed framework's
+# `peerDependencies` and passes the target flags on to its `bun install`.
 COPY scripts/install-otel.ts ./scripts/
 ARG OTEL_ENABLED=true
 RUN --mount=type=cache,target=/root/.bun/install/cache \
@@ -81,23 +98,32 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
       bun scripts/install-otel.ts --os="$TARGETOS" --cpu="$(cat .bun-cpu)"; \
     fi
 
-# Debian uses glibc; discard musl-only optional native bindings after installs.
+# `--os`/`--cpu` have no libc counterpart, so a native dependency published in
+# glibc and musl variants (DuckDB's bindings, for one) installs both. The
+# runtime image is Debian (glibc) and never loads the musl copy; the script
+# deletes every package whose own `libc` admits only musl. It follows every
+# install, since a later `bun install` restores what it removes. A server on a
+# musl (Alpine) runtime image drops these two lines.
 COPY scripts/prune-musl-packages.ts ./scripts/
 RUN bun scripts/prune-musl-packages.ts
 
-# The scanner seed is needed only while installing dependencies.
+# The seeded scanner served only the installs above; keep it out of the image.
 RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
+
 
 # ==============================================================================
 # Production Stage
 #
-# The slim target-platform runtime receives only production dependencies and
-# compiled JavaScript. No Bun process runs under emulation during this stage.
+# This stage creates a minimal, optimized, and secure image for running the
+# application. It uses a slim base image and only includes production
+# dependencies and build artifacts. Its only Bun invocations are HEALTHCHECK
+# and CMD, which run on the real target at container start.
 # ==============================================================================
 FROM oven/bun:1.4.4-slim AS production
 
 WORKDIR /usr/src/app
 
+# Set the environment to production for performance.
 ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
@@ -108,11 +134,14 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/chembl-mcp-server"
 
+# The manifest comes from the build context: the deps stage's copy was rewritten
+# by the OTel install, and the runtime reads only its name, version, and type.
 COPY package.json ./
 COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/skills ./skills
 
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.

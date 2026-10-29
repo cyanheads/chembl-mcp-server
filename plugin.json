@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "chembl-mcp-server",
+  "version": "0.4.1",
+  "description": "Link compounds to protein targets, rank bioactivity (IC50/Ki/EC50), and look up drug mechanisms and indications over ChEMBL via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/chembl-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/chembl-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "chembl",
+    "drug-discovery",
+    "bioactivity",
+    "cheminformatics",
+    "compounds",
+    "protein-targets",
+    "medicinal-chemistry",
+    "ai-agent"
+  ]
+}
