@@ -2,9 +2,9 @@
 
 **Server:** chembl-mcp-server
 **Version:** 0.4.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -29,6 +29,8 @@ ChEMBL drug-discovery data over the EBI REST API (`https://www.ebi.ac.uk/chembl/
 | `chembl_dataframe_drop` | Drop a staged table early. Opt-in behind `CHEMBL_DATAFRAME_DROP_ENABLED`; wrapped in `disabledTool()` when off, so it carries the enable hint in the manifest while staying absent from `tools/list` |
 
 **Resources** (`src/mcp-server/resources/definitions/`): `chembl://molecule/{chemblId}` and `chembl://target/{chemblId}` — injectable-context mirrors of the per-record fetch.
+
+**Published skill** (`skills/chembl-guide/`: `SKILL.md` + `references/sql-recipes.md`): gates and workflows for the `chembl_*` tools: pinning a protein to its single-protein target, ranking leads without mixing mutants, salts, or repeat measurements, reading selectivity with the inactive results, and checking assay provenance and approval status. `createApp({ skills: 'skills' })` serves it over MCP as `skill://chembl-guide/SKILL.md` plus the `skill://{+path}` template; the same tree reaches plugin installs, the npm package (`files`), the Docker image, and the `.mcpb` bundle. A gate or identifier claim in it is checked against live tool behavior before it ships (`field-test`).
 
 **Service** (`src/services/chembl/chembl-service.ts`): the single upstream client. Builds Django-style filtered `.json` URLs, walks a bioactivity view by offset on a total order (`-pchembl_value` then `activity_id`, or `activity_id` alone for the null-potency view — never `page_meta.next`), asks every activity page for only the fields `normalizeActivity` reads (`only=` from `ACTIVITY_FIELDS`, derived from a field set that `satisfies` ties to `RawActivity` both ways, with a test that the list equals the keys `normalizeActivity` reads — ChEMBL drops an unknown name silently, so a new field goes in the type, the set, and the normalizer or the typecheck or test fails), coerces string numerics → `number | null` at the boundary (absent → `null`, never `0` — the scientific-fidelity rule), flattens nested upstream structures into the flat domain types in `types.ts`. Every fetch routes through `fetchJson`, which wraps the framework HTTP utility in `withRetry` under the call's one deadline (`CallDeadline`), started at each public method's entry or passed in by a caller chaining methods: 45 s (`CALL_DEADLINE_MS`) by default, or `CHEMBL_SPILL_DEADLINE_MS` (default 45 s) for a canvas-on `chembl_get_bioactivities` call without a cursor. At the defaults every request of a call — chained, concurrent, or retried — settles before an MCP client's 60 s timeout. The bioactivity spill walks its pages concurrently, in offset order, through one service-wide `createPacer({ maxConcurrent })`, so one spill whose pages hang can hold every slot until each attempt's timeout or its deadline, and a concurrent spill waits behind it (an accepted limitation, `docs/design.md` § Known Limitations).
 
@@ -185,6 +187,7 @@ await createApp({
   sessionMode: 'stateless',                                // no ctx.requestInput surface
   tools,
   resources: [chemblMoleculeResource, chemblTargetResource],
+  skills: 'skills',                                        // serves the root skills/ tree (chembl-guide) over MCP
   setup(core) {
     initChemblService(getServerConfig());                  // parse here, so a bad value reaches the banner
     setCanvas(core.canvas);
@@ -192,7 +195,7 @@ await createApp({
 });
 ```
 
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Here it carries the canonical cross-server chains (UniProt → `chembl_search_targets` → `chembl_get_bioactivities`), the ranking trap (`pchembl_value` is comparable only within one `standard_type`), the coverage trap (measurements without a `pchembl_value` sit in the `null_potency` view), the salt trap (a drug's measurements split across its alternate forms), and the ChEMBL CC BY-SA attribution — instead of repeating that context across tool descriptions.
+`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Here it carries the canonical cross-server chains (UniProt → `chembl_search_targets` → `chembl_get_bioactivities`), the ranking trap (`pchembl_value` is comparable only within one `standard_type`), the coverage trap (measurements without a `pchembl_value` sit in the `null_potency` view), the salt trap (a drug's measurements split across its alternate forms), and the ChEMBL CC BY-SA attribution — instead of repeating that context across tool descriptions. `skills: 'skills'` opts the root `skills/` tree into MCP delivery; the folder is read once at startup, and a missing or unreadable one fails startup with a `ConfigurationError`.
 
 ### Session posture and shutdown
 
@@ -286,6 +289,11 @@ src/
     resources/definitions/
       chembl-molecule.resource.ts       # chembl://molecule/{chemblId}
       chembl-target.resource.ts         # chembl://target/{chemblId}
+skills/
+  chembl-guide/                         # Published agent skill: SKILL.md + references/sql-recipes.md
+framework-skills/                       # Development skills for the agent working on this repo
+plugin.json                             # Agent Plugins 1.0.0 manifest (Codex, Cursor, Copilot, VS Code, Kiro)
+mcp.json                                # Its stdio server entry
 tests/                                  # Vitest — services/, tools/, resources/, mcp-server/ (no prompts)
 ```
 
@@ -306,9 +314,18 @@ No `prompts/` directory — this server defines no prompts.
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, and this server ships `.claude-plugin/` and `.codex-plugin/`, so that name would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Two skill trees live at the project root, written for different readers:
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
+| Tree | For | Written by |
+|:-----|:----|:-----------|
+| `framework-skills/` | The agent developing this server — framework skills (`metadata.audience: external`) plus any development-time skills of the server's own | the `maintenance` sync (framework skills); you (your own) |
+| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates. Holds one skill, `chembl-guide` | You, deliberately, with the `add-skill` skill |
+
+Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Their directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, and this server ships `.claude-plugin/` and `.codex-plugin/`, so that name would hand them to every agent that installs it.
+
+`skills/chembl-guide/` reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package (`files`) and the Docker image, and reaches MCP clients because `src/index.ts` opts in with `createApp({ skills: 'skills' })`. `lint:packaging` validates the tree.
+
+**Agent skill directory:** Copy `framework-skills/` into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
 Available skills:
 
@@ -320,6 +337,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a skill the server publishes in root `skills/` for the agents that use it — when one earns its place, structure, validation, delivery |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -367,12 +385,13 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run audit:fix` | `bun audit fix` — upgrade vulnerable packages to the lowest safe version within existing ranges (`--dry-run` previews, `--latest` rewrites ranges). First response when `devcheck` flags a transitive advisory; then `bun update <name>`, then `bun dedupe` |
 | `bun run audit:refresh` | Delete `bun.lock` and reinstall. Last resort after `audit:fix`, `bun update <name>`, and `bun dedupe` — re-resolves every ranged dep (the framework pin included) and rewrites the lockfile as `lockfileVersion: 2` |
 | `bun run lint:mcp` | Run the MCP definition linter standalone (rule catalog: `api-linter` skill) |
-| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity (run by devcheck) |
+| `bun run lint:packaging` | Packaging surface checks — `server.json`/`manifest.json` env-var parity, `.mcpbignore` coverage, plugin manifests, the published `skills/` tree (run by devcheck) |
 | `bun run list-skills` | Print the skill registry |
 | `bun run tree` | Generate directory structure doc |
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run test:coverage` | Run tests with Istanbul coverage (`vitest run --coverage`) |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
@@ -385,7 +404,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. This server uses DataCanvas, so it ships a portable bundle without the DuckDB native. `@duckdb/node-api` is a direct dependency, not an optional peer, but with its native binding stripped the canvas cannot start: under `CANVAS_PROVIDER_TYPE=duckdb` every `chembl_get_bioactivities` call whose view spills fails with `-32008` (`Install "@duckdb/node-api"…`) while inline fits and cursor pages still answer, and no canvas is ever staged for the `chembl_dataframe_*` tools to read. The bundle therefore runs canvas-off: `manifest.json` fixes `CANVAS_PROVIDER_TYPE` to `"none"` in `mcp_config.env`, overriding the server's `duckdb` default, and leaves the canvas-only options out of `user_config`: `CANVAS_PROVIDER_TYPE` itself, `CHEMBL_DATAFRAME_DROP_ENABLED` (it only registers a tool that needs a canvas), `CHEMBL_MAX_SPILL_ROWS` (it bounds only what a canvas stages), and `CHEMBL_MAX_CONCURRENT_PAGES` and `CHEMBL_SPILL_DEADLINE_MS` (they shape only the spill walk). Both plugin manifests offer them: they install through `npx`, which brings the native binding with `@duckdb/node-api`. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose: it holds `chembl-guide`. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (compiled `*.node` addons stay); and build-only package files (the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, config bases, and `better-sqlite3`'s C sources). The cleaner carries a local port of cyanheads/mcp-ts-core#794 (`AGENT_DOC_ENTRY`, mirrored in `scripts/lint-packaging.ts`): it matches agent-doc directories only at an installed package's root, so the MCP SDK's own runtime under `dist/ext/skills/` survives cleaning. This server uses DataCanvas, so it ships a portable bundle without the DuckDB native. `@duckdb/node-api` is a direct dependency, not an optional peer, but with its native binding stripped the canvas cannot start: under `CANVAS_PROVIDER_TYPE=duckdb` every `chembl_get_bioactivities` call whose view spills fails with `-32008` (`Install "@duckdb/node-api"…`) while inline fits and cursor pages still answer, and no canvas is ever staged for the `chembl_dataframe_*` tools to read. The bundle therefore runs canvas-off: `manifest.json` fixes `CANVAS_PROVIDER_TYPE` to `"none"` in `mcp_config.env`, overriding the server's `duckdb` default, and leaves the canvas-only options out of `user_config`: `CANVAS_PROVIDER_TYPE` itself, `CHEMBL_DATAFRAME_DROP_ENABLED` (it only registers a tool that needs a canvas), `CHEMBL_MAX_SPILL_ROWS` (it bounds only what a canvas stages), and `CHEMBL_MAX_CONCURRENT_PAGES` and `CHEMBL_SPILL_DEADLINE_MS` (they shape only the spill walk). Both plugin manifests offer them: they install through `npx`, which brings the native binding with `@duckdb/node-api`. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding a user-settable env var touches four files:** `server.json` (registry discovery, `environmentVariables[]` — the source of each option's description), `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`, unless the option needs the canvas), `.claude-plugin/plugin.json` (`userConfig` + `"KEY": "${user_config.KEY}"` in `env`), and `.codex-plugin/mcp.json` (`env_vars`). Each option keys on its env var name; `manifest.json` and `.claude-plugin/plugin.json` give it the same `title` and its `server.json` `description`, and `.codex-plugin/mcp.json` lists the name in `env_vars`. `lint:packaging` (run by `devcheck`) checks `manifest.json` against `server.json` — every `${user_config.…}` reference in `mcp_config.env` names a stdio env var `server.json` lists, every required one there reaches `mcp_config.env`, every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else but its own path placeholders — `"${X}"` reaches the server as that literal string), and an optional string option carries `"default": ""`. It checks the plugin manifests for identity, version, non-empty descriptions, `""` env values, and undeclared `${user_config.…}` references, but not their option lists, so keep those lists and their wording in step with `server.json` by hand.
 
@@ -452,7 +471,10 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
+- [ ] `plugin.json` + `mcp.json` (Agent Plugins 1.0.0 — read by Codex, Cursor, GitHub Copilot, VS Code, Kiro) populated — `plugin.json` `name` = the unscoped repo name (lowercase `a-z`, `0-9`, `-`, `.` only); `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords` from `package.json`; no other top-level field, `extensions` included. `mcp.json` holds one `"type": "stdio"` entry keyed by the unscoped name, `npx -y <full package name>`, and the same fixed `env` as `.codex-plugin/mcp.json`. Neither file carries a user-supplied variable (no `""`, no `${…}` besides `${PLUGIN_ROOT}`/`${PLUGIN_DATA}`): variables reach Codex through `.codex-plugin/mcp.json` `env_vars`, which works only while `.codex-plugin/plugin.json` keeps `"mcpServers": "./.codex-plugin/mcp.json"`
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset
 - [ ] `.claude-plugin/plugin.json` populated — `name`, `version`, `description`, `author`, `repository`, `license`, `keywords` from `package.json`; inline `mcpServers` entry keyed by the unscoped repo name. Every user-supplied variable is declared under `userConfig` (`type`, `title`, `description`; `sensitive: true` for keys and tokens; `required: true` or `default: ""`) and referenced from `env` as `"KEY": "${user_config.<option>}"` — the same options as `manifest.json`'s `user_config`, plus the canvas options the bundle leaves out (§ Bundling). Never write `"KEY": ""` into `env`
+- [ ] Any new root dev path has a root-anchored line in `.mcpbignore`; `bun run bundle` and `lint:packaging` pass
+- [ ] If the server's published skill in root `skills/` changes: `lint:packaging` passes, and `field-test` verified every gate and identifier claim in it against live tool behavior
 - [ ] `npm run devcheck` passes

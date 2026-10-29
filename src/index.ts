@@ -6,8 +6,9 @@
  * CANVAS_PROVIDER_TYPE to duckdb once `.env` is loaded, so a `.env` value still
  * wins over the default.
  * Declares the stateless HTTP session posture, registers the tool/resource
- * surface, and carries the cross-server chain guidance + CC BY-SA attribution
- * as server-level instructions. chembl_dataframe_drop is gated behind
+ * surface, serves the root `skills/` tree over MCP, and carries the
+ * cross-server chain guidance + CC BY-SA attribution as server-level
+ * instructions. chembl_dataframe_drop is gated behind
  * CHEMBL_DATAFRAME_DROP_ENABLED via disabledTool().
  * @module index
  */
@@ -73,6 +74,7 @@ await createApp({
     "Drug-discovery data over ChEMBL (EBI) — the curated link between compounds, protein targets, and measured bioactivity (IC50/Ki/EC50), plus drug mechanisms and indications. Canonical chains: (1) a UniProt accession from the uniprot/protein server → chembl_search_targets → chembl_get_bioactivities for the most potent leads on a target, or with molecule_chembl_id supplied alongside target_chembl_id to narrow to how potently one compound hits that one target; (2) chembl_search_molecules → chembl_get_drug_info for a drug's mechanism and indications; (3) a molecule's standard_inchi_key → the pubchem server for richer chemistry, an approved drug (max_phase 4) → the openfda server for the FDA label and adverse events. Ranking trap: pchembl_value is comparable only within one standard_type — set the standard_type filter (mixing IC50 and Ki is a scientific error). Coverage trap: many measurements have no derivable pchembl_value and are absent from the default potency-ranked view — chembl_get_bioactivities returns them only under potency_view: \"null_potency\", which stages its own canvas table alongside the ranked one. Salt trap: a drug's measurements are split across its salts and other alternate forms, and a salt often ranks first in chembl_search_molecules — every molecule row names its family parent_chembl_id, chembl_get_bioactivities reads the whole family under include_alternate_forms: true, and chembl_get_drug_info always reports the family's mechanisms and indications. A popular target carries tens of thousands of measurements; chembl_get_bioactivities spills the selected view to a DataCanvas table (call chembl_dataframe_describe for its columns, then chembl_dataframe_query to SQL them; unavailable only where the server sets CANVAS_PROVIDER_TYPE=none), bounded by a row cap (CHEMBL_MAX_SPILL_ROWS) and a time budget (CHEMBL_SPILL_DEADLINE_MS) — read truncated: true as a bounded slice, not the complete view, with truncated_by naming the bound. Pass that canvas_id back and each later non-cursor call re-stages the view's table with its own rows, inline fits included. Data from ChEMBL, licensed CC BY-SA 3.0 — attribute ChEMBL (https://www.ebi.ac.uk/chembl/) in downstream use.",
   tools,
   resources: [chemblMoleculeResource, chemblTargetResource],
+  skills: 'skills',
   setup(core) {
     initChemblService(getServerConfig());
     setCanvas(core.canvas);

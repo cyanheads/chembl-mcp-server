@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/chembl-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/chembl-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/chembl-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -52,6 +52,12 @@ Drug-discovery data from ChEMBL (EBI): the curated link between compounds, prote
 | `chembl://target/{chemblId}` | A target record by ChEMBL target ID — preferred name, type, organism, and component UniProt accessions + gene symbols. |
 
 All resource data is also reachable via the tools, so tool-only MCP clients lose nothing. There are no prompts — the canonical workflows are short tool chains an agent composes directly, and the cross-server chain guidance ships as server-level `instructions` instead.
+
+### Skills
+
+| Skill | Description |
+|:---|:---|
+| `chembl-guide` | Gates and workflows for the `chembl_*` tools: pinning a protein to its single-protein target, ranking leads without mixing mutants or salts, reading selectivity with the inactive results, and checking assay provenance and approval status. Served as `skill://chembl-guide/SKILL.md`; also ships in plugin installs, the `.mcpb` bundle, the npm package, and the Docker image. |
 
 ## Capability reference
 
@@ -357,7 +363,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 
 | Directory | Purpose |
 |:---|:---|
-| `src/index.ts` | `createApp()` entry point — registers tools/resources and inits the ChEMBL service + the DataCanvas, which it defaults to DuckDB. |
+| `src/index.ts` | `createApp()` entry point — registers tools/resources, serves `skills/`, and inits the ChEMBL service + the DataCanvas, which it defaults to DuckDB. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/input-normalization.ts` | Input-edge parsing shared by the tools and resources — ChEMBL IDs, molecule references, `assay_type`, uppercase codes, the `limit` clamp. |
 | `src/mcp-server/markdown-text.ts` | The escape every upstream string passes through in `format()`, so `content[]` reads back the field exactly. |
@@ -365,6 +371,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/mcp-server/resources/definitions` | Resource definitions (`*.resource.ts`). Molecule and target record mirrors. |
 | `src/services/chembl` | The single ChEMBL upstream client — URL builder, pagination, numeric coercion, nested-structure flattening, activity page stream. |
 | `src/services/canvas-accessor.ts` | Module-level holder for the optional `DataCanvas` wired in `createApp({ setup })`. |
+| `skills/` | Agent skills the server publishes (`chembl-guide`). |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide
