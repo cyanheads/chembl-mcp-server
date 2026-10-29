@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-28
+
+Publishes the chembl-guide Agent Skill over MCP, corrects the max_phase scale in tool descriptions, and moves to @cyanheads/mcp-ts-core 0.13.18.
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-10-24
 
 chembl_get_drug_info and chembl_get_bioactivities read a drug's whole salt-form family, ID and code inputs are normalized or refused before any request, and ChEMBL text renders inert in content[]. The DataCanvas is on by default.

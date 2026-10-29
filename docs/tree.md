@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-10-24 11:17:13
+Generated on: 2026-10-29 04:19:56
 
 ```text
 chembl-mcp-server/
@@ -28,6 +28,7 @@ chembl-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -40,6 +41,8 @@ chembl-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -137,6 +140,11 @@ chembl-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── chembl-guide/
+│       ├── references/
+│       │   └── sql-recipes.md
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -172,6 +180,8 @@ chembl-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   │   └── chembl-resources.test.ts
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── chembl-coercion.test.ts
 │   │   ├── chembl-service-fetch.test.ts
@@ -211,7 +221,9 @@ chembl-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
