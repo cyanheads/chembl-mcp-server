@@ -53,6 +53,12 @@ interface FakeTable {
 
 /** One canvas's tables, keyed by name. */
 interface FakeCanvasState {
+  /**
+   * Tables a `registerTable` call is still writing, by name. Every other read
+   * sees `tables` alone until the registration commits, as another DuckDB
+   * connection sees the previous table until the provider's transaction does.
+   */
+  pending: Map<string, FakeTable>;
   tables: Map<string, FakeTable>;
 }
 
@@ -119,7 +125,7 @@ class FakeDuckdbProvider implements IDataCanvasProvider {
   ) {}
 
   async initCanvas(canvasId: string): Promise<void> {
-    this.owner.canvases.set(canvasId, { tables: new Map() });
+    this.owner.canvases.set(canvasId, { tables: new Map(), pending: new Map() });
   }
 
   async destroyCanvas(canvasId: string): Promise<void> {
@@ -138,12 +144,14 @@ class FakeDuckdbProvider implements IDataCanvasProvider {
    * As in the DuckDB provider: the table name is gated, then the schema is
    * settled — the explicit one, or the framework's inference from the first 100
    * rows of a sync source (an async source without a schema, or an empty one,
-   * is refused) — and every column name gated, all before an existing table
-   * under the name is dropped. The empty table is then created before any
-   * further row is read, and rows are appended as the source yields them,
-   * checking the signal between rows, so a registration that fails part-way
-   * leaves a partial table behind the name — never the rows it held before. The
-   * appender writes the schema's columns alone, a missing value as null.
+   * is refused) — and every column name gated. Rows are then appended as the
+   * source yields them, checking the signal between rows, into a table only
+   * this call sees (`pending`), which replaces the one under the name when the
+   * source ends. The provider runs the drop, create, and append in one
+   * transaction, so a registration that fails part-way leaves the previous
+   * table — or, on a first registration, no table — and every other read sees
+   * the previous table until it commits. The appender writes the schema's
+   * columns alone, a missing value as null.
    */
   async registerTable(
     canvasId: string,
@@ -179,17 +187,23 @@ class FakeDuckdbProvider implements IDataCanvasProvider {
     for (const col of columns) assertValidIdentifier(col.name, 'column');
 
     const stored: Record<string, unknown>[] = [];
-    state.tables.set(name, { columns, rows: stored });
-    options?.signal?.throwIfAborted();
-    const append = (row: Record<string, unknown>) => {
+    const table: FakeTable = { columns, rows: stored };
+    state.pending.set(name, table);
+    try {
       options?.signal?.throwIfAborted();
-      stored.push(Object.fromEntries(columns.map((col) => [col.name, row[col.name] ?? null])));
-    };
-    for (const row of sniffed) append(row);
-    if (sync) {
-      for (let next = sync.next(); !next.done; next = sync.next()) append(next.value);
-    } else {
-      for await (const row of rows as AsyncIterable<Record<string, unknown>>) append(row);
+      const append = (row: Record<string, unknown>) => {
+        options?.signal?.throwIfAborted();
+        stored.push(Object.fromEntries(columns.map((col) => [col.name, row[col.name] ?? null])));
+      };
+      for (const row of sniffed) append(row);
+      if (sync) {
+        for (let next = sync.next(); !next.done; next = sync.next()) append(next.value);
+      } else {
+        for await (const row of rows as AsyncIterable<Record<string, unknown>>) append(row);
+      }
+      state.tables.set(name, table);
+    } finally {
+      state.pending.delete(name);
     }
     return { tableName: name, rowCount: stored.length, columns: columns.map((col) => col.name) };
   }

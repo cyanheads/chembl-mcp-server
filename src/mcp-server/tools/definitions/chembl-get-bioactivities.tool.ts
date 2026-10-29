@@ -1011,8 +1011,8 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
      * stopping short of CHEMBL_MAX_SPILL_ROWS (#14) and ending at the contiguous
      * prefix it holds if the time budget ends it (#16). spillover's row type is
      * Record<string, unknown>; an Activity is structurally a string-keyed record, so
-     * the source is widened for the generic constraint. spillover never closes a
-     * source it stops reading early, so the walk is closed here, releasing any page
+     * the source is widened for the generic constraint. The walk is closed here on
+     * every outcome, an early stop or a failed spill included, releasing any page
      * still in flight.
      */
     let deadlineHit = false;

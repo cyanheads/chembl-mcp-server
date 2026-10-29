@@ -895,6 +895,12 @@ function tablesOn(fake: FakeDataCanvas, canvasId: string): Record<string, unknow
   return Object.fromEntries([...tables].map(([name, table]) => [name, table.rows]));
 }
 
+/** The rows each registration still in progress on `canvasId` has appended, by table name. */
+function pendingOn(fake: FakeDataCanvas, canvasId: string): Record<string, unknown[]> {
+  const pending = fake.canvases.get(canvasId)?.pending ?? new Map();
+  return Object.fromEntries([...pending].map(([name, table]) => [name, table.rows]));
+}
+
 describe('chembl_get_bioactivities — supplied canvas_id across failures (#28)', () => {
   it('keeps a supplied canvas and its tables when upstream fails before anything stages', async () => {
     const fake = new FakeDataCanvas();
@@ -994,20 +1000,23 @@ describe('chembl_get_bioactivities — supplied canvas_id across failures (#28)'
         }),
       ),
     ).catch((error: unknown) => error);
-    // Cancel once the spill has registered its partial rows on the canvas.
+    // Cancel once the spill's registration has appended its partial rows.
     await vi.waitFor(() => {
-      expect(Object.values(tablesOn(fake, canvasId)).some((rows) => rows.length === 100)).toBe(
+      expect(Object.values(pendingOn(fake, canvasId)).some((rows) => rows.length === 100)).toBe(
         true,
       );
     });
-    // Mid-registration, the view's earlier table is still there to read.
-    expect(tablesOn(fake, canvasId).bioactivities).toEqual(ranked);
+    // Mid-registration, the view's earlier tables are all there is to read.
+    expect(tablesOn(fake, canvasId)).toEqual({
+      bioactivities: ranked,
+      bioactivities_null_potency: unranked,
+    });
     controller.abort();
 
     expect(await call).toMatchObject({ name: 'AbortError' });
     expect(drop).not.toHaveBeenCalled();
     expect(fake.canvases.has(canvasId)).toBe(true);
-    // The partial staging table is gone, and both earlier tables are intact.
+    // The partial staging rows were never committed, and both earlier tables are intact.
     expect(tablesOn(fake, canvasId)).toEqual({
       bioactivities: ranked,
       bioactivities_null_potency: unranked,
