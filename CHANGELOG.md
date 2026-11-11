@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-11 · ⚠️ Breaking
+
+Adds chembl_get_documents for a row's source paper, makes chembl_get_assay a batch lookup (breaking), reads withdrawal flags and warnings in chembl_get_drug_info, applies max_phase_min to structure searches, and moves to mcp-ts-core 0.13.22 on DuckDB 2.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-28
 
 Publishes the chembl-guide Agent Skill over MCP, corrects the max_phase scale in tool descriptions, and moves to @cyanheads/mcp-ts-core 0.13.18.

@@ -1,6 +1,6 @@
 # chembl-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 04:19:56
+Generated on: 2026-11-11 16:47:04
 
 ```text
 chembl-mcp-server/
@@ -29,6 +29,7 @@ chembl-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -162,6 +163,7 @@ chembl-mcp-server/
 │   │   │       ├── chembl-dataframe-query.tool.ts
 │   │   │       ├── chembl-get-assay.tool.ts
 │   │   │       ├── chembl-get-bioactivities.tool.ts
+│   │   │       ├── chembl-get-documents.tool.ts
 │   │   │       ├── chembl-get-drug-info.tool.ts
 │   │   │       ├── chembl-search-molecules.tool.ts
 │   │   │       └── chembl-search-targets.tool.ts
@@ -193,6 +195,7 @@ chembl-mcp-server/
 │   │   ├── chembl-dataframe-tools.test.ts
 │   │   ├── chembl-get-assay.tool.test.ts
 │   │   ├── chembl-get-bioactivities.tool.test.ts
+│   │   ├── chembl-get-documents.tool.test.ts
 │   │   ├── chembl-get-drug-info.tool.test.ts
 │   │   ├── chembl-input-gates.test.ts
 │   │   ├── chembl-query-types.test.ts
