@@ -2,21 +2,28 @@
  * @fileoverview Tests for the shared input-edge normalization (#41): the ChEMBL
  * ID and assay_type patterns the input schemas advertise (every raw form a
  * handler maps is admitted, nothing else is, and each stays linear on
- * adversarial input), the molecule-reference and assay_type mappings, and the
- * limit clamp.
+ * adversarial input), the ChEMBL ID list input's element parse and bounds (#55),
+ * the optional canvas_id's blank and minted forms (#45), the molecule-reference
+ * and assay_type mappings, and the limit clamp.
  * @module tests/mcp-server/input-normalization
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { describe, expect, it } from 'vitest';
 import {
   ASSAY_TYPE_INPUT,
   assayTypeInput,
   CHEMBL_ID_INPUT,
   chemblIdInput,
+  chemblIdListInput,
   clampLimit,
+  ID_LIST_CEILING,
+  isChemblId,
   normalizeMoleculeRef,
+  OPTIONAL_CANVAS_ID_INPUT,
   OPTIONAL_CHEMBL_ID_INPUT,
+  optionalCanvasIdInput,
   optionalChemblIdInput,
   optionalCodeInput,
 } from '@/mcp-server/input-normalization.js';
@@ -65,6 +72,36 @@ describe('ChEMBL ID patterns', () => {
     expect(optional.parse({}).id).toBeUndefined();
     expect(required.safeParse('imatinib').error?.issues[0]?.message).toBe('Must be a ChEMBL ID.');
     expect(optional.safeParse({ id: 'imatinib' }).success).toBe(false);
+  });
+});
+
+describe('chemblIdListInput', () => {
+  const list = chemblIdListInput('Must be a ChEMBL ID.');
+
+  it('parses every element to the canonical ID, keeping order and repeats for the tool to dedup', () => {
+    expect(list.parse(CHEMBL_ID_FORMS)).toEqual(Array(CHEMBL_ID_FORMS.length).fill('CHEMBL941'));
+    expect(list.parse(['chembl2', 'CHEMBL1', ' chembl2 '])).toEqual([
+      'CHEMBL2',
+      'CHEMBL1',
+      'CHEMBL2',
+    ]);
+  });
+
+  it('refuses an element that is not a ChEMBL ID by its path and message', () => {
+    for (const raw of [...NOT_CHEMBL_IDS, '', '   ']) {
+      const parsed = list.safeParse(['CHEMBL1', raw]);
+      expect(parsed.success, raw).toBe(false);
+      expect(parsed.error?.issues[0]).toMatchObject({ path: [1], message: 'Must be a ChEMBL ID.' });
+    }
+  });
+
+  it('takes 1 to ID_LIST_CEILING elements, refusing an empty list and absurd input', () => {
+    expect(ID_LIST_CEILING).toBe(1000);
+    const many = (n: number) => Array.from({ length: n }, (_, i) => `CHEMBL${i + 1}`);
+    expect(list.safeParse([]).success).toBe(false);
+    expect(list.safeParse(many(1)).success).toBe(true);
+    expect(list.safeParse(many(ID_LIST_CEILING)).success).toBe(true);
+    expect(list.safeParse(many(ID_LIST_CEILING + 1)).success).toBe(false);
   });
 });
 
@@ -122,6 +159,59 @@ describe('optionalCodeInput', () => {
   });
 });
 
+describe('optional canvas_id (#45)', () => {
+  /** Every character class CanvasIdSchema mints from, ten characters each. */
+  const MINTED = [
+    'Ab3_xY-9Qz',
+    'ABCDEFGHIJ',
+    'abcdefghij',
+    '0123456789',
+    '__________',
+    '----------',
+  ];
+  const NOT_CANVAS_IDS = [
+    'x',
+    'Ab3_xY-9Qz0',
+    'Ab3_xY 9Qz',
+    'not-a-canvas',
+    ' Ab3_xY-9Qz ',
+    'Ab3_xY-9Q\n',
+    'bioactivities',
+  ];
+  const BLANKS = ['', '   ', '\t', '\r\n'];
+  const schema = z.object({ canvas_id: optionalCanvasIdInput });
+
+  it('admits a blank or exactly what CanvasIdSchema admits, at the pattern and the parse', () => {
+    for (const id of MINTED) {
+      expect(CanvasIdSchema.safeParse(id).success, id).toBe(true);
+      expect(OPTIONAL_CANVAS_ID_INPUT.test(id), id).toBe(true);
+      expect(schema.parse({ canvas_id: id })).toEqual({ canvas_id: id });
+    }
+    for (const raw of NOT_CANVAS_IDS) {
+      expect(CanvasIdSchema.safeParse(raw).success, raw).toBe(false);
+      expect(OPTIONAL_CANVAS_ID_INPUT.test(raw), raw).toBe(false);
+      expect(schema.safeParse({ canvas_id: raw }).success, raw).toBe(false);
+    }
+    for (const blank of BLANKS) expect(OPTIONAL_CANVAS_ID_INPUT.test(blank)).toBe(true);
+  });
+
+  it('reads a blank as unset, so no blank reaches the canvas', () => {
+    for (const blank of BLANKS) {
+      expect(schema.parse({ canvas_id: blank }).canvas_id).toBeUndefined();
+    }
+    expect(schema.parse({}).canvas_id).toBeUndefined();
+  });
+
+  it("refuses a malformed id with CanvasIdSchema's own message", () => {
+    const expected = CanvasIdSchema.safeParse('x').error?.issues[0]?.message;
+    expect(expected).toContain('Expected a canvas ID');
+    expect(schema.safeParse({ canvas_id: 'not-a-canvas' }).error?.issues[0]).toMatchObject({
+      path: ['canvas_id'],
+      message: expected,
+    });
+  });
+});
+
 describe('normalizeMoleculeRef', () => {
   it.each([
     ['chembl941', 'CHEMBL941'],
@@ -162,7 +252,7 @@ describe('clampLimit', () => {
  */
 describe('pattern timing', () => {
   /** Thread CPU milliseconds for one `pattern.test(input)`, best of three. */
-  function cpuMs(pattern: RegExp, input: string): number {
+  function cpuMs(pattern: Pick<RegExp, 'test'>, input: string): number {
     let best = Number.POSITIVE_INFINITY;
     for (let run = 0; run < 3; run++) {
       const before = process.threadCpuUsage();
@@ -186,6 +276,21 @@ describe('pattern timing', () => {
     ['padding around a code', (n) => `${' '.repeat(n / 2)}binding${' '.repeat(n / 2)}x`],
     ['line breaks after a code', (n) => `b${'\r\n'.repeat(n / 2)}x`],
   ];
+  /** Runs that reach the optional canvas_id pattern's blank `\s*` and its fixed-width ID. */
+  const CANVAS_ID_SHAPES: Array<[string, (n: number) => string]> = [
+    ['breaks throughout before a stray character', (n) => `${'  \r\n'.repeat(n / 4)}x`],
+    ['breaks throughout', (n) => '  \r\n'.repeat(n / 4)],
+    ['one long line ending in a break', (n) => `${'§1 x'.repeat(n / 4)}\ny`],
+    ['an ID-character run past ten', (n) => 'A'.repeat(n)],
+    ['padding around an ID', (n) => `${' '.repeat(n / 2)}Ab3_xY-9Qz${' '.repeat(n / 2)}x`],
+  ];
+  /** Whole `chembl_search_targets` queries, which it uppercases and checks for a target ID (#48). */
+  const QUERY_SHAPES: Array<[string, (n: number) => string]> = [
+    ['a digit run after CHEMBL that fails at its end', (n) => `chembl${'1'.repeat(n)}x`],
+    ['one long line ending in a break', (n) => `${'§1 x'.repeat(n / 4)}\ny`],
+    ['breaks throughout', (n) => `a${'  \r\n'.repeat(n / 4)}b`],
+  ];
+  const TARGET_QUERY_ROUTE = { test: (query: string) => isChemblId(query.toUpperCase()) };
   const ROWS = [
     ...ID_SHAPES.map(([shape, build]) => ['CHEMBL_ID_INPUT', shape, CHEMBL_ID_INPUT, build]),
     ...ID_SHAPES.map(([shape, build]) => [
@@ -200,7 +305,19 @@ describe('pattern timing', () => {
       ASSAY_TYPE_INPUT,
       build,
     ]),
-  ] as Array<[string, string, RegExp, (n: number) => string]>;
+    ...CANVAS_ID_SHAPES.map(([shape, build]) => [
+      'OPTIONAL_CANVAS_ID_INPUT',
+      shape,
+      OPTIONAL_CANVAS_ID_INPUT,
+      build,
+    ]),
+    ...QUERY_SHAPES.map(([shape, build]) => [
+      'isChemblId(query.toUpperCase())',
+      shape,
+      TARGET_QUERY_ROUTE,
+      build,
+    ]),
+  ] as Array<[string, string, Pick<RegExp, 'test'>, (n: number) => string]>;
 
   it.each(ROWS)('%s stays linear over %s', (_name, _shape, pattern, build) => {
     const times: number[] = [];

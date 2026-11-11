@@ -10,8 +10,10 @@
  * molecule fetch still tanks the call), its parent-family reads (#36: lists keyed by the parent the
  * anchor record resolves, indications deduplicated across forms), the
  * mechanism/indication page envelope and its truncation signal,
- * getAssay/getTarget normalization, empty-page handling, and the one upstream time
- * budget every request of a call draws on.
+ * getAssays' one `__in` request per call (#55: distinct IDs to the cap, request
+ * order, misses, deferred IDs) and getDocuments' wiring onto it with its PubMed ID
+ * as a digit string (#54), getTarget normalization, empty-page handling,
+ * and the one upstream time budget every request of a call draws on.
  * @module tests/services/chembl-service-fetch
  */
 
@@ -19,9 +21,14 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  ASSAY_FIELDS,
   CALL_DEADLINE_MS,
   CallDeadline,
   ChemblService,
+  DOCUMENT_FIELDS,
+  ID_LOOKUP_CAP,
+  normalizeAssay,
+  normalizeDocument,
   sanitizeUpstreamError,
 } from '@/services/chembl/chembl-service.js';
 import {
@@ -30,10 +37,18 @@ import {
   SUBSTRUCTURE_UNPARSEABLE_BODY,
 } from '../_chembl-error-bodies.js';
 import {
+  ALMITRINE,
+  DICYCLOMINE,
+  type DrugFamilyCorpus,
   drugFamilyUpstream,
+  GEFITINIB,
   IMATINIB,
+  INOTERSEN,
   PRODRUG,
   RAPACURONIUM,
+  ROFECOXIB,
+  ROSIGLITAZONE,
+  TETRABENAZINE,
 } from '../_fake-drug-family-upstream.js';
 
 const config = {
@@ -163,6 +178,73 @@ describe('ChemblService — request URL construction', () => {
     expect(calledUrl()).toContain('/substructure/c1ccccc1O.json');
   });
 
+  it.each([4, 0])(
+    'sends maxPhaseMin %i on a similarity search as max_phase__gte',
+    async (maxPhaseMin) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({ molecules: [], page_meta: { total_count: 0 } }),
+      );
+      await new ChemblService(config).structureSearch(
+        {
+          structure: 'CCO',
+          searchType: 'similarity',
+          similarityThreshold: 80,
+          limit: 5,
+          maxPhaseMin,
+        },
+        ctx(),
+      );
+      const url = new URL(calledUrl());
+      expect(url.pathname).toBe('/chembl/api/data/similarity/CCO/80.json');
+      expect(url.searchParams.get('max_phase__gte')).toBe(String(maxPhaseMin));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('sends a filtered substructure page and an unfiltered one-row count on the same route', async () => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonResponse({ molecules: [], page_meta: { total_count: 0 } })),
+    );
+    await new ChemblService(config).structureSearch(
+      {
+        structure: 'c1ccncc1',
+        searchType: 'substructure',
+        similarityThreshold: 70,
+        limit: 5,
+        offset: 10,
+        maxPhaseMin: 4,
+      },
+      ctx(),
+    );
+    const urls = [calledUrl(0), calledUrl(1)].map((u) => new URL(u));
+    const page = urls.find((u) => u.searchParams.has('max_phase__gte'));
+    const count = urls.find((u) => !u.searchParams.has('max_phase__gte'));
+    expect(page?.pathname).toBe('/chembl/api/data/substructure/c1ccncc1.json');
+    expect(Object.fromEntries(page?.searchParams ?? [])).toEqual({
+      limit: '5',
+      offset: '10',
+      max_phase__gte: '4',
+    });
+    expect(count?.pathname).toBe(page?.pathname);
+    expect(Object.fromEntries(count?.searchParams ?? [])).toEqual({
+      limit: '1',
+      offset: '0',
+      only: 'molecule_chembl_id',
+    });
+  });
+
+  it('never sends maxPhaseMin to the exact by-resource route', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ molecule_chembl_id: 'CHEMBL25', max_phase: '4.0' }),
+    );
+    await new ChemblService(config).structureSearch(
+      { structure: 'CCO', searchType: 'exact', similarityThreshold: 70, limit: 5, maxPhaseMin: 4 },
+      ctx(),
+    );
+    expect(new URL(calledUrl()).searchParams.has('max_phase__gte')).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('surfaces the row when an exact search returns a single molecule object (no list envelope)', async () => {
     // The exact endpoint (/molecule/{smiles}) returns a single molecule object on
     // a hit — top-level molecule_chembl_id, no `molecules` key. Without the
@@ -208,6 +290,22 @@ describe('ChemblService — request URL construction', () => {
     expect(url).toContain('organism__iexact=Homo+sapiens');
   });
 
+  it('sends a target ID as target_chembl_id on the /target list route, beside the other filters (#48)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ targets: [], page_meta: { total_count: 0 } }));
+    await new ChemblService(config).searchTargets(
+      { targetChemblId: 'CHEMBL203', targetType: 'SINGLE PROTEIN', limit: 25 },
+      ctx(),
+    );
+    const url = new URL(calledUrl());
+    expect(url.pathname).toBe('/chembl/api/data/target.json');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      limit: '25',
+      offset: '0',
+      target_chembl_id: 'CHEMBL203',
+      target_type: 'SINGLE PROTEIN',
+    });
+  });
+
   it('ranks the activity stream by -pchembl_value and forwards the potency filter', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ activities: [], page_meta: { total_count: 0, next: null } }),
@@ -242,14 +340,32 @@ describe('ChemblService — upstream error sanitization (no leak)', () => {
     expect((thrown as McpError).code).toBe(JsonRpcErrorCode.NotFound);
   });
 
-  it('sanitizes a 404 from getAssay to a clean NotFound carrying no internals', async () => {
-    fetchMock.mockResolvedValue(
-      new Response(SECRET_BODY, { status: 404, statusText: 'Not Found' }),
-    );
-    const thrown = await captureThrow(() => new ChemblService(config).getAssay('CHEMBL000', ctx()));
-    expectLeakFree(thrown);
-    expect((thrown as McpError).code).toBe(JsonRpcErrorCode.NotFound);
-  });
+  /**
+   * A list lookup answers an ID it holds no record of with HTTP 200 and the ID
+   * dropped, so a 404 on the request itself is the endpoint missing, never a miss:
+   * it surfaces as an outage naming the operation, not a not_found pointing the
+   * caller at the IDs.
+   */
+  it.each([
+    ['getAssays', 'ChemblService.getAssays'],
+    ['getDocuments', 'ChemblService.getDocuments'],
+  ] as const)(
+    'sanitizes a 404 from %s to a clean upstream_unavailable carrying no internals',
+    async (method, operation) => {
+      fetchMock.mockResolvedValue(
+        new Response(SECRET_BODY, { status: 404, statusText: 'Not Found' }),
+      );
+      const thrown = await captureThrow(() =>
+        new ChemblService(config)[method](['CHEMBL000'], ctx()),
+      );
+      expectLeakFree(thrown);
+      expect((thrown as McpError).code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect((thrown as McpError).data).toMatchObject({
+        reason: 'upstream_unavailable',
+        recovery: { hint: expect.stringContaining(operation) },
+      });
+    },
+  );
 
   it('sanitizes a 400 from searchTargets to a clean ValidationError carrying no internals', async () => {
     fetchMock.mockResolvedValue(
@@ -447,7 +563,7 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
   it('fails a never-answering request as upstream_timeout inside the budget, short of the retry budget', async () => {
     const starts = recordStarts(neverAnswers);
     const { error, elapsedMs } = await settleUnderFakeTimers(
-      service().getAssay('CHEMBL674637', ctx()),
+      service().getAssays(['CHEMBL674637'], ctx()),
     );
     expectLeakFree(error);
     expect(error).toMatchObject({
@@ -486,9 +602,9 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
 
   it("holds getDrugInfo's lists to the budget the anchor left, starting none past it", async () => {
     /**
-     * The anchor answers after 4 s and both lists then stall: they share what is
-     * left of the one 10 s budget instead of starting a budget of their own, and
-     * settle as failed lists, not a failed call.
+     * The anchor answers after 4 s and the three lists and the family read then
+     * stall: they share what is left of the one 10 s budget instead of starting a
+     * budget of their own, and settle as failed lists, not a failed call.
      */
     const family = drugFamilyUpstream(IMATINIB);
     const starts = recordStarts((input, init) =>
@@ -505,15 +621,24 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
       mechanisms_failure: 'timeout',
       indications_status: 'failed',
       indications_failure: 'timeout',
+      warnings_status: 'failed',
+      warnings_failure: 'timeout',
+      family_read: { status: 'failed', failure: 'timeout' },
+      // The anchor's own record answers for the family it could not read.
+      max_phase: 4,
+      first_approval: 2001,
+      withdrawn: null,
+      black_box_warning: null,
     });
     const paths = fetchMock.mock.calls.map((_call, i) => new URL(calledUrl(i)).pathname);
     expect(paths).toEqual([
       '/chembl/api/data/molecule/CHEMBL941.json',
       '/chembl/api/data/mechanism.json',
       '/chembl/api/data/drug_indication.json',
+      '/chembl/api/data/drug_warning.json',
+      '/chembl/api/data/molecule.json',
     ]);
-    expect(starts[1]).toBeGreaterThanOrEqual(4_000);
-    expect(starts[2]).toBeGreaterThanOrEqual(4_000);
+    for (const start of starts.slice(1)) expect(start).toBeGreaterThanOrEqual(4_000);
     expect(Math.max(...starts)).toBeLessThan(10_000);
     expect(elapsedMs).toBeGreaterThanOrEqual(10_000);
     expect(elapsedMs).toBeLessThan(11_000);
@@ -521,9 +646,9 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
 
   it("surfaces a caller abort during getDrugInfo's lists as the abort, never as failed lists", async () => {
     /**
-     * The anchor answers and both lists then stall until the caller cancels. The
-     * lists settle through Promise.allSettled, which would otherwise read the
-     * cancellation as two failed lists in a successful result.
+     * The anchor answers and the lists and the family read then stall until the
+     * caller cancels. They settle through Promise.allSettled, which would otherwise
+     * read the cancellation as failed lists in a successful result.
      */
     const family = drugFamilyUpstream(IMATINIB);
     fetchMock.mockImplementation((input: string, init?: RequestInit) =>
@@ -543,6 +668,8 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
       '/chembl/api/data/molecule/CHEMBL941.json',
       '/chembl/api/data/mechanism.json',
       '/chembl/api/data/drug_indication.json',
+      '/chembl/api/data/drug_warning.json',
+      '/chembl/api/data/molecule.json',
     ]);
     expect(elapsedMs).toBeLessThan(3_000);
   });
@@ -550,7 +677,7 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
   it('sends nothing on a budget a chained call already spent', async () => {
     const deadline = new CallDeadline(10_000);
     await vi.advanceTimersByTimeAsync(10_000);
-    const thrown = await captureThrow(() => service().getAssay('CHEMBL674637', ctx(), deadline));
+    const thrown = await captureThrow(() => service().getAssays(['CHEMBL674637'], ctx(), deadline));
     expectLeakFree(thrown);
     expect(thrown).toMatchObject({
       code: JsonRpcErrorCode.Timeout,
@@ -619,12 +746,12 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
       .mockResolvedValueOnce(jsonResponse({ error_message: 'boom' }, 500))
       .mockResolvedValueOnce(jsonResponse({ error_message: 'boom' }, 503))
       .mockResolvedValueOnce(
-        jsonResponse({ assay_chembl_id: 'CHEMBL674637', confidence_score: '9' }),
+        jsonResponse({ assays: [{ assay_chembl_id: 'CHEMBL674637', confidence_score: '9' }] }),
       );
     const { value, elapsedMs } = await settleUnderFakeTimers(
-      service().getAssay('CHEMBL674637', ctx()),
+      service().getAssays(['CHEMBL674637'], ctx()),
     );
-    expect(value).toMatchObject({ assay_chembl_id: 'CHEMBL674637', confidence_score: 9 });
+    expect(value?.items[0]).toMatchObject({ assay_chembl_id: 'CHEMBL674637', confidence_score: 9 });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(elapsedMs).toBeLessThan(60_000);
   });
@@ -640,7 +767,7 @@ describe('ChemblService — one upstream time budget per call (#33)', () => {
       setTimeout(() => controller.abort(), abortAtMs);
       const cancelled = createMockContext({ tenantId: 'default', signal: controller.signal });
       const { error, elapsedMs } = await settleUnderFakeTimers(
-        service().getAssay('CHEMBL674637', cancelled),
+        service().getAssays(['CHEMBL674637'], cancelled),
       );
       expect(error).toMatchObject({ name: 'AbortError' });
       expect(error).not.toBeInstanceOf(McpError);
@@ -838,10 +965,14 @@ describe('ChemblService — a query SMILES ChEMBL cannot parse (#43)', () => {
   });
 });
 
-describe('ChemblService.getAssay — normalization', () => {
+/** An `/assay.json` list page holding `assays`, in the order given. */
+const assayList = (...assays: Record<string, unknown>[]) =>
+  jsonResponse({ assays, page_meta: { total_count: assays.length, next: null } });
+
+describe('ChemblService.getAssays — normalization', () => {
   it('decodes confidence_score and assay_type, coercing a string score to number', async () => {
     fetchMock.mockResolvedValueOnce(
-      jsonResponse({
+      assayList({
         assay_chembl_id: 'CHEMBL674637',
         description: 'Inhibition of EGFR',
         assay_type: 'B',
@@ -852,8 +983,8 @@ describe('ChemblService.getAssay — normalization', () => {
         confidence_description: 'Direct single protein target assigned',
       }),
     );
-    const assay = await new ChemblService(config).getAssay('CHEMBL674637', ctx());
-    expect(assay).toMatchObject({
+    const { items } = await new ChemblService(config).getAssays(['CHEMBL674637'], ctx());
+    expect(items[0]).toMatchObject({
       assay_chembl_id: 'CHEMBL674637',
       assay_type: 'B',
       assay_type_description: 'Binding',
@@ -863,13 +994,394 @@ describe('ChemblService.getAssay — normalization', () => {
     });
   });
 
+  it('carries the format, cell type, tissue, strain, and source document ChEMBL records', async () => {
+    fetchMock.mockResolvedValueOnce(
+      assayList({
+        assay_chembl_id: 'CHEMBL3877213',
+        bao_label: 'cell-based format',
+        assay_cell_type: 'A-431',
+        assay_tissue: ' Skin ',
+        assay_strain: 'BALB/c',
+        document_chembl_id: 'CHEMBL3875233',
+      }),
+    );
+    const { items } = await new ChemblService(config).getAssays(['CHEMBL3877213'], ctx());
+    expect(items[0]).toMatchObject({
+      bao_label: 'cell-based format',
+      assay_cell_type: 'A-431',
+      assay_tissue: 'Skin',
+      assay_strain: 'BALB/c',
+      document_chembl_id: 'CHEMBL3875233',
+    });
+  });
+
   it('preserves absence as null on a sparse assay (no confidence, no target)', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ assay_chembl_id: 'CHEMBL1' }));
-    const assay = await new ChemblService(config).getAssay('CHEMBL1', ctx());
-    expect(assay.confidence_score).toBeNull();
-    expect(assay.target_chembl_id).toBeNull();
-    expect(assay.assay_type).toBeNull();
-    expect(assay.description).toBeNull();
+    fetchMock.mockResolvedValueOnce(assayList({ assay_chembl_id: 'CHEMBL1' }));
+    const {
+      items: [assay],
+    } = await new ChemblService(config).getAssays(['CHEMBL1'], ctx());
+    expect(assay?.confidence_score).toBeNull();
+    expect(assay?.target_chembl_id).toBeNull();
+    expect(assay?.assay_type).toBeNull();
+    expect(assay?.description).toBeNull();
+    expect(assay).toMatchObject({
+      bao_label: null,
+      assay_cell_type: null,
+      assay_tissue: null,
+      assay_strain: null,
+      document_chembl_id: null,
+    });
+  });
+
+  it.each([0, '0'])(
+    'keeps a confidence_score of %j (no target assigned yet) as 0, never null',
+    async (score) => {
+      fetchMock.mockResolvedValueOnce(
+        assayList({
+          assay_chembl_id: 'CHEMBL615118',
+          confidence_score: score,
+          confidence_description: 'Default value - Target unknown or has yet to be assigned',
+        }),
+      );
+      const { items } = await new ChemblService(config).getAssays(['CHEMBL615118'], ctx());
+      expect(items[0]?.confidence_score).toBe(0);
+    },
+  );
+
+  it('lists exactly the raw fields normalizeAssay reads, the ID among them', () => {
+    const read = new Set<string>();
+    /** A raw record that records every key read from it, answering each with `value`. */
+    const recording = (value: unknown) =>
+      new Proxy({} as Parameters<typeof normalizeAssay>[0], {
+        get(_target, key) {
+          if (typeof key === 'string') read.add(key);
+          return value;
+        },
+      });
+    normalizeAssay(recording(undefined));
+    normalizeAssay(recording('9'));
+    expect([...read].sort()).toEqual([...ASSAY_FIELDS].sort());
+    expect([...ASSAY_FIELDS].sort()).toEqual([
+      'assay_cell_type',
+      'assay_chembl_id',
+      'assay_organism',
+      'assay_strain',
+      'assay_tissue',
+      'assay_type',
+      'assay_type_description',
+      'bao_label',
+      'confidence_description',
+      'confidence_score',
+      'description',
+      'document_chembl_id',
+      'target_chembl_id',
+    ]);
+  });
+});
+
+describe('ChemblService.getAssays — one __in request per call (#55)', () => {
+  /** `n` distinct assay IDs, CHEMBL1000 upward. */
+  const ids = (n: number) => Array.from({ length: n }, (_, i) => `CHEMBL${1000 + i}`);
+
+  it('asks /assay.json for the IDs through one __in filter, limit set to their count, selecting only the fields it reads', async () => {
+    fetchMock.mockResolvedValueOnce(assayList());
+    await new ChemblService(config).getAssays(['CHEMBL2', 'CHEMBL1'], ctx());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = new URL(calledUrl());
+    expect(url.pathname).toBe('/chembl/api/data/assay.json');
+    expect([...url.searchParams.keys()].sort()).toEqual(['assay_chembl_id__in', 'limit', 'only']);
+    expect(url.searchParams.get('assay_chembl_id__in')).toBe('CHEMBL2,CHEMBL1');
+    // ChEMBL's default page is 20 rows, so without a limit the rest would read as misses.
+    expect(url.searchParams.get('limit')).toBe('2');
+    expect(url.searchParams.get('only')).toBe(ASSAY_FIELDS.join(','));
+  });
+
+  it('returns records in request order and the IDs ChEMBL answered nothing for, in request order', async () => {
+    // ChEMBL answers in its own order and drops an ID it holds no assay for.
+    fetchMock.mockResolvedValueOnce(
+      assayList({ assay_chembl_id: 'CHEMBL1' }, { assay_chembl_id: 'CHEMBL4' }),
+    );
+    const lookup = await new ChemblService(config).getAssays(
+      ['CHEMBL4', 'CHEMBL25', 'CHEMBL1', 'CHEMBL3'],
+      ctx(),
+    );
+    expect(lookup.items.map((assay) => assay.assay_chembl_id)).toEqual(['CHEMBL4', 'CHEMBL1']);
+    expect(lookup.notFoundIds).toEqual(['CHEMBL25', 'CHEMBL3']);
+    expect(lookup.deferredIds).toEqual([]);
+  });
+
+  it('answers every ID missing as a lookup with no records, never an error', async () => {
+    fetchMock.mockResolvedValueOnce(assayList());
+    const lookup = await new ChemblService(config).getAssays(['CHEMBL25'], ctx());
+    expect(lookup).toEqual({ items: [], notFoundIds: ['CHEMBL25'], deferredIds: [] });
+  });
+
+  it('sends each ID once, keeping its first position', async () => {
+    fetchMock.mockResolvedValueOnce(
+      assayList({ assay_chembl_id: 'CHEMBL1' }, { assay_chembl_id: 'CHEMBL2' }),
+    );
+    const lookup = await new ChemblService(config).getAssays(
+      ['CHEMBL2', 'CHEMBL1', 'CHEMBL2', 'CHEMBL1'],
+      ctx(),
+    );
+    const url = new URL(calledUrl());
+    expect(url.searchParams.get('assay_chembl_id__in')).toBe('CHEMBL2,CHEMBL1');
+    expect(url.searchParams.get('limit')).toBe('2');
+    expect(lookup.items.map((assay) => assay.assay_chembl_id)).toEqual(['CHEMBL2', 'CHEMBL1']);
+  });
+
+  it(`looks up the first ${ID_LOOKUP_CAP} distinct IDs and defers the rest in request order, each once`, async () => {
+    expect(ID_LOOKUP_CAP).toBe(100);
+    const sent = [...ids(103), 'CHEMBL1000', 'CHEMBL1101'];
+    fetchMock.mockResolvedValueOnce(assayList(...ids(100).map((id) => ({ assay_chembl_id: id }))));
+    const lookup = await new ChemblService(config).getAssays(sent, ctx());
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = new URL(calledUrl());
+    expect(url.searchParams.get('assay_chembl_id__in')?.split(',')).toEqual(ids(100));
+    expect(url.searchParams.get('limit')).toBe('100');
+    expect(lookup.items).toHaveLength(100);
+    expect(lookup.notFoundIds).toEqual([]);
+    expect(lookup.deferredIds).toEqual(['CHEMBL1100', 'CHEMBL1101', 'CHEMBL1102']);
+  });
+
+  it('keeps the request line of 100 real-length IDs well under the 4,094 bytes EBI accepts', async () => {
+    fetchMock.mockResolvedValueOnce(assayList());
+    const longest = Array.from({ length: 100 }, (_, i) => `CHEMBL${10_000_000 + i}`);
+    await new ChemblService(config).getAssays(longest, ctx());
+    const { pathname, search } = new URL(calledUrl());
+    // `GET <path+query> HTTP/1.1` is the request line EBI measures.
+    expect(`GET ${pathname}${search} HTTP/1.1`.length).toBeLessThan(2_500);
+  });
+});
+
+/** A `/document.json` list page holding `documents`, in the order given. */
+const documentList = (...documents: Record<string, unknown>[]) =>
+  jsonResponse({ documents, page_meta: { total_count: documents.length, next: null } });
+
+/** Every document field null but the ID. */
+const bareDocument = (id: string) => ({
+  document_chembl_id: id,
+  doc_type: null,
+  title: null,
+  authors: null,
+  journal: null,
+  year: null,
+  volume: null,
+  issue: null,
+  first_page: null,
+  last_page: null,
+  pubmed_id: null,
+  doi: null,
+  patent_id: null,
+});
+
+describe('ChemblService.getDocuments — normalization (#54)', () => {
+  it('carries a publication as ChEMBL records it, its integer PubMed ID as a digit string', async () => {
+    // CHEMBL1240298 as ChEMBL records it (live, 2026-11-11): pubmed_id and year are integers.
+    fetchMock.mockResolvedValueOnce(
+      documentList({
+        document_chembl_id: 'CHEMBL1240298',
+        doc_type: 'PUBLICATION',
+        title: 'Features of selective kinase inhibitors.',
+        authors: 'Knight ZA, Shokat KM.',
+        journal: 'Chem Biol',
+        year: 2005,
+        volume: '12',
+        issue: '6',
+        first_page: '621',
+        last_page: '637',
+        pubmed_id: 15975507,
+        doi: '10.1016/j.chembiol.2005.04.011',
+        patent_id: null,
+      }),
+    );
+    const { items } = await new ChemblService(config).getDocuments(['CHEMBL1240298'], ctx());
+    expect(items).toEqual([
+      {
+        document_chembl_id: 'CHEMBL1240298',
+        doc_type: 'PUBLICATION',
+        title: 'Features of selective kinase inhibitors.',
+        authors: 'Knight ZA, Shokat KM.',
+        journal: 'Chem Biol',
+        year: 2005,
+        volume: '12',
+        issue: '6',
+        first_page: '621',
+        last_page: '637',
+        pubmed_id: '15975507',
+        doi: '10.1016/j.chembiol.2005.04.011',
+        patent_id: null,
+      },
+    ]);
+  });
+
+  it('keeps what a patent and a bare record lack null, a blank string included', async () => {
+    fetchMock.mockResolvedValueOnce(
+      documentList(
+        {
+          document_chembl_id: 'CHEMBL3638439',
+          doc_type: 'PATENT',
+          title: 'Compounds Useful as Inhibitors of ATR Kinase',
+          authors: null,
+          journal: null,
+          year: 2013,
+          volume: null,
+          issue: null,
+          first_page: null,
+          last_page: null,
+          pubmed_id: null,
+          doi: null,
+          patent_id: 'US-20130089624-A1',
+        },
+        { document_chembl_id: 'CHEMBL1', authors: '', title: '  ', doi: '' },
+      ),
+    );
+    const { items } = await new ChemblService(config).getDocuments(
+      ['CHEMBL3638439', 'CHEMBL1'],
+      ctx(),
+    );
+    expect(items).toEqual([
+      {
+        ...bareDocument('CHEMBL3638439'),
+        doc_type: 'PATENT',
+        title: 'Compounds Useful as Inhibitors of ATR Kinase',
+        year: 2013,
+        patent_id: 'US-20130089624-A1',
+      },
+      bareDocument('CHEMBL1'),
+    ]);
+  });
+
+  it.each<[unknown, string | null]>([
+    [25383627, '25383627'],
+    ['25383627', '25383627'],
+    [' 25383627 ', '25383627'],
+    [0, null],
+    [-25383627, null],
+    [25383627.5, null],
+    ['PMID25383627', null],
+    ['', null],
+    [null, null],
+    [undefined, null],
+  ])('reads a pubmed_id of %j as %j', (raw, expected) => {
+    expect(
+      normalizeDocument({ document_chembl_id: 'CHEMBL1', pubmed_id: raw as never }).pubmed_id,
+    ).toBe(expected);
+  });
+
+  it('lists exactly the raw fields normalizeDocument reads, the ID among them', () => {
+    const read = new Set<string>();
+    /** A raw record that records every key read from it, answering each with `value`. */
+    const recording = (value: unknown) =>
+      new Proxy({} as Parameters<typeof normalizeDocument>[0], {
+        get(_target, key) {
+          if (typeof key === 'string') read.add(key);
+          return value;
+        },
+      });
+    normalizeDocument(recording(undefined));
+    normalizeDocument(recording('1'));
+    expect([...read].sort()).toEqual([...DOCUMENT_FIELDS].sort());
+    expect([...DOCUMENT_FIELDS].sort()).toEqual([
+      'authors',
+      'doc_type',
+      'document_chembl_id',
+      'doi',
+      'first_page',
+      'issue',
+      'journal',
+      'last_page',
+      'patent_id',
+      'pubmed_id',
+      'title',
+      'volume',
+      'year',
+    ]);
+  });
+});
+
+describe('ChemblService.getDocuments — the shared __in lookup (#54)', () => {
+  it('asks /document.json through one __in filter, limit set to the count, selecting only the fields it reads, and answers in request order', async () => {
+    // ChEMBL answers in its own order and drops an ID it holds no document for, an assay ID included.
+    fetchMock.mockResolvedValueOnce(
+      documentList(
+        { document_chembl_id: 'CHEMBL1201862' },
+        { document_chembl_id: 'CHEMBL3351701' },
+      ),
+    );
+    const lookup = await new ChemblService(config).getDocuments(
+      ['CHEMBL3351701', 'CHEMBL1908684', 'CHEMBL1201862'],
+      ctx(),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = new URL(calledUrl());
+    expect(url.pathname).toBe('/chembl/api/data/document.json');
+    expect([...url.searchParams.keys()].sort()).toEqual([
+      'document_chembl_id__in',
+      'limit',
+      'only',
+    ]);
+    expect(url.searchParams.get('document_chembl_id__in')).toBe(
+      'CHEMBL3351701,CHEMBL1908684,CHEMBL1201862',
+    );
+    expect(url.searchParams.get('limit')).toBe('3');
+    expect(url.searchParams.get('only')).toBe(DOCUMENT_FIELDS.join(','));
+    expect(lookup.items.map((doc) => doc.document_chembl_id)).toEqual([
+      'CHEMBL3351701',
+      'CHEMBL1201862',
+    ]);
+    expect(lookup.notFoundIds).toEqual(['CHEMBL1908684']);
+    expect(lookup.deferredIds).toEqual([]);
+  });
+
+  it('keeps the request line of 100 real-length IDs well under the 4,094 bytes EBI accepts', async () => {
+    fetchMock.mockResolvedValueOnce(documentList());
+    const longest = Array.from({ length: 100 }, (_, i) => `CHEMBL${10_000_000 + i}`);
+    await new ChemblService(config).getDocuments(longest, ctx());
+    const { pathname, search } = new URL(calledUrl());
+    // `GET <path+query> HTTP/1.1` is the request line EBI measures.
+    expect(`GET ${pathname}${search} HTTP/1.1`.length).toBeLessThan(2_500);
+  });
+
+  describe('on the call deadline', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('names getDocuments in the outage hint once the retries are spent', async () => {
+      fetchMock.mockImplementation(() =>
+        Promise.resolve(jsonResponse({ error_message: 'boom' }, 503)),
+      );
+      const { error } = await settleUnderFakeTimers(
+        new ChemblService(config).getDocuments(['CHEMBL3351701'], ctx()),
+      );
+      expectLeakFree(error);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'upstream_unavailable',
+          recovery: { hint: expect.stringContaining('(ChemblService.getDocuments)') },
+        },
+      });
+    });
+
+    it('sends nothing on a budget a chained call already spent', async () => {
+      const deadline = new CallDeadline(10_000);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const thrown = await captureThrow(() =>
+        new ChemblService(config).getDocuments(['CHEMBL3351701'], ctx(), deadline),
+      );
+      expectLeakFree(thrown);
+      expect(thrown).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        data: { reason: 'upstream_timeout' },
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -1103,15 +1615,15 @@ describe('ChemblService.getDrugInfo — per-list state (#6, #11)', () => {
   });
 });
 
-describe('ChemblService.getDrugInfo — the parent family (#36)', () => {
-  /** The query params of every request to `resource` (e.g. "mechanism.json"), in call order. */
-  function paramsOf(resource: string): URLSearchParams[] {
-    return fetchMock.mock.calls
-      .map((_call, i) => new URL(calledUrl(i)))
-      .filter((url) => url.pathname.endsWith(`/${resource}`))
-      .map((url) => url.searchParams);
-  }
+/** The query params of every request to `resource` (e.g. "mechanism.json"), in call order. */
+function paramsOf(resource: string): URLSearchParams[] {
+  return fetchMock.mock.calls
+    .map((_call, i) => new URL(calledUrl(i)))
+    .filter((url) => url.pathname.endsWith(`/${resource}`))
+    .map((url) => url.searchParams);
+}
 
+describe('ChemblService.getDrugInfo — the parent family (#36)', () => {
   /**
    * The CML indication imatinib's fixture records on both forms, at phases 2 and 4:
    * the family's highest phase on the row, and each form's own phase in `forms`.
@@ -1390,7 +1902,8 @@ describe('ChemblService.getDrugInfo — the parent family (#36)', () => {
     });
     await new ChemblService(config).getDrugInfo('CHEMBL941', ctx());
     expect(order.slice(0, 2)).toEqual(['start CHEMBL941.json', 'end CHEMBL941.json']);
-    expect(order).toHaveLength(6);
+    // The anchor, then the three lists and the family read.
+    expect(order).toHaveLength(10);
   });
 
   it('throws the anchor failure and requests neither list', async () => {
@@ -1405,6 +1918,375 @@ describe('ChemblService.getDrugInfo — the parent family (#36)', () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(new URL(calledUrl()).pathname).toBe('/chembl/api/data/molecule/CHEMBL000.json');
+  });
+});
+
+describe("ChemblService.getDrugInfo — the family's withdrawal, boxed warning, and warnings (#51)", () => {
+  /** `corpus` as the fake serves it, except that ChEMBL rejects every request to `resource`. */
+  function rejecting(corpus: DrugFamilyCorpus, resource: string) {
+    const upstream = drugFamilyUpstream(corpus);
+    return (input: string) =>
+      new URL(input).pathname.endsWith(`/${resource}`)
+        ? Promise.resolve(jsonResponse({ error_message: 'boom' }, REJECTED_STATUS))
+        : upstream(input);
+  }
+
+  /** The two warnings rofecoxib's fixture files on its parent, as the service returns them. */
+  const ROFECOXIB_WARNINGS = [
+    {
+      warning_type: 'Black Box Warning',
+      warning_class: null,
+      warning_country: 'United States',
+      warning_year: null,
+      warning_description: null,
+      efo_id: null,
+      efo_term: null,
+      molecule_chembl_id: 'CHEMBL122',
+      refs: [],
+    },
+    {
+      warning_type: 'Withdrawn',
+      warning_class: 'cardiotoxicity',
+      warning_country: 'Worldwide',
+      warning_year: 2004,
+      warning_description: 'Risk for heart attack and stroke',
+      efo_id: 'EFO:0000712',
+      efo_term: 'stroke',
+      molecule_chembl_id: 'CHEMBL122',
+      refs: [
+        {
+          ref_type: 'USGPO',
+          ref_id: 'FR-2014-07-02/pdf/2014-15371.pdf',
+          ref_url: 'https://www.govinfo.gov/content/pkg/FR-2014-07-02/pdf/2014-15371.pdf',
+        },
+        {
+          ref_type: 'WHO',
+          ref_id: 'WHO/PSM/QSM/2005.2',
+          ref_url: 'https://apps.who.int/iris/handle/10665/66869',
+        },
+        {
+          ref_type: 'PubMed',
+          ref_id: '21574210',
+          ref_url: 'http://europepmc.org/abstract/MED/21574210',
+        },
+      ],
+    },
+  ];
+
+  it('reads both flags and every warning of a withdrawn drug, keeping max_phase 4', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ROFECOXIB));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL122', ctx());
+    expect(info).toMatchObject({
+      max_phase: 4,
+      first_approval: 1999,
+      withdrawn: true,
+      black_box_warning: true,
+      warnings_status: 'complete',
+      warnings_total_count: 2,
+      warnings_failure: null,
+      family_read: { status: 'complete', failure: null },
+    });
+    // Nulls stay null: the boxed warning records no class, year, description, or EFO term.
+    expect(info.warnings).toEqual(ROFECOXIB_WARNINGS);
+  });
+
+  it('reads a withdrawal filed on the parent when the salt queried carries no flag of its own', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(DICYCLOMINE));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL1200479', ctx());
+    expect(info).toMatchObject({
+      molecule_chembl_id: 'CHEMBL1200479',
+      parent_molecule_chembl_id: 'CHEMBL1123',
+      withdrawn: true,
+      black_box_warning: false,
+      warnings_status: 'complete',
+      warnings_total_count: 1,
+    });
+    expect(info.warnings).toEqual([
+      {
+        warning_type: 'Withdrawn',
+        warning_class: null,
+        warning_country: 'Norway',
+        warning_year: null,
+        warning_description: 'Serious adverse reactions in infants under six months',
+        efo_id: 'EFO:0009658',
+        efo_term: 'adverse effect',
+        molecule_chembl_id: 'CHEMBL1123',
+        refs: [],
+      },
+    ]);
+  });
+
+  it("reads a boxed warning filed on a salt when the parent is queried, keeping the parent's own approval year", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(INOTERSEN));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL4297770', ctx());
+    expect(info).toMatchObject({
+      parent_molecule_chembl_id: 'CHEMBL4297770',
+      withdrawn: false,
+      black_box_warning: true,
+      // The year is filed on the sodium salt alone; the parent's own record holds none.
+      first_approval: null,
+      max_phase: 4,
+    });
+    expect(info.warnings.map((w) => w.molecule_chembl_id)).toEqual(['CHEMBL4297537']);
+  });
+
+  it('answers a salt and its parent with the same flags and warnings, each row naming its form', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ROSIGLITAZONE));
+    const service = new ChemblService(config);
+    const salt = await service.getDrugInfo('CHEMBL843', ctx());
+    const parent = await service.getDrugInfo('CHEMBL121', ctx());
+    for (const info of [salt, parent]) {
+      expect(info).toMatchObject({ withdrawn: true, black_box_warning: true, max_phase: 4 });
+    }
+    expect(salt.warnings).toEqual(parent.warnings);
+    expect(parent.warnings.map((w) => [w.warning_type, w.molecule_chembl_id])).toEqual([
+      ['Black Box Warning', 'CHEMBL843'],
+      ['Withdrawn', 'CHEMBL121'],
+      ['Withdrawn', 'CHEMBL843'],
+    ]);
+  });
+
+  it('reports both flags false and an empty, complete warnings list for a drug with neither', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(GEFITINIB));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL939', ctx());
+    expect(info).toMatchObject({
+      withdrawn: false,
+      black_box_warning: false,
+      warnings: [],
+      warnings_status: 'complete',
+      warnings_total_count: 0,
+      warnings_failure: null,
+    });
+  });
+
+  /**
+   * ChEMBL files a deuterated analog under its protium parent, so a family fold of
+   * the phase or year would read an investigational analog as the parent's
+   * approved drug. The flags stay the family's.
+   */
+  it("keeps a deuterated analog's own phase and null approval year under an approved parent, folding the family's flags", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(TETRABENAZINE));
+    const analog = await new ChemblService(config).getDrugInfo('CHEMBL900020', ctx());
+    expect(analog).toMatchObject({
+      molecule_chembl_id: 'CHEMBL900020',
+      parent_molecule_chembl_id: 'CHEMBL117785',
+      max_phase: 2,
+      first_approval: null,
+      // The analog carries no flag of its own; its parent and sibling carry the boxed warning.
+      black_box_warning: true,
+      withdrawn: false,
+      family_read: { status: 'complete', failure: null },
+    });
+    expect(analog.warnings.map((w) => w.molecule_chembl_id)).toEqual([
+      'CHEMBL3137326',
+      'CHEMBL117785',
+    ]);
+  });
+
+  it('keeps an approved analog its own approval year, never the earlier year of its parent', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(TETRABENAZINE));
+    expect(await new ChemblService(config).getDrugInfo('CHEMBL3137326', ctx())).toMatchObject({
+      max_phase: 4,
+      first_approval: 2017,
+      black_box_warning: true,
+    });
+  });
+
+  it("reads a salt's own max_phase beside its family's withdrawal, never its parent's phase", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ALMITRINE));
+    const mesylate = await new ChemblService(config).getDrugInfo('CHEMBL3181957', ctx());
+    // The mesylate's own record says −1; its parent reached phase 4 and was withdrawn.
+    expect(mesylate).toMatchObject({ max_phase: -1, first_approval: null, withdrawn: true });
+    expect(mesylate.indications[0]?.max_phase_for_ind).toBe(4);
+  });
+
+  it("answers each form with its own phase and approval year, whatever the family's others record", async () => {
+    const forms = (id: string, max_phase: string | null, first_approval: number | null) => ({
+      molecule_chembl_id: id,
+      max_phase,
+      first_approval,
+      withdrawn_flag: false,
+      black_box_warning: 0,
+      molecule_hierarchy: { parent_chembl_id: 'CHEMBL900010' },
+    });
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({
+        molecules: {
+          CHEMBL900010: forms('CHEMBL900010', '2.0', 2001),
+          CHEMBL900011: forms('CHEMBL900011', '0.5', 1998),
+          CHEMBL900012: forms('CHEMBL900012', '-1.0', null),
+          CHEMBL900013: forms('CHEMBL900013', null, 2005),
+        },
+        mechanisms: [],
+        indications: [],
+      }),
+    );
+    const service = new ChemblService(config);
+    const own: Array<[string, number | null, number | null]> = [
+      ['CHEMBL900010', 2, 2001],
+      ['CHEMBL900011', 0.5, 1998],
+      ['CHEMBL900012', -1, null],
+      ['CHEMBL900013', null, 2005],
+    ];
+    for (const [id, max_phase, first_approval] of own) {
+      expect(await service.getDrugInfo(id, ctx())).toMatchObject({ max_phase, first_approval });
+    }
+  });
+
+  it('requests the family and its warnings once each, by the parent, naming only the fields read', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ROSIGLITAZONE));
+    await new ChemblService(config).getDrugInfo('CHEMBL843', ctx());
+    const [family, ...moreFamily] = paramsOf('molecule.json');
+    const [warnings, ...moreWarnings] = paramsOf('drug_warning.json');
+    expect(moreFamily).toEqual([]);
+    expect(moreWarnings).toEqual([]);
+    expect(family?.get('molecule_hierarchy__parent_chembl_id')).toBe('CHEMBL121');
+    expect(family?.get('limit')).toBe(String(config.maxPageSize));
+    expect(family?.get('only')?.split(',').sort()).toEqual(['black_box_warning', 'withdrawn_flag']);
+    expect(warnings?.get('parent_molecule_chembl_id')).toBe('CHEMBL121');
+    expect(warnings?.has('molecule_chembl_id')).toBe(false);
+    expect(warnings?.get('limit')).toBe(String(config.maxPageSize));
+    expect(warnings?.get('only')?.split(',').sort()).toEqual([
+      'efo_id',
+      'efo_term',
+      'molecule_chembl_id',
+      'warning_class',
+      'warning_country',
+      'warning_description',
+      'warning_refs',
+      'warning_type',
+      'warning_year',
+    ]);
+  });
+
+  it("falls back to the queried form's own record when the family read fails, leaving an unflagged result null", async () => {
+    const service = new ChemblService(config);
+
+    fetchMock.mockImplementation(rejecting(DICYCLOMINE, 'molecule.json'));
+    const salt = await service.getDrugInfo('CHEMBL1200479', ctx());
+    // The salt carries neither flag, but its family was never read: unknown, not false.
+    expect(salt).toMatchObject({
+      withdrawn: null,
+      black_box_warning: null,
+      max_phase: 4,
+      first_approval: 1950,
+      family_read: { status: 'failed', failure: 'upstream_error' },
+      // The warnings list is its own request, unaffected.
+      warnings_status: 'complete',
+      warnings_total_count: 1,
+    });
+
+    fetchMock.mockImplementation(rejecting(ALMITRINE, 'molecule.json'));
+    expect(await service.getDrugInfo('CHEMBL3181957', ctx())).toMatchObject({
+      max_phase: -1,
+      first_approval: null,
+      withdrawn: null,
+    });
+
+    // A flag the queried record carries holds whether or not the family was read.
+    fetchMock.mockImplementation(rejecting(ROFECOXIB, 'molecule.json'));
+    expect(await service.getDrugInfo('CHEMBL122', ctx())).toMatchObject({
+      withdrawn: true,
+      black_box_warning: true,
+      max_phase: 4,
+      first_approval: 1999,
+      family_read: { status: 'failed' },
+    });
+  });
+
+  it('reports a rejected warnings request as failed with an unknown count, failing neither the call nor the flags', async () => {
+    fetchMock.mockImplementation(rejecting(ROFECOXIB, 'drug_warning.json'));
+    const info = await new ChemblService(config).getDrugInfo('CHEMBL122', ctx());
+    expect(info).toMatchObject({
+      warnings: [],
+      warnings_status: 'failed',
+      warnings_total_count: null,
+      warnings_failure: 'upstream_error',
+      withdrawn: true,
+      black_box_warning: true,
+      family_read: { status: 'complete', failure: null },
+    });
+  });
+
+  it('reports a warnings list and a family read the page cap cut short, a flag no fetched form carries unknown', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ROFECOXIB));
+    const info = await new ChemblService({ ...config, maxPageSize: 1 }).getDrugInfo(
+      'CHEMBL122',
+      ctx(),
+    );
+    expect(info).toMatchObject({
+      warnings: [ROFECOXIB_WARNINGS[0]],
+      warnings_status: 'truncated',
+      warnings_total_count: 2,
+      family_read: { status: 'truncated', failure: null },
+      // The one form fetched (the parent) carries both flags.
+      withdrawn: true,
+      black_box_warning: true,
+    });
+
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    // One of imatinib's two forms fetched, neither flagged: the other could be.
+    expect(
+      await new ChemblService({ ...config, maxPageSize: 1 }).getDrugInfo('CHEMBL941', ctx()),
+    ).toMatchObject({
+      withdrawn: null,
+      black_box_warning: null,
+      family_read: { status: 'truncated' },
+    });
+  });
+
+  /**
+   * The page the family read returns need not hold the queried form: inotersen's
+   * page of one is its unflagged parent, while the sodium salt queried carries the
+   * boxed warning. The salt's own record still folds in.
+   */
+  it("keeps the queried form's own flag when the page-capped family read leaves it out", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(INOTERSEN));
+    const info = await new ChemblService({ ...config, maxPageSize: 1 }).getDrugInfo(
+      'CHEMBL4297537',
+      ctx(),
+    );
+    const familyParams = paramsOf('molecule.json')[0];
+    expect(familyParams?.get('molecule_hierarchy__parent_chembl_id')).toBe('CHEMBL4297770');
+    expect(familyParams?.get('limit')).toBe('1');
+    expect(info).toMatchObject({
+      black_box_warning: true,
+      withdrawn: null,
+      family_read: { status: 'truncated', failure: null },
+    });
+  });
+
+  it('reads a molecule with no recorded hierarchy as its whole family, a flag it records nothing for null', async () => {
+    fetchMock.mockImplementation(
+      drugFamilyUpstream({
+        ...RAPACURONIUM,
+        molecules: {
+          CHEMBL1201352: {
+            ...RAPACURONIUM.molecules.CHEMBL1201352,
+            withdrawn_flag: true,
+            black_box_warning: 0,
+          },
+        },
+      }),
+    );
+    const flagged = await new ChemblService(config).getDrugInfo('CHEMBL1201352', ctx());
+    expect(paramsOf('molecule.json')[0]?.get('molecule_hierarchy__parent_chembl_id')).toBe(
+      'CHEMBL1201352',
+    );
+    expect(flagged).toMatchObject({
+      withdrawn: true,
+      black_box_warning: false,
+      max_phase: 4,
+      first_approval: 1999,
+      family_read: { status: 'complete' },
+    });
+
+    // RAPACURONIUM's record carries neither flag field.
+    fetchMock.mockImplementation(drugFamilyUpstream(RAPACURONIUM));
+    expect(await new ChemblService(config).getDrugInfo('CHEMBL1201352', ctx())).toMatchObject({
+      withdrawn: null,
+      black_box_warning: null,
+    });
   });
 });
 

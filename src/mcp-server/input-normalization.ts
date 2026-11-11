@@ -1,7 +1,7 @@
 /**
  * @fileoverview Input-edge normalization shared by the tool and resource
- * definitions: ChEMBL IDs, molecule references, the assay_type code, upper-case
- * codes (UniProt accessions, target types), and the limit clamp. ChEMBL's
+ * definitions: ChEMBL IDs and ID lists, molecule references, the assay_type code, upper-case
+ * codes (UniProt accessions, target types), the optional canvas_id, and the limit clamp. ChEMBL's
  * by-resource lookups match a ChEMBL ID in any case, but its list filters match
  * exactly, so each value is brought to the form ChEMBL records before any request.
  * JSON Schema `pattern` takes no flags, so every pattern a schema advertises spells
@@ -11,6 +11,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 
 /** A ChEMBL ID in any case, padded with whitespace: what a required ID input admits. */
 export const CHEMBL_ID_INPUT = /^\s*[Cc][Hh][Ee][Mm][Bb][Ll]\d+\s*$/;
@@ -37,6 +38,23 @@ export function chemblIdInput(message: string) {
     (value) => (typeof value === 'string' ? value.trim().toUpperCase() : value),
     z.string().regex(CHEMBL_ID_INPUT, message),
   );
+}
+
+/**
+ * The most IDs an ID-list input takes: a ceiling against absurd input only. A
+ * tool serves its own per-call cap below it and names the IDs past the cap.
+ */
+export const ID_LIST_CEILING = 1000;
+
+/**
+ * A ChEMBL ID list input: 1 to {@link ID_LIST_CEILING} IDs, each parsed by
+ * {@link chemblIdInput}, in the order sent with repeats kept for the lookup to
+ * collapse. The list stays a plain `z.array()` so the framework still repairs a
+ * lone string or a JSON-stringified array into it; `message` is each element's
+ * rejection text.
+ */
+export function chemblIdListInput(message: string) {
+  return z.array(chemblIdInput(message)).min(1).max(ID_LIST_CEILING);
 }
 
 /** An optional ChEMBL ID input, parsed to the canonical ID; a blank reads as unset. */
@@ -116,6 +134,32 @@ export const assayTypeInput = z.preprocess((value) => {
     'Must be an assay type code — B (binding), F (functional), A (ADMET), T (toxicity), P (physicochemical), or U (unassigned) — or its name.',
   )
   .optional());
+
+/** A whitespace-only string to `undefined`; anything else passes to the schema as sent. */
+export function blankAsUnset(value: unknown): unknown {
+  return typeof value === 'string' && value.trim() === '' ? undefined : value;
+}
+
+/**
+ * The `canvas_id` shape the framework mints, as its CanvasIdSchema advertises it,
+ * and the message that schema refuses anything else with. The framework exports
+ * the schema alone, so both are read off it.
+ */
+const CANVAS_ID_PATTERN = z.toJSONSchema(CanvasIdSchema).pattern;
+const CANVAS_ID_MESSAGE = CanvasIdSchema.safeParse('').error?.issues[0]?.message;
+
+/** A blank, or a `canvas_id` exactly as {@link CanvasIdSchema} admits one: what an optional canvas_id input advertises. */
+export const OPTIONAL_CANVAS_ID_INPUT = new RegExp(`^\\s*$|${CANVAS_ID_PATTERN}`);
+
+/**
+ * An optional `canvas_id` input: a blank reads as unset, and any other value is
+ * checked as CanvasIdSchema checks it, with its message. A padded ID is refused, as
+ * on the inputs that require one.
+ */
+export const optionalCanvasIdInput = z.preprocess(
+  blankAsUnset,
+  z.string().regex(OPTIONAL_CANVAS_ID_INPUT, CANVAS_ID_MESSAGE).optional(),
+);
 
 /** The schema ceiling on every `limit` input: past a tool's own cap, a request clamps up to here. */
 export const LIMIT_CEILING = 10_000;

@@ -12,12 +12,22 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { Parser } from 'commonmark';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import { chemblGetDrugInfo } from '@/mcp-server/tools/definitions/chembl-get-drug-info.tool.js';
 import { initChemblService } from '@/services/chembl/chembl-service.js';
 import { markupNodes, parseMarkdown } from '../_commonmark.js';
-import { drugFamilyUpstream, IMATINIB, RAPACURONIUM } from '../_fake-drug-family-upstream.js';
+import {
+  ALMITRINE,
+  DICYCLOMINE,
+  drugFamilyUpstream,
+  GEFITINIB,
+  IMATINIB,
+  RAPACURONIUM,
+  ROFECOXIB,
+  TETRABENAZINE,
+} from '../_fake-drug-family-upstream.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -31,12 +41,17 @@ let fetchMock: ReturnType<typeof vi.fn>;
 /**
  * Route the stubbed fetch by URL rather than by call order. `mockResolvedValueOnce`
  * queues are scrambled by a retry, and a single shared `Response` has its body
- * consumed by the first read — this hands every call a fresh one.
+ * consumed by the first read — this hands every call a fresh one. The family read
+ * and the warnings list answer empty unless a route names them.
  */
 function routeFetch(routes: Array<{ match: string; body: unknown; status?: number }>): void {
+  const defaults: typeof routes = [
+    { match: '/molecule.json', body: { molecules: [] } },
+    { match: '/drug_warning.json', body: { drug_warnings: [] } },
+  ];
   fetchMock.mockImplementation((input: unknown) => {
     const url = typeof input === 'string' ? input : String((input as Request).url);
-    const route = routes.find((r) => url.includes(r.match));
+    const route = [...routes, ...defaults].find((r) => url.includes(r.match));
     if (!route) return Promise.reject(new Error(`unrouted fetch: ${url}`));
     return Promise.resolve(jsonResponse(route.body, route.status ?? 200));
   });
@@ -303,6 +318,11 @@ describe('chembl_get_drug_info — partial-result disclosure (#11)', () => {
           page_meta: { total_count: 1 },
         },
       },
+      // A recorded warning, so the failed list is the only empty one.
+      {
+        match: '/drug_warning.json',
+        body: { drug_warnings: [{ warning_type: 'Withdrawn', warning_country: 'France' }] },
+      },
     ]);
     const c = ctx();
     const result = await chemblGetDrugInfo.handler(
@@ -490,7 +510,7 @@ describe('chembl_get_drug_info — the parent family (#36)', () => {
 
     const lines = textLines(result);
     expect(lines).toContain(
-      'Parent: CHEMBL941 — both lists cover the parent and its alternate forms',
+      "Parent: CHEMBL941 — the phase and approval year are this form's own; both flags and every list below cover the parent and its alternate forms unless the notice says a read failed or was cut short",
     );
     expect(lines).toContain(
       '- Tyrosine-protein kinase ABL inhibitor (INHIBITOR) → target CHEMBL1862 — recorded on CHEMBL1642',
@@ -685,6 +705,29 @@ describe('chembl_get_drug_info — input normalization (#41)', () => {
   });
 });
 
+/** The regulatory fields of a drug with no flag and no warning, every list complete. */
+const UNFLAGGED = {
+  withdrawn: false,
+  black_box_warning: false,
+  warnings: [],
+  warnings_total_count: 0,
+  warnings_status: 'complete' as const,
+  warnings_failure: null,
+};
+
+/** A withdrawal row, filed on the form `form`, with one cited source. */
+const withdrawal = (form: string) => ({
+  warning_type: 'Withdrawn',
+  warning_class: 'hepatotoxicity',
+  warning_country: 'France; Spain',
+  warning_year: 1995,
+  warning_description: 'Liver injury',
+  efo_id: 'EFO:0004228',
+  efo_term: 'drug-induced liver injury',
+  molecule_chembl_id: form,
+  refs: [{ ref_type: 'WHO', ref_id: 'WHO/EDM/QSM/2001.3', ref_url: 'https://www.who.int/x' }],
+});
+
 describe('chembl_get_drug_info format()', () => {
   const PAIN = {
     mesh_id: 'D010146',
@@ -731,6 +774,7 @@ describe('chembl_get_drug_info format()', () => {
       indications_rows_fetched: 4,
       indications_status: 'complete',
       indications_failure: null,
+      ...UNFLAGGED,
     });
     const lines = (blocks[0] as { text: string }).text.split('\n');
     expect(lines).toContain(
@@ -741,7 +785,7 @@ describe('chembl_get_drug_info format()', () => {
     );
   });
 
-  it('renders "— none recorded" for empty mechanism and indication lists', () => {
+  it('renders "— none recorded" for empty mechanism, indication, and warning lists', () => {
     const blocks = chemblGetDrugInfo.format!({
       molecule_chembl_id: 'CHEMBL999999',
       parent_molecule_chembl_id: 'CHEMBL999999',
@@ -757,11 +801,14 @@ describe('chembl_get_drug_info format()', () => {
       indications_rows_fetched: 0,
       indications_status: 'complete',
       indications_failure: null,
+      ...UNFLAGGED,
+      withdrawn: null,
+      black_box_warning: null,
     });
     expect((blocks[0] as { text: string }).text.split('\n')).toEqual([
       '**CHEMBL999999** — (unnamed)',
-      'Max phase: — | First approval: —',
-      'Parent: CHEMBL999999 — both lists cover the parent and its alternate forms',
+      'Max phase: — | First approval: — | Withdrawn: — | Black box warning: —',
+      "Parent: CHEMBL999999 — the phase and approval year are this form's own; both flags and every list below cover the parent and its alternate forms unless the notice says a read failed or was cut short",
       '',
       '### Mechanisms of action',
       'mechanisms_status: complete | mechanisms_total_count: 0',
@@ -769,6 +816,10 @@ describe('chembl_get_drug_info format()', () => {
       '',
       '### Indications',
       'indications_status: complete | indications_total_count: 0 | indications_rows_fetched: 0',
+      '— none recorded',
+      '',
+      '### Warnings',
+      'warnings_status: complete | warnings_total_count: 0',
       '— none recorded',
     ]);
   });
@@ -789,6 +840,10 @@ describe('chembl_get_drug_info format()', () => {
       indications_rows_fetched: 1,
       indications_status: 'complete',
       indications_failure: null,
+      ...UNFLAGGED,
+      withdrawn: true,
+      warnings: [withdrawal('CHEMBL25')],
+      warnings_total_count: 1,
     });
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('mechanisms_status: failed');
@@ -821,6 +876,7 @@ describe('chembl_get_drug_info format()', () => {
       indications_rows_fetched: 100,
       indications_status: 'truncated',
       indications_failure: null,
+      ...UNFLAGGED,
     });
     const lines = (blocks[0] as { text: string }).text.split('\n');
     // A mechanism row is one mechanism, so its shortfall is exact.
@@ -877,9 +933,10 @@ describe('chembl_get_drug_info format()', () => {
     indications_rows_fetched: 1,
     indications_status: 'complete' as const,
     indications_failure: null,
+    ...UNFLAGGED,
   });
 
-  it('renders the header, both lists, and their state lines, markup-free values as written', () => {
+  it('renders the header, every list, and their state lines, markup-free values as written', () => {
     const blocks = chemblGetDrugInfo.format!(
       drugResult({
         id: 'CHEMBL939',
@@ -897,8 +954,8 @@ describe('chembl_get_drug_info format()', () => {
     );
     expect((blocks[0] as { text: string }).text.split('\n')).toEqual([
       '**CHEMBL939** — GEFITINIB',
-      'Max phase: 4 | First approval: 2003',
-      'Parent: CHEMBL939 — both lists cover the parent and its alternate forms',
+      'Max phase: 4 | First approval: 2003 | Withdrawn: false | Black box warning: false',
+      "Parent: CHEMBL939 — the phase and approval year are this form's own; both flags and every list below cover the parent and its alternate forms unless the notice says a read failed or was cut short",
       '',
       '### Mechanisms of action',
       'mechanisms_status: complete | mechanisms_total_count: 1',
@@ -907,6 +964,10 @@ describe('chembl_get_drug_info format()', () => {
       '### Indications',
       'indications_status: complete | indications_total_count: 1 | indications_rows_fetched: 1',
       '- Carcinoma, Non-Small-Cell Lung [MeSH D002289] / EFO: non-small cell lung carcinoma [EFO:0003060] (max phase 4) — recorded on CHEMBL939 (phase 4)',
+      '',
+      '### Warnings',
+      'warnings_status: complete | warnings_total_count: 0',
+      '— none recorded',
     ]);
   });
 
@@ -934,17 +995,20 @@ describe('chembl_get_drug_info format()', () => {
     expect(text).toBe(
       [
         `${strings.id} — ${strings.name}`,
-        'Max phase: 4 | First approval: 2003',
-        `Parent: ${strings.parent} — both lists cover the parent and its alternate forms`,
+        'Max phase: 4 | First approval: 2003 | Withdrawn: false | Black box warning: false',
+        `Parent: ${strings.parent} — the phase and approval year are this form's own; both flags and every list below cover the parent and its alternate forms unless the notice says a read failed or was cut short`,
         'Mechanisms of action',
         'mechanisms_status: complete | mechanisms_total_count: 1',
         `${strings.mechanism} (${strings.action}) → target ${strings.target} — recorded on ${strings.form}`,
         'Indications',
         'indications_status: complete | indications_total_count: 1 | indications_rows_fetched: 1',
         `${strings.heading} [MeSH ${strings.meshId}] / EFO: ${strings.term} [${strings.efoId}] (max phase 4) — recorded on ${strings.form} (phase 4)`,
+        'Warnings',
+        'warnings_status: complete | warnings_total_count: 0',
+        '— none recorded',
       ].join('\n'),
     );
-    // The two section headings are the server's own; nothing else may build markup.
+    // The section headings are the server's own; nothing else may build markup.
     expect(markupNodes(nodes)).toEqual(['heading']);
 
     const definition = chemblGetDrugInfo.format!(
@@ -956,6 +1020,406 @@ describe('chembl_get_drug_info format()', () => {
   });
 });
 
+describe("chembl_get_drug_info — the family's withdrawal, boxed warning, and warnings (#51)", () => {
+  const textLines = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    result.content
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('\n')
+      .split('\n');
+
+  it('reports a withdrawn drug at max_phase 4 with both flags and every warning, on both surfaces', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ROFECOXIB));
+    const result = await runToolContract(
+      chemblGetDrugInfo,
+      { molecule_chembl_id: 'CHEMBL122' },
+      { context: { tenantId: 'default' } },
+    );
+    expect(result.isError).toBeFalsy();
+    const structured = chemblGetDrugInfo.output.parse(result.structuredContent);
+    expect(structured).toMatchObject({
+      max_phase: 4,
+      first_approval: 1999,
+      withdrawn: true,
+      black_box_warning: true,
+      warnings_status: 'complete',
+      warnings_total_count: 2,
+      warnings_failure: null,
+    });
+    // The boxed warning records no class, year, description, EFO term, or source.
+    expect(structured.warnings[0]).toEqual({
+      warning_type: 'Black Box Warning',
+      warning_class: null,
+      warning_country: 'United States',
+      warning_year: null,
+      warning_description: null,
+      efo_id: null,
+      efo_term: null,
+      molecule_chembl_id: 'CHEMBL122',
+      refs: [],
+    });
+    expect(structured.warnings[1]?.refs.map((r) => r.ref_type)).toEqual(['USGPO', 'WHO', 'PubMed']);
+    // The service's family-read state stays off the wire; nothing went wrong to disclose.
+    expect(result.structuredContent).not.toHaveProperty('family_read');
+    expect(result.structuredContent).not.toHaveProperty('notice');
+
+    const lines = textLines(result);
+    expect(lines).toContain(
+      'Max phase: 4 | First approval: 1999 | Withdrawn: true | Black box warning: true',
+    );
+    const warnings = lines.slice(lines.indexOf('### Warnings'));
+    expect(warnings).toEqual([
+      '### Warnings',
+      'warnings_status: complete | warnings_total_count: 2',
+      '- Black Box Warning — class: — | country: United States | year: — | description: — | EFO: — [—] | recorded on CHEMBL122',
+      '  - no source recorded',
+      '- Withdrawn — class: cardiotoxicity | country: Worldwide | year: 2004 | description: Risk for heart attack and stroke | EFO: stroke [EFO:0000712] | recorded on CHEMBL122',
+      '  - USGPO FR-2014-07-02/pdf/2014-15371.pdf — [source](<https://www.govinfo.gov/content/pkg/FR-2014-07-02/pdf/2014-15371.pdf>)',
+      '  - WHO WHO/PSM/QSM/2005.2 — [source](<https://apps.who.int/iris/handle/10665/66869>)',
+      '  - PubMed 21574210 — [source](<http://europepmc.org/abstract/MED/21574210>)',
+    ]);
+  });
+
+  it("answers a salt carrying no flag with its parent's withdrawal, on both surfaces", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(DICYCLOMINE));
+    const result = await runToolContract(
+      chemblGetDrugInfo,
+      { molecule_chembl_id: 'CHEMBL1200479' },
+      { context: { tenantId: 'default' } },
+    );
+    const structured = chemblGetDrugInfo.output.parse(result.structuredContent);
+    expect(structured).toMatchObject({
+      parent_molecule_chembl_id: 'CHEMBL1123',
+      withdrawn: true,
+      black_box_warning: false,
+    });
+    expect(structured.warnings.map((w) => [w.warning_country, w.molecule_chembl_id])).toEqual([
+      ['Norway', 'CHEMBL1123'],
+    ]);
+    const lines = textLines(result);
+    expect(lines).toContain(
+      'Max phase: 4 | First approval: 1950 | Withdrawn: true | Black box warning: false',
+    );
+    expect(lines).toContain(
+      '- Withdrawn — class: — | country: Norway | year: — | description: Serious adverse reactions in infants under six months | EFO: adverse effect [EFO:0009658] | recorded on CHEMBL1123',
+    );
+  });
+
+  it('reports both flags false and an empty, complete warnings list, saying none are recorded', async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(GEFITINIB));
+    const result = await runToolContract(
+      chemblGetDrugInfo,
+      { molecule_chembl_id: 'CHEMBL939' },
+      { context: { tenantId: 'default' } },
+    );
+    expect(chemblGetDrugInfo.output.parse(result.structuredContent)).toMatchObject({
+      withdrawn: false,
+      black_box_warning: false,
+      warnings: [],
+      warnings_status: 'complete',
+      warnings_total_count: 0,
+    });
+    const lines = textLines(result);
+    expect(lines).toContain(
+      'Max phase: 4 | First approval: 2003 | Withdrawn: false | Black box warning: false',
+    );
+    expect(lines.slice(lines.indexOf('### Warnings'))).toEqual([
+      '### Warnings',
+      'warnings_status: complete | warnings_total_count: 0',
+      '— none recorded',
+    ]);
+  });
+
+  it("reports a salt's own phase of −1 beside its parent's withdrawal, on both surfaces", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(ALMITRINE));
+    const result = await runToolContract(
+      chemblGetDrugInfo,
+      { molecule_chembl_id: 'CHEMBL3181957' },
+      { context: { tenantId: 'default' } },
+    );
+    expect(chemblGetDrugInfo.output.parse(result.structuredContent)).toMatchObject({
+      max_phase: -1,
+      first_approval: null,
+      withdrawn: true,
+    });
+    expect(textLines(result)).toContain(
+      'Max phase: -1 | First approval: — | Withdrawn: true | Black box warning: false',
+    );
+  });
+
+  it("reports a deuterated analog's own phase and year beside its family's boxed warning, on both surfaces", async () => {
+    fetchMock.mockImplementation(drugFamilyUpstream(TETRABENAZINE));
+    const result = await runToolContract(
+      chemblGetDrugInfo,
+      { molecule_chembl_id: 'CHEMBL900020' },
+      { context: { tenantId: 'default' } },
+    );
+    expect(chemblGetDrugInfo.output.parse(result.structuredContent)).toMatchObject({
+      parent_molecule_chembl_id: 'CHEMBL117785',
+      max_phase: 2,
+      first_approval: null,
+      withdrawn: false,
+      black_box_warning: true,
+    });
+    const lines = textLines(result);
+    expect(lines).toContain(
+      'Max phase: 2 | First approval: — | Withdrawn: false | Black box warning: true',
+    );
+    expect(lines).toContain(
+      "Parent: CHEMBL117785 — the phase and approval year are this form's own; both flags and every list below cover the parent and its alternate forms unless the notice says a read failed or was cut short",
+    );
+    expect(lines.filter((line) => line.startsWith('- Black Box Warning'))).toEqual([
+      '- Black Box Warning — class: psychiatric toxicity | country: United States | year: — | description: — | EFO: — [—] | recorded on CHEMBL3137326',
+      '- Black Box Warning — class: psychiatric toxicity | country: United States | year: — | description: — | EFO: — [—] | recorded on CHEMBL117785',
+    ]);
+  });
+
+  it('discloses a failed warnings list without failing the call, on both surfaces', async () => {
+    routeFetch([
+      { match: '/molecule/', body: APPROVAL },
+      {
+        match: '/mechanism.json',
+        body: { mechanisms: [{ mechanism_of_action: 'COX inhibitor' }] },
+      },
+      { match: '/drug_indication.json', body: { drug_indications: indicationRows(1) } },
+      { match: '/drug_warning.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
+    ]);
+    const c = ctx();
+    const result = await chemblGetDrugInfo.handler(
+      chemblGetDrugInfo.input.parse({ molecule_chembl_id: 'CHEMBL25' }),
+      c,
+    );
+    expect(result).toMatchObject({
+      warnings: [],
+      warnings_status: 'failed',
+      warnings_total_count: null,
+      warnings_failure: 'upstream_error',
+    });
+    expect((getEnrichment(c) as { notice?: string }).notice).toBe(
+      'Upstream fetch failed for warnings — that array is empty because ChEMBL returned an error or could not be reached, not because CHEMBL25 has none recorded. Re-call chembl_get_drug_info to retry.',
+    );
+    const lines = (chemblGetDrugInfo.format!(result)[0] as { text: string }).text.split('\n');
+    expect(lines.slice(lines.indexOf('### Warnings'))).toEqual([
+      '### Warnings',
+      'warnings_status: failed | warnings_total_count: — | warnings_failure: upstream_error',
+      '— not retrieved: ChEMBL returned an error or could not be reached, so this list is unknown, not empty. Re-call to retry.',
+    ]);
+  });
+
+  it('names every failed list in one clause, and never blames the molecule', async () => {
+    routeFetch([
+      { match: '/molecule/', body: APPROVAL },
+      { match: '/mechanism.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
+      { match: '/drug_indication.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
+      { match: '/drug_warning.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
+    ]);
+    const c = ctx();
+    await chemblGetDrugInfo.handler(
+      chemblGetDrugInfo.input.parse({ molecule_chembl_id: 'CHEMBL25' }),
+      c,
+    );
+    expect((getEnrichment(c) as { notice?: string }).notice).toBe(
+      'Upstream fetch failed for mechanisms, indications, and warnings — those arrays are empty because ChEMBL returned an error or could not be reached, not because CHEMBL25 has none recorded. Re-call chembl_get_drug_info to retry.',
+    );
+  });
+
+  it('discloses a warnings list the page cap bounded, on both surfaces', async () => {
+    const row = {
+      warning_type: 'Withdrawn',
+      warning_country: 'France',
+      molecule_chembl_id: 'CHEMBL25',
+    };
+    routeFetch([
+      { match: '/molecule/', body: APPROVAL },
+      {
+        match: '/mechanism.json',
+        body: { mechanisms: [{ mechanism_of_action: 'COX inhibitor' }] },
+      },
+      { match: '/drug_indication.json', body: { drug_indications: indicationRows(1) } },
+      {
+        match: '/drug_warning.json',
+        body: { drug_warnings: [row], page_meta: { total_count: 3 } },
+      },
+    ]);
+    const c = ctx();
+    const result = await chemblGetDrugInfo.handler(
+      chemblGetDrugInfo.input.parse({ molecule_chembl_id: 'CHEMBL25' }),
+      c,
+    );
+    expect(result).toMatchObject({ warnings_status: 'truncated', warnings_total_count: 3 });
+    expect((getEnrichment(c) as { notice?: string }).notice).toBe(
+      'Only 1 of 3 warnings were returned — the single-request page cap bounded the list, so the remaining 2 are not reachable through this tool.',
+    );
+    const lines = (chemblGetDrugInfo.format!(result)[0] as { text: string }).text.split('\n');
+    expect(lines).toContain(
+      'warnings_status: truncated | warnings_total_count: 3 — showing 1 of 3; the remaining 2 were not returned',
+    );
+  });
+
+  it("discloses a failed family read and answers from the queried form's own record", async () => {
+    routeFetch([
+      {
+        match: '/molecule/',
+        body: { ...APPROVAL, max_phase: '2.0', withdrawn_flag: false, black_box_warning: 0 },
+      },
+      {
+        match: '/mechanism.json',
+        body: { mechanisms: [{ mechanism_of_action: 'COX inhibitor' }] },
+      },
+      { match: '/drug_indication.json', body: { drug_indications: indicationRows(1) } },
+      { match: '/molecule.json', body: { error_message: 'boom' }, status: REJECTED_STATUS },
+    ]);
+    const result = await runToolContract(
+      chemblGetDrugInfo,
+      { molecule_chembl_id: 'CHEMBL25' },
+      { context: { tenantId: 'default' } },
+    );
+    const structured = chemblGetDrugInfo.output.parse(result.structuredContent);
+    // The queried record is unflagged, but the family was never read: unknown, not false.
+    expect(structured).toMatchObject({
+      max_phase: 2,
+      first_approval: 1950,
+      withdrawn: null,
+      black_box_warning: null,
+    });
+    expect(result.structuredContent).not.toHaveProperty('family_read');
+    expect((result.structuredContent as { notice?: string }).notice).toBe(
+      "The forms of CHEMBL25's family were not read (ChEMBL returned an error or could not be reached), so withdrawn and black_box_warning reflect only CHEMBL25's own record — a null flag is unknown, not false. Re-call chembl_get_drug_info to retry.",
+    );
+    const text = textLines(result);
+    expect(text).toContain(
+      'Max phase: 2 | First approval: 1950 | Withdrawn: — | Black box warning: —',
+    );
+    expect(text.join('\n')).toContain("The forms of CHEMBL25's family were not read");
+  });
+
+  it('says a family read that ran out of time timed out, never that ChEMBL rejected it', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const family = drugFamilyUpstream(IMATINIB);
+    fetchMock.mockImplementation((input: string, init?: RequestInit) =>
+      input.includes('/molecule.json')
+        ? new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          })
+        : family(input),
+    );
+    const c = ctx();
+    let settled: Awaited<ReturnType<typeof chemblGetDrugInfo.handler>> | undefined;
+    Promise.resolve(
+      chemblGetDrugInfo.handler(
+        chemblGetDrugInfo.input.parse({ molecule_chembl_id: 'CHEMBL941' }),
+        c,
+      ),
+    ).then((value) => {
+      settled = value;
+    });
+    for (let waited = 0; !settled && waited < 60_000; waited += 250) {
+      await vi.advanceTimersByTimeAsync(250);
+    }
+    if (!settled) throw new Error('The call did not settle inside 60 s.');
+    expect(settled).toMatchObject({ withdrawn: null, black_box_warning: null, max_phase: 4 });
+    expect((getEnrichment(c) as { notice?: string }).notice).toBe(
+      "The forms of CHEMBL941's family were not read (the request ran out of time), so withdrawn and black_box_warning reflect only CHEMBL941's own record — a null flag is unknown, not false. Re-call chembl_get_drug_info to retry.",
+    );
+  });
+
+  it('discloses a family read the page cap cut short', async () => {
+    initChemblService({ ...getServerConfig(), maxPageSize: 1 });
+    onTestFinished(() => initChemblService(getServerConfig()));
+    fetchMock.mockImplementation(drugFamilyUpstream(IMATINIB));
+    const c = ctx();
+    const result = await chemblGetDrugInfo.handler(
+      chemblGetDrugInfo.input.parse({ molecule_chembl_id: 'CHEMBL941' }),
+      c,
+    );
+    expect(result).toMatchObject({ withdrawn: null, black_box_warning: null });
+    expect((getEnrichment(c) as { notice?: string }).notice).toContain(
+      "The page cap read only some of the forms of CHEMBL941's family, so a null withdrawn or black_box_warning is unknown, not false.",
+    );
+  });
+
+  it('renders upstream warning strings as the text recorded, each source a link to its URL', () => {
+    const strings = {
+      type: '# Withdrawn *x*',
+      klass: '_cardio_',
+      country: 'France\n> quoted',
+      description: '[x](y) <b>',
+      term: 'liver &amp; kidney',
+      efoId: 'EFO:1](y)',
+      form: 'CHEMBL`1`',
+      refType: '1. DailyMed',
+      refId: 'id*1*',
+    };
+    const plainUrl = 'https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid=a-b_c&x=1';
+    const hostileUrl = 'https://x.org/a>b)c<d\\e&amp;f g\n> h\\';
+    const blocks = chemblGetDrugInfo.format!({
+      molecule_chembl_id: 'CHEMBL1',
+      parent_molecule_chembl_id: 'CHEMBL1',
+      pref_name: 'X',
+      max_phase: 4,
+      first_approval: 1990,
+      mechanisms: [],
+      mechanisms_total_count: 0,
+      mechanisms_status: 'complete',
+      mechanisms_failure: null,
+      indications: [],
+      indications_total_count: 0,
+      indications_rows_fetched: 0,
+      indications_status: 'complete',
+      indications_failure: null,
+      withdrawn: true,
+      black_box_warning: false,
+      warnings: [
+        {
+          warning_type: strings.type,
+          warning_class: strings.klass,
+          warning_country: strings.country,
+          warning_year: 1995,
+          warning_description: strings.description,
+          efo_id: strings.efoId,
+          efo_term: strings.term,
+          molecule_chembl_id: strings.form,
+          refs: [
+            { ref_type: strings.refType, ref_id: strings.refId, ref_url: plainUrl },
+            { ref_type: 'FDA', ref_id: '1', ref_url: hostileUrl },
+            { ref_type: null, ref_id: null, ref_url: null },
+          ],
+        },
+      ],
+      warnings_total_count: 1,
+      warnings_status: 'complete',
+      warnings_failure: null,
+    });
+    const markdown = (blocks[0] as { text: string }).text;
+    const { text, nodes } = parseMarkdown(markdown);
+    expect(text.slice(text.indexOf('Warnings\n'))).toBe(
+      [
+        'Warnings',
+        'warnings_status: complete | warnings_total_count: 1',
+        `${strings.type} — class: ${strings.klass} | country: ${strings.country} | year: 1995 | description: ${strings.description} | EFO: ${strings.term} [${strings.efoId}] | recorded on ${strings.form}`,
+        `${strings.refType} ${strings.refId} — source`,
+        'FDA 1 — source',
+        // No type, no ID, no link.
+        '— — — —',
+      ].join('\n'),
+    );
+    // The server's own headings and source links are the only markup.
+    expect(markupNodes(nodes)).toEqual(['heading', 'link']);
+    const destinations: string[] = [];
+    const walker = new Parser().parse(markdown).walker();
+    for (let event = walker.next(); event; event = walker.next()) {
+      if (event.entering && event.node.type === 'link')
+        destinations.push(event.node.destination ?? '');
+    }
+    // A reader percent-encodes what a URL cannot hold, exactly as encodeURI does.
+    expect(destinations).toEqual([plainUrl, encodeURI(hostileUrl)]);
+  });
+});
+
 describe('chembl_get_drug_info — output field descriptions', () => {
   it('describe the counts by what they report, never by the upstream paging field behind them', () => {
     const schema = JSON.stringify(z.toJSONSchema(chemblGetDrugInfo.output));
@@ -963,5 +1427,17 @@ describe('chembl_get_drug_info — output field descriptions', () => {
     expect(schema).toContain(
       'Total mechanism rows ChEMBL holds for the molecule and its alternate forms. Exceeds the returned array length exactly when the status is \\"truncated\\".',
     );
+  });
+
+  it('say a withdrawn drug keeps phase 4 and where its withdrawal is read', () => {
+    const { properties } = z.toJSONSchema(chemblGetDrugInfo.output) as {
+      properties: Record<string, { description?: string }>;
+    };
+    for (const field of ['max_phase', 'first_approval']) {
+      expect(properties[field]?.description).toContain('read withdrawn and warnings');
+    }
+    expect(properties.max_phase?.description).toContain('A drug withdrawn from a market keeps 4');
+    expect(properties.withdrawn?.description).toContain('in at least one country');
+    expect(chemblGetDrugInfo.description).toContain('A withdrawn drug keeps max_phase 4');
   });
 });

@@ -33,6 +33,8 @@ import type { ServerConfig } from '@/config/server-config.js';
 import type {
   Activity,
   Assay,
+  BatchLookup,
+  Document,
   DrugInfo,
   GetActivitiesOptions,
   Indication,
@@ -48,6 +50,7 @@ import type {
   StructureSearchOptions,
   Target,
   TargetComponent,
+  Warning,
 } from './types.js';
 
 /**
@@ -89,11 +92,14 @@ const EXACT_MOLECULE_IDENTIFIER = /^(?:CHEMBL\d+|[A-Z]{14}-[A-Z]{10}-[A-Z])$/;
  * its Elasticsearch result window and `/substructure` at its hit limit. Each
  * reports the ceiling as `page_meta.total_count` and serves no row at or past it,
  * so a total equal to one is a lower bound — a true count of exactly the ceiling
- * reads the same. `/similarity`, the by-resource lookups, and the filtered
- * `/target` list (which pages past 15,000) report exact counts.
+ * reads the same. `/substructure` applies a filter such as `max_phase__gte` to
+ * only those first hits, so a filtered total under the ceiling is a lower bound
+ * too whenever the unfiltered search reaches it. `/similarity`, the by-resource
+ * lookups, and the filtered `/target` list (which pages past 15,000) report exact
+ * counts.
  */
 const NAME_SEARCH_CEILING = 10_000;
-const SUBSTRUCTURE_SEARCH_CEILING = 30_000;
+export const SUBSTRUCTURE_SEARCH_CEILING = 30_000;
 
 /**
  * The `error_message` text ChEMBL's similarity and substructure routes answer a
@@ -252,7 +258,7 @@ const STANDARD_TYPE_SPELLING_BUDGET_MS = 5_000;
 /**
  * One call's upstream time budget, as an absolute expiry. Every request the call
  * makes draws on the same instance, so chained and concurrent requests (a count
- * before a page, getDrugInfo's anchor and its two lists) share one budget rather than each
+ * before a page, getDrugInfo's anchor and the requests it keys off it) share one budget rather than each
  * restarting the clock.
  */
 export class CallDeadline {
@@ -315,6 +321,9 @@ function isRetryBudgetStop(error: unknown): boolean {
 
 /** Raw upstream molecule record (sparse — every field may be absent). */
 interface RawMolecule {
+  /** A JSON integer: 1 when the molecule carries a boxed warning, else 0. */
+  black_box_warning?: number | null;
+  first_approval?: number | null;
   max_phase?: string | number | null;
   molecule_chembl_id?: string;
   /** Null when ChEMBL records no hierarchy for the molecule. */
@@ -337,7 +346,93 @@ interface RawMolecule {
   molecule_type?: string | null;
   pref_name?: string | null;
   similarity?: string | number | null;
+  /** A JSON boolean: withdrawn from the market in at least one country. */
+  withdrawn_flag?: boolean | null;
 }
+
+/** The fields of a molecule record the family-level drug-info flags fold, for each form. */
+type RawFormFlags = Pick<RawMolecule, 'black_box_warning' | 'withdrawn_flag'>;
+
+/**
+ * Every key of {@link RawFormFlags}, tied to it both ways by `satisfies`. The
+ * family read names these alone through `only=`, and ChEMBL drops a name it does
+ * not know with HTTP 200 and no error, so a field missing here would read as null.
+ */
+const FORM_FLAG_FIELDS = Object.keys({
+  black_box_warning: true,
+  withdrawn_flag: true,
+} satisfies Record<keyof RawFormFlags, true>);
+
+/** One form's regulatory flags, as {@link ChemblService.getDrugInfo} folds them across a family. */
+interface FormFlags {
+  black_box_warning: boolean | null;
+  withdrawn: boolean | null;
+}
+
+/**
+ * A ChEMBL yes/no flag as a boolean — `withdrawn_flag` arrives as a JSON
+ * boolean, `black_box_warning` and `potential_duplicate` as 1 or 0 — or `null`
+ * when ChEMBL records neither.
+ */
+function toFlagOrNull(value: unknown): boolean | null {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  return null;
+}
+
+function normalizeFormFlags(raw: RawFormFlags): FormFlags {
+  return {
+    black_box_warning: toFlagOrNull(raw.black_box_warning),
+    withdrawn: toFlagOrNull(raw.withdrawn_flag),
+  };
+}
+
+/**
+ * A family's flags from the forms read: each `true` when any of them carries it —
+ * ChEMBL flags a withdrawal on the parent while a salt stays unflagged, and a
+ * boxed warning on a salt while the parent does not. A flag is `false` only when
+ * `everyForm` was read and none carries it; a failed or truncated family read
+ * leaves it `null`, unknown rather than false. The phase and approval year are
+ * never folded ({@link ChemblService.getDrugInfo}).
+ */
+function foldFamilyFlags(forms: readonly FormFlags[], everyForm: boolean): FormFlags {
+  const flag = (values: Array<boolean | null>) =>
+    values.includes(true) ? true : everyForm && values.every((v) => v === false) ? false : null;
+  return {
+    black_box_warning: flag(forms.map((f) => f.black_box_warning)),
+    withdrawn: flag(forms.map((f) => f.withdrawn)),
+  };
+}
+
+/** Raw upstream drug-warning row: exactly the fields {@link ChemblService.getWarnings} reads. */
+interface RawWarning {
+  efo_id?: string | null;
+  efo_term?: string | null;
+  molecule_chembl_id?: string | null;
+  warning_class?: string | null;
+  warning_country?: string | null;
+  warning_description?: string | null;
+  warning_refs?: Array<{
+    ref_id?: string | null;
+    ref_type?: string | null;
+    ref_url?: string | null;
+  }> | null;
+  warning_type?: string | null;
+  warning_year?: number | string | null;
+}
+
+/** Every key of {@link RawWarning}, the warnings request's `only=` — tied to the type as {@link FORM_FLAG_FIELDS} is. */
+const WARNING_FIELDS = Object.keys({
+  efo_id: true,
+  efo_term: true,
+  molecule_chembl_id: true,
+  warning_class: true,
+  warning_country: true,
+  warning_description: true,
+  warning_refs: true,
+  warning_type: true,
+  warning_year: true,
+} satisfies Record<keyof RawWarning, true>);
 
 /** Raw upstream activity record: exactly the fields {@link normalizeActivity} reads. */
 export interface RawActivity {
@@ -348,12 +443,16 @@ export interface RawActivity {
   assay_type?: string | null;
   assay_variant_accession?: string | null;
   assay_variant_mutation?: string | null;
+  bao_label?: string | null;
   data_validity_comment?: string | null;
   document_chembl_id?: string | null;
   document_year?: number | string | null;
   molecule_chembl_id?: string;
   molecule_pref_name?: string | null;
+  parent_molecule_chembl_id?: string | null;
   pchembl_value?: string | null;
+  /** A JSON integer: 1 when the value is likely a repeat citation, else 0. */
+  potential_duplicate?: number | null;
   relation?: string | null;
   standard_relation?: string | null;
   standard_type?: string | null;
@@ -384,12 +483,15 @@ const ACTIVITY_FIELD_SET = {
   assay_type: true,
   assay_variant_accession: true,
   assay_variant_mutation: true,
+  bao_label: true,
   data_validity_comment: true,
   document_chembl_id: true,
   document_year: true,
   molecule_chembl_id: true,
   molecule_pref_name: true,
+  parent_molecule_chembl_id: true,
   pchembl_value: true,
+  potential_duplicate: true,
   relation: true,
   standard_relation: true,
   standard_type: true,
@@ -412,12 +514,14 @@ export function normalizeActivity(raw: RawActivity): Activity {
     activity_id: raw.activity_id ?? 0,
     molecule_chembl_id: raw.molecule_chembl_id ?? '',
     molecule_pref_name: toStringOrNull(raw.molecule_pref_name),
+    parent_molecule_chembl_id: toStringOrNull(raw.parent_molecule_chembl_id),
     target_chembl_id: raw.target_chembl_id ?? '',
     target_pref_name: toStringOrNull(raw.target_pref_name),
     target_organism: toStringOrNull(raw.target_organism),
     assay_chembl_id: raw.assay_chembl_id ?? '',
     assay_type: toStringOrNull(raw.assay_type),
     assay_description: toStringOrNull(raw.assay_description),
+    bao_label: toStringOrNull(raw.bao_label),
     standard_type: toStringOrNull(raw.standard_type),
     standard_relation: toStringOrNull(raw.standard_relation),
     standard_value: toNumberOrNull(raw.standard_value),
@@ -429,6 +533,8 @@ export function normalizeActivity(raw: RawActivity): Activity {
     relation: toStringOrNull(raw.relation),
     activity_comment: toStringOrNull(raw.activity_comment),
     data_validity_comment: toStringOrNull(raw.data_validity_comment),
+    // A real boolean: the canvas stores a BOOLEAN column as Boolean(value).
+    potential_duplicate: toFlagOrNull(raw.potential_duplicate),
     assay_variant_mutation: toStringOrNull(raw.assay_variant_mutation),
     assay_variant_accession: toStringOrNull(raw.assay_variant_accession),
     document_chembl_id: toStringOrNull(raw.document_chembl_id),
@@ -455,6 +561,179 @@ interface RawTarget {
 interface RawPageMeta {
   total_count?: number;
 }
+
+/**
+ * A structure-search response: the similarity and substructure list envelope, or
+ * the single molecule object the exact by-resource route answers with.
+ */
+type RawStructurePage = { molecules?: RawMolecule[]; page_meta?: RawPageMeta } & RawMolecule;
+
+/**
+ * The most distinct IDs one batch lookup by ChEMBL ID sends. ChEMBL's list
+ * endpoints serve up to 1,000 rows a page, but EBI's front end refuses a request
+ * line over 4,094 bytes with HTTP 400; 100 IDs, comma-joined as `URLSearchParams`
+ * encodes them, beside the `limit` and the `only=` field list, take about 2 KB.
+ */
+export const ID_LOOKUP_CAP = 100;
+
+/**
+ * What a batch lookup by ChEMBL ID reads for one entity. ChEMBL names a list
+ * resource's endpoint, ID field, and response key after its entity: `assay` is
+ * `/assay.json`, filtered on `assay_chembl_id__in`, answering `{ assays: [...] }`.
+ */
+interface ChemblIdLookup<E extends string, Raw, T> {
+  /** ChEMBL's entity name, e.g. `assay` or `document`. */
+  entity: E;
+  /** The raw fields `normalize` reads, `<entity>_chembl_id` among them: the `only=` selection. */
+  fields: readonly string[];
+  /** One matched raw record as its domain shape. */
+  normalize: (raw: Raw) => T;
+  /** The operation the request logs under, which an outage's recovery hint also names. */
+  operation: string;
+}
+
+/** Raw upstream assay record: exactly the fields {@link normalizeAssay} reads. */
+interface RawAssay {
+  assay_cell_type?: string | null;
+  /** Always present on a list record: it is what the lookup matched the record by. */
+  assay_chembl_id: string;
+  assay_organism?: string | null;
+  assay_strain?: string | null;
+  assay_tissue?: string | null;
+  assay_type?: string | null;
+  assay_type_description?: string | null;
+  bao_label?: string | null;
+  confidence_description?: string | null;
+  confidence_score?: number | string | null;
+  description?: string | null;
+  document_chembl_id?: string | null;
+  target_chembl_id?: string | null;
+}
+
+/**
+ * Every key of {@link RawAssay}, tied to it both ways by `satisfies`, as
+ * `ACTIVITY_FIELD_SET` is to {@link RawActivity}: ChEMBL drops an `only=` name it
+ * does not know with HTTP 200, so a field missing here would read as a silent `null`.
+ */
+const ASSAY_FIELD_SET = {
+  assay_cell_type: true,
+  assay_chembl_id: true,
+  assay_organism: true,
+  assay_strain: true,
+  assay_tissue: true,
+  assay_type: true,
+  assay_type_description: true,
+  bao_label: true,
+  confidence_description: true,
+  confidence_score: true,
+  description: true,
+  document_chembl_id: true,
+  target_chembl_id: true,
+} satisfies Record<keyof RawAssay, true>;
+
+/** The raw assay fields a lookup requests, in {@link RawAssay} order. */
+export const ASSAY_FIELDS: readonly string[] = Object.keys(ASSAY_FIELD_SET);
+
+/** One raw assay record as the flat domain {@link Assay}. Reads every field of {@link RawAssay} and no other. */
+export function normalizeAssay(raw: RawAssay): Assay {
+  return {
+    assay_chembl_id: raw.assay_chembl_id,
+    description: toStringOrNull(raw.description),
+    assay_type: toStringOrNull(raw.assay_type),
+    assay_type_description: toStringOrNull(raw.assay_type_description),
+    bao_label: toStringOrNull(raw.bao_label),
+    target_chembl_id: toStringOrNull(raw.target_chembl_id),
+    organism: toStringOrNull(raw.assay_organism),
+    assay_cell_type: toStringOrNull(raw.assay_cell_type),
+    assay_tissue: toStringOrNull(raw.assay_tissue),
+    assay_strain: toStringOrNull(raw.assay_strain),
+    confidence_score: toNumberOrNull(raw.confidence_score),
+    confidence_description: toStringOrNull(raw.confidence_description),
+    document_chembl_id: toStringOrNull(raw.document_chembl_id),
+  };
+}
+
+const ASSAY_LOOKUP: ChemblIdLookup<'assay', RawAssay, Assay> = {
+  entity: 'assay',
+  fields: ASSAY_FIELDS,
+  normalize: normalizeAssay,
+  operation: 'ChemblService.getAssays',
+};
+
+/** Raw upstream document record: exactly the fields {@link normalizeDocument} reads. */
+interface RawDocument {
+  authors?: string | null;
+  doc_type?: string | null;
+  /** Always present on a list record: it is what the lookup matched the record by. */
+  document_chembl_id: string;
+  doi?: string | null;
+  first_page?: string | null;
+  issue?: string | null;
+  journal?: string | null;
+  last_page?: string | null;
+  patent_id?: string | null;
+  /** An integer upstream. */
+  pubmed_id?: number | string | null;
+  title?: string | null;
+  volume?: string | null;
+  /** An integer upstream. */
+  year?: number | string | null;
+}
+
+/** Every key of {@link RawDocument}, tied to it both ways by `satisfies`, as {@link ASSAY_FIELD_SET} is to {@link RawAssay}. */
+const DOCUMENT_FIELD_SET = {
+  authors: true,
+  doc_type: true,
+  document_chembl_id: true,
+  doi: true,
+  first_page: true,
+  issue: true,
+  journal: true,
+  last_page: true,
+  patent_id: true,
+  pubmed_id: true,
+  title: true,
+  volume: true,
+  year: true,
+} satisfies Record<keyof RawDocument, true>;
+
+/** The raw document fields a lookup requests, in {@link RawDocument} order. */
+export const DOCUMENT_FIELDS: readonly string[] = Object.keys(DOCUMENT_FIELD_SET);
+
+/**
+ * A PubMed ID as its digit string, the form PubMed tools take. ChEMBL ships it as
+ * an integer; a value that is not a positive whole number reads as `null`.
+ */
+function toPubmedIdOrNull(value: unknown): string | null {
+  const pmid = toNumberOrNull(value);
+  return pmid !== null && Number.isSafeInteger(pmid) && pmid > 0 ? String(pmid) : null;
+}
+
+/** One raw document record as the flat domain {@link Document}. Reads every field of {@link RawDocument} and no other. */
+export function normalizeDocument(raw: RawDocument): Document {
+  return {
+    document_chembl_id: raw.document_chembl_id,
+    doc_type: toStringOrNull(raw.doc_type),
+    title: toStringOrNull(raw.title),
+    authors: toStringOrNull(raw.authors),
+    journal: toStringOrNull(raw.journal),
+    year: toNumberOrNull(raw.year),
+    volume: toStringOrNull(raw.volume),
+    issue: toStringOrNull(raw.issue),
+    first_page: toStringOrNull(raw.first_page),
+    last_page: toStringOrNull(raw.last_page),
+    pubmed_id: toPubmedIdOrNull(raw.pubmed_id),
+    doi: toStringOrNull(raw.doi),
+    patent_id: toStringOrNull(raw.patent_id),
+  };
+}
+
+const DOCUMENT_LOOKUP: ChemblIdLookup<'document', RawDocument, Document> = {
+  entity: 'document',
+  fields: DOCUMENT_FIELDS,
+  normalize: normalizeDocument,
+  operation: 'ChemblService.getDocuments',
+};
 
 /**
  * The ChEMBL upstream client. Holds the resolved config values and the spill-page
@@ -597,6 +876,76 @@ export class ChemblService {
     }
   }
 
+  /**
+   * Look records of one entity up by ChEMBL ID in a single list request — the
+   * batch contract every by-ID-list tool shares. `ids` arrive canonical (trimmed
+   * and uppercased by the input schema: ChEMBL's `__in` matches case-exactly), so
+   * repeats collapse to their first occurrence here. The first
+   * {@link ID_LOOKUP_CAP} distinct IDs go out as one
+   * `/<entity>.json?<entity>_chembl_id__in=…&limit=<count>&only=<fields>` through
+   * {@link fetchJson} on the caller's `deadline`, and the rest come back deferred.
+   * `limit` is the looked-up count because ChEMBL's default page is 20 rows.
+   * ChEMBL answers in its own order and drops, with HTTP 200, any ID it holds no
+   * record of that entity for, so records go back in request order and misses are
+   * the looked-up IDs no record matched. An upstream failure fails the lookup
+   * whole: one request leaves no per-ID failure to report. A 404 on the request
+   * is that failure too (`upstream_unavailable`), never a not-found.
+   */
+  private async lookupByChemblIds<
+    E extends string,
+    Raw extends Partial<Record<`${E}_chembl_id`, string | null>>,
+    T,
+  >(
+    lookup: ChemblIdLookup<E, Raw, T>,
+    ids: readonly string[],
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<BatchLookup<T>> {
+    const distinct = [...new Set(ids)];
+    const looked = distinct.slice(0, ID_LOOKUP_CAP);
+    const idField = `${lookup.entity}_chembl_id` as const;
+    const url = this.buildUrl(lookup.entity, {
+      [`${idField}__in`]: looked.join(','),
+      limit: looked.length,
+      only: lookup.fields.join(','),
+    });
+    let body: Partial<Record<`${E}s`, Raw[]>>;
+    try {
+      body = await this.fetchJson<Partial<Record<`${E}s`, Raw[]>>>(
+        url,
+        lookup.operation,
+        ctx,
+        deadline,
+      );
+    } catch (err) {
+      // A miss is an ID dropped from a 200, so a 404 is the list endpoint itself gone.
+      if (!(err instanceof McpError && err.code === JsonRpcErrorCode.NotFound)) throw err;
+      throw serviceUnavailable(
+        'The ChEMBL API is currently unavailable.',
+        {
+          reason: 'upstream_unavailable',
+          recovery: {
+            hint: `Retry shortly. If it persists, ChEMBL may be down (${lookup.operation}).`,
+          },
+        },
+        { cause: err },
+      );
+    }
+    const byId = new Map<string, Raw>();
+    for (const raw of body[`${lookup.entity}s` as const] ?? []) {
+      const id = toStringOrNull(raw[idField]);
+      if (id) byId.set(id, raw);
+    }
+    const items: T[] = [];
+    const notFoundIds: string[] = [];
+    for (const id of looked) {
+      const raw = byId.get(id);
+      if (raw) items.push(lookup.normalize(raw));
+      else notFoundIds.push(id);
+    }
+    return { items, notFoundIds, deferredIds: distinct.slice(ID_LOOKUP_CAP) };
+  }
+
   // --- Molecules ---------------------------------------------------------
 
   /**
@@ -702,10 +1051,19 @@ export class ChemblService {
    * fetch: on a hit it returns a single molecule object at the top level (no
    * `molecules` key); on a miss it 404s (the framework classifies that as
    * NotFound). Detect the single-object shape so an exact match is not silently
-   * dropped.
+   * dropped. That route ignores `offset`, so the one hit is windowed here the way
+   * {@link lookupMoleculeByIdentifier} windows its record.
+   *
+   * `opts.maxPhaseMin` rides the similarity and substructure routes as
+   * `max_phase__gte`. The exact route is a by-resource fetch, so — as in
+   * {@link searchMolecules} — no filter is staked on it: its one hit is kept only
+   * when its own `max_phase` is at or above the minimum, and a null phase fails.
    *
    * A substructure total equal to {@link SUBSTRUCTURE_SEARCH_CEILING} is flagged
-   * `totalCountCapped`, and passed through unchanged.
+   * `totalCountCapped`, and passed through unchanged. ChEMBL applies a filter to
+   * only the first hits up to that ceiling, so a filtered substructure search is
+   * flagged as well when its unfiltered total reaches it
+   * ({@link fetchFilteredSubstructure}): the filtered total is then a lower bound.
    */
   async structureSearch(
     opts: StructureSearchOptions,
@@ -721,19 +1079,41 @@ export class ChemblService {
     } else {
       resource = `substructure/${smiles}`;
     }
-    const url = this.buildUrl(resource, { limit: opts.limit, offset: opts.offset ?? 0 });
-    const raw = await this.fetchJson<
-      { molecules?: RawMolecule[]; page_meta?: RawPageMeta } & RawMolecule
-    >(url, `ChemblService.structureSearch.${opts.searchType}`, ctx, deadline, {
-      // The exact lookup answers a SMILES it cannot read with 404, not 500.
-      structureQuery: opts.searchType !== 'exact',
+    const url = this.buildUrl(resource, {
+      limit: opts.limit,
+      offset: opts.offset ?? 0,
+      max_phase__gte: opts.searchType === 'exact' ? undefined : opts.maxPhaseMin,
     });
+    const operation = `ChemblService.structureSearch.${opts.searchType}`;
+    let raw: RawStructurePage;
+    let unfilteredTotal: number | undefined;
+    if (opts.searchType === 'substructure' && opts.maxPhaseMin !== undefined) {
+      [raw, unfilteredTotal] = await this.fetchFilteredSubstructure(
+        url,
+        resource,
+        operation,
+        ctx,
+        deadline,
+      );
+    } else {
+      raw = await this.fetchJson<RawStructurePage>(url, operation, ctx, deadline, {
+        // The exact lookup answers a SMILES it cannot read with 404, not 500.
+        structureQuery: opts.searchType !== 'exact',
+      });
+    }
 
     // Exact match returns a single molecule object (top-level molecule_chembl_id),
     // not a list envelope. Wrap it so the row is surfaced.
     if (raw.molecules === undefined && raw.molecule_chembl_id !== undefined) {
-      const item = this.normalizeMolecule(raw);
-      return { items: [item], totalCount: 1, totalCountCapped: false };
+      const hit = this.normalizeMolecule(raw);
+      const min = opts.maxPhaseMin;
+      const kept = min === undefined || (hit.max_phase !== null && hit.max_phase >= min);
+      const offset = opts.offset ?? 0;
+      return {
+        items: (kept ? [hit] : []).slice(offset, offset + opts.limit),
+        totalCount: kept ? 1 : 0,
+        totalCountCapped: false,
+      };
     }
 
     const items = (raw.molecules ?? []).map((m) => this.normalizeMolecule(m));
@@ -742,8 +1122,55 @@ export class ChemblService {
       items,
       totalCount,
       totalCountCapped:
-        opts.searchType === 'substructure' && totalCount === SUBSTRUCTURE_SEARCH_CEILING,
+        opts.searchType === 'substructure' &&
+        (totalCount === SUBSTRUCTURE_SEARCH_CEILING ||
+          unfilteredTotal === SUBSTRUCTURE_SEARCH_CEILING),
     };
+  }
+
+  /**
+   * A filtered substructure page and the route's unfiltered total, requested
+   * concurrently on the call's deadline. ChEMBL applies a filter to only the first
+   * {@link SUBSTRUCTURE_SEARCH_CEILING} hits of a substructure search, so the
+   * filtered total cannot say whether that ceiling cut it; the unfiltered total
+   * of one row can. Either request failing fails the call: the first failure is
+   * thrown and the other request abandoned, and a caller abort rethrows as the
+   * caller's reason. The total is `undefined` when ChEMBL sends no `page_meta`.
+   */
+  private async fetchFilteredSubstructure(
+    url: string,
+    resource: string,
+    operation: string,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<[RawStructurePage, number | undefined]> {
+    const abandon = new AbortController();
+    const request = { structureQuery: true, signal: AbortSignal.any([ctx.signal, abandon.signal]) };
+    const state: { failure?: unknown } = {};
+    /** Settles with the response, or with `undefined` once it failed — never rejects. */
+    const settle = <T>(pending: Promise<T>): Promise<T | undefined> =>
+      pending.catch((error: unknown): undefined => {
+        state.failure ??= error;
+        abandon.abort();
+      });
+    const countUrl = this.buildUrl(resource, { limit: 1, offset: 0, only: 'molecule_chembl_id' });
+    const [page, count] = await Promise.all([
+      settle(this.fetchJson<RawStructurePage>(url, operation, ctx, deadline, request)),
+      settle(
+        this.fetchJson<{ page_meta?: RawPageMeta }>(
+          countUrl,
+          `${operation}.unfilteredTotal`,
+          ctx,
+          deadline,
+          request,
+        ),
+      ),
+    ]);
+    if (page === undefined || count === undefined) {
+      ctx.signal.throwIfAborted();
+      throw state.failure;
+    }
+    return [page, count.page_meta?.total_count];
   }
 
   /** Fetch a single molecule by ChEMBL ID. */
@@ -757,20 +1184,24 @@ export class ChemblService {
     return this.normalizeMolecule(raw);
   }
 
-  /** The molecule record with its first_approval year — the anchor of {@link getDrugInfo}. */
-  async getMoleculeApproval(
+  /** The molecule record with its own approval year and flags — the anchor of {@link getDrugInfo}. */
+  private async getMoleculeApproval(
     id: string,
     ctx: Context,
-    deadline = new CallDeadline(CALL_DEADLINE_MS),
-  ): Promise<Molecule & { first_approval: number | null }> {
+    deadline: CallDeadline,
+  ): Promise<{ firstApproval: number | null; flags: FormFlags; molecule: Molecule }> {
     const url = this.buildUrl(`molecule/${encodeURIComponent(id)}`, {});
-    const raw = await this.fetchJson<RawMolecule & { first_approval?: number | null }>(
+    const raw = await this.fetchJson<RawMolecule>(
       url,
       'ChemblService.getMoleculeApproval',
       ctx,
       deadline,
     );
-    return { ...this.normalizeMolecule(raw), first_approval: toNumberOrNull(raw.first_approval) };
+    return {
+      firstApproval: toNumberOrNull(raw.first_approval),
+      flags: normalizeFormFlags(raw),
+      molecule: this.normalizeMolecule(raw),
+    };
   }
 
   /**
@@ -810,8 +1241,11 @@ export class ChemblService {
   /**
    * Resolve a protein/gene/UniProt accession → ChEMBL target. Accession and
    * gene-symbol filters traverse the nested `target_components`; free-text `query`
-   * matches `pref_name`. `opts.offset` windows the match set as in
-   * {@link searchMolecules}, and carries the same caller-validates constraint.
+   * matches `pref_name`, and `targetChemblId` names one target on the same list
+   * route, so the other filters still AND with it upstream and an unknown ID is an
+   * empty page rather than the by-resource route's 404. `opts.offset` windows the
+   * match set as in {@link searchMolecules}, and carries the same caller-validates
+   * constraint.
    */
   async searchTargets(
     opts: SearchTargetsOptions,
@@ -828,6 +1262,7 @@ export class ChemblService {
         opts.geneSymbol;
     }
     if (opts.query) params.pref_name__icontains = opts.query;
+    if (opts.targetChemblId) params.target_chembl_id = opts.targetChemblId;
     if (opts.organism) params.organism__iexact = opts.organism;
     if (opts.targetType) params.target_type = opts.targetType;
 
@@ -1320,6 +1755,81 @@ export class ChemblService {
   }
 
   /**
+   * Fetch the withdrawal and boxed-warning rows filed across a family: every form
+   * under `parentChemblId`, each row naming the form it is filed on — ChEMBL files
+   * many on a salt, where a `molecule_chembl_id` filter on the parent misses them.
+   * One request at the configured page size, as for {@link getIndications}: a
+   * family's warning rows run to 22 at the largest measured.
+   */
+  async getWarnings(
+    parentChemblId: string,
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<ListPage<Warning>> {
+    const url = this.buildUrl('drug_warning', {
+      parent_molecule_chembl_id: parentChemblId,
+      only: WARNING_FIELDS.join(','),
+      limit: this.maxPageSize,
+    });
+    const raw = await this.fetchJson<{ drug_warnings?: RawWarning[]; page_meta?: RawPageMeta }>(
+      url,
+      'ChemblService.getWarnings',
+      ctx,
+      deadline,
+    );
+    const items = (raw.drug_warnings ?? []).map((row) => ({
+      warning_type: toStringOrNull(row.warning_type),
+      warning_class: toStringOrNull(row.warning_class),
+      warning_country: toStringOrNull(row.warning_country),
+      warning_year: toNumberOrNull(row.warning_year),
+      warning_description: toStringOrNull(row.warning_description),
+      efo_id: toStringOrNull(row.efo_id),
+      efo_term: toStringOrNull(row.efo_term),
+      molecule_chembl_id: toStringOrNull(row.molecule_chembl_id),
+      refs: (row.warning_refs ?? []).map((ref) => ({
+        ref_type: toStringOrNull(ref.ref_type),
+        ref_id: toStringOrNull(ref.ref_id),
+        ref_url: toStringOrNull(ref.ref_url),
+      })),
+    }));
+    return {
+      items,
+      rowCount: items.length,
+      totalCount: raw.page_meta?.total_count ?? items.length,
+    };
+  }
+
+  /**
+   * The flags of every form filed under `parentChemblId`, the parent's own
+   * included, in one request that names only the fields {@link foldFamilyFlags}
+   * reads. A molecule ChEMBL records no hierarchy for matches no form;
+   * {@link getDrugInfo} folds the queried record in either way.
+   */
+  private async getFamilyFlags(
+    parentChemblId: string,
+    ctx: Context,
+    deadline: CallDeadline,
+  ): Promise<ListPage<FormFlags>> {
+    const url = this.buildUrl('molecule', {
+      molecule_hierarchy__parent_chembl_id: parentChemblId,
+      only: FORM_FLAG_FIELDS.join(','),
+      limit: this.maxPageSize,
+    });
+    const raw = await this.fetchJson<{ molecules?: RawFormFlags[]; page_meta?: RawPageMeta }>(
+      url,
+      'ChemblService.getFamilyFlags',
+      ctx,
+      deadline,
+    );
+    const items = (raw.molecules ?? []).map(normalizeFormFlags);
+    return {
+      items,
+      rowCount: items.length,
+      totalCount: raw.page_meta?.total_count ?? items.length,
+    };
+  }
+
+  /**
    * Resolve one settled secondary list into the three states a caller has to tell
    * apart. A rejection is a partial result, never an authoritative empty one: the
    * array stays empty, but the status says `failed` and the count stays `null` —
@@ -1369,37 +1879,59 @@ export class ChemblService {
   /**
    * Compose drug pharmacology for a molecule and its family. The molecule record
    * is the anchor: its failure (e.g. 404) fails the call, and it supplies the
-   * canonical ID and the family parent ({@link Molecule.parent_chembl_id}) both
-   * lists are requested by, never the caller's string — ChEMBL often records a
-   * drug's mechanisms and approved indications on a salt rather than the parent.
-   * The lists follow concurrently through `Promise.allSettled`, so a rejected one
-   * degrades to a disclosed partial result rather than tanking the call — except a
-   * caller cancellation, which `allSettled` would otherwise read as two failed
-   * lists in a successful result, so it is rethrown as the cancellation. Every
-   * request draws on the one deadline, so the call settles inside it.
+   * canonical ID and the family parent ({@link Molecule.parent_chembl_id}) every
+   * later request is keyed by, never the caller's string — ChEMBL often records a
+   * drug's mechanisms, approved indications, and warnings on a salt rather than
+   * the parent. The three lists and the family's flags follow concurrently
+   * through `Promise.allSettled`, so a rejected one degrades to a disclosed
+   * partial result rather than tanking the call — except a caller cancellation,
+   * which `allSettled` would otherwise read as failed requests in a successful
+   * result, so it is rethrown as the cancellation. Every request draws on the one
+   * deadline, so the call settles inside it.
+   *
+   * Both flags are the family's ({@link foldFamilyFlags}), folded over the
+   * anchor's own record and every form the family read returned; when that read
+   * fails, the anchor's record answers alone and `family_read` says so. The phase
+   * and approval year are always the anchor's own: ChEMBL files deuterated and
+   * radiolabelled analogs under their protium or cold parent, so the family's
+   * highest phase and earliest year would read an investigational analog as its
+   * parent's approved drug — the reason {@link getIndications} keeps each form's
+   * own phase.
    */
   async getDrugInfo(
     moleculeChemblId: string,
     ctx: Context,
     deadline = new CallDeadline(CALL_DEADLINE_MS),
   ): Promise<DrugInfo> {
-    const molecule = await this.getMoleculeApproval(moleculeChemblId, ctx, deadline);
+    const { firstApproval, flags, molecule } = await this.getMoleculeApproval(
+      moleculeChemblId,
+      ctx,
+      deadline,
+    );
     const parent = molecule.parent_chembl_id;
-    const [mechanisms, indications] = await Promise.allSettled([
+    const [mechanisms, indications, warnings, familyForms] = await Promise.allSettled([
       this.getMechanisms(parent, ctx, deadline),
       this.getIndications(parent, ctx, deadline),
+      this.getWarnings(parent, ctx, deadline),
+      this.getFamilyFlags(parent, ctx, deadline),
     ]);
     ctx.signal.throwIfAborted();
 
     const mechanismList = this.settleList(mechanisms, 'ChemblService.getMechanisms', ctx);
     const indicationList = this.settleList(indications, 'ChemblService.getIndications', ctx);
+    const warningList = this.settleList(warnings, 'ChemblService.getWarnings', ctx);
+    const familyList = this.settleList(familyForms, 'ChemblService.getFamilyFlags', ctx);
+    const family = foldFamilyFlags([flags, ...familyList.items], familyList.status === 'complete');
 
     return {
       molecule_chembl_id: molecule.molecule_chembl_id,
       parent_molecule_chembl_id: parent,
       pref_name: molecule.pref_name,
       max_phase: molecule.max_phase,
-      first_approval: molecule.first_approval,
+      first_approval: firstApproval,
+      withdrawn: family.withdrawn,
+      black_box_warning: family.black_box_warning,
+      family_read: { status: familyList.status, failure: familyList.failure },
       mechanisms: mechanismList.items,
       mechanisms_status: mechanismList.status,
       mechanisms_total_count: mechanismList.totalCount,
@@ -1409,38 +1941,33 @@ export class ChemblService {
       indications_total_count: indicationList.totalCount,
       indications_rows_fetched: indicationList.rowCount,
       indications_failure: indicationList.failure,
+      warnings: warningList.items,
+      warnings_status: warningList.status,
+      warnings_total_count: warningList.totalCount,
+      warnings_failure: warningList.failure,
     };
   }
 
   // --- Assay -------------------------------------------------------------
 
-  /** Fetch a single assay by ChEMBL assay ID. */
-  async getAssay(
-    id: string,
+  /** Look assays up by ChEMBL assay ID: one `/assay.json` request, {@link lookupByChemblIds}. */
+  async getAssays(
+    ids: readonly string[],
     ctx: Context,
     deadline = new CallDeadline(CALL_DEADLINE_MS),
-  ): Promise<Assay> {
-    const url = this.buildUrl(`assay/${encodeURIComponent(id)}`, {});
-    const raw = await this.fetchJson<{
-      assay_chembl_id?: string;
-      description?: string | null;
-      assay_type?: string | null;
-      assay_type_description?: string | null;
-      target_chembl_id?: string | null;
-      assay_organism?: string | null;
-      confidence_score?: number | string | null;
-      confidence_description?: string | null;
-    }>(url, 'ChemblService.getAssay', ctx, deadline);
-    return {
-      assay_chembl_id: raw.assay_chembl_id ?? id,
-      description: toStringOrNull(raw.description),
-      assay_type: toStringOrNull(raw.assay_type),
-      assay_type_description: toStringOrNull(raw.assay_type_description),
-      target_chembl_id: toStringOrNull(raw.target_chembl_id),
-      organism: toStringOrNull(raw.assay_organism),
-      confidence_score: toNumberOrNull(raw.confidence_score),
-      confidence_description: toStringOrNull(raw.confidence_description),
-    };
+  ): Promise<BatchLookup<Assay>> {
+    return await this.lookupByChemblIds(ASSAY_LOOKUP, ids, ctx, deadline);
+  }
+
+  // --- Document ----------------------------------------------------------
+
+  /** Look documents up by ChEMBL document ID: one `/document.json` request, {@link lookupByChemblIds}. */
+  async getDocuments(
+    ids: readonly string[],
+    ctx: Context,
+    deadline = new CallDeadline(CALL_DEADLINE_MS),
+  ): Promise<BatchLookup<Document>> {
+    return await this.lookupByChemblIds(DOCUMENT_LOOKUP, ids, ctx, deadline);
   }
 }
 

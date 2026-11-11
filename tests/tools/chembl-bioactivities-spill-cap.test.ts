@@ -28,8 +28,8 @@ import { activityCorpus, viewRequests } from '../_fake-activity-upstream.js';
 import { FakeDataCanvas } from '../_fake-canvas.js';
 
 /**
- * Cap for this file. A `rawActivity` row serializes to ~745 chars, so the 50,000-character
- * preview budget buffers ~67 rows before the overflow sentinel — a cap of 100
+ * Cap for this file. A `rawActivity` row serializes to ~830 chars, so the 50,000-character
+ * preview budget buffers ~60 rows before the overflow sentinel — a cap of 100
  * therefore trips in the spill tail, after a normal preview, exactly as a real
  * over-cap drain does.
  */
@@ -333,7 +333,7 @@ describe('chembl_get_bioactivities — spill row cap (#14)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const existing = await fake.acquire(undefined, { tenantId: 'default' });
-    // 150 rows fit the 600 KB budget a limit of 1000 buys, but exceed the 100-row cap.
+    // 150 rows fit the 900 KB budget a limit of 1000 buys, but exceed the 100-row cap.
     mockUpstream({ honest: 150, viewTotal: 150, rows: 150 });
     const c = ctx();
     const result = await chemblGetBioactivities.handler(
@@ -363,7 +363,7 @@ describe('chembl_get_bioactivities — spill row cap (#14)', () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const existing = await fake.acquire(undefined, { tenantId: 'default' });
-    // 105 rows fit the 62.4 KB budget a limit of 104 buys; the table keeps the first 100.
+    // 105 rows fit the 93.6 KB budget a limit of 104 buys; the table keeps the first 100.
     mockUpstream({ honest: 105, viewTotal: 105, rows: 105 });
     const c = ctx();
     const result = await chemblGetBioactivities.handler(
@@ -547,7 +547,7 @@ describe('chembl_get_bioactivities — truncated_by names only the bound that cu
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const existing = await fake.acquire(undefined, { tenantId: 'default' });
-    // 100 rows fit the 60 KB budget a limit of 100 buys; the view holds one more past the cap.
+    // 100 rows fit the 90 KB budget a limit of 100 buys; the view holds one more past the cap.
     mockShortPageUpstream({ rows: 101, viewTotal: 101, perPage: 50 });
     const { structured, notice, text } = await runBoth({
       target_chembl_id: 'CHEMBL203',

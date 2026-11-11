@@ -1,8 +1,10 @@
 /**
  * @fileoverview chembl_search_targets — resolve a protein/gene/UniProt accession
  * to the ChEMBL target ID that chembl_get_bioactivities needs. Searches the
- * ChEMBL target resource by free-text name, UniProt accession, gene symbol, and
- * organism, flattening component accessions + gene symbols into each row.
+ * ChEMBL target resource by free-text name or ChEMBL target ID, UniProt accession,
+ * gene symbol, organism, and target type, flattening component accessions + gene
+ * symbols into each row. A zero-hit notice names every filter sent and steers
+ * organism and target_type to the forms ChEMBL records.
  * @module mcp-server/tools/definitions/chembl-search-targets
  */
 
@@ -10,12 +12,70 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { decodeCursor, encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { clampLimit, LIMIT_CEILING, optionalCodeInput } from '@/mcp-server/input-normalization.js';
+import {
+  clampLimit,
+  isChemblId,
+  LIMIT_CEILING,
+  optionalCodeInput,
+} from '@/mcp-server/input-normalization.js';
 import { mdInline } from '@/mcp-server/markdown-text.js';
 import { getChemblService } from '@/services/chembl/chembl-service.js';
 
 /** The most targets one call returns; a larger `limit` is served at this cap. */
 const MAX_LIMIT = 100;
+
+/** The filters a target search sent, as the handler resolved them. */
+interface SentFilters {
+  accession: string | undefined;
+  geneSymbol: string | undefined;
+  nameQuery: string | undefined;
+  organism: string | undefined;
+  targetChemblId: string | undefined;
+  targetType: string | undefined;
+}
+
+/** The form each narrowing filter must take to match: both are exact against ChEMBL's vocabulary. */
+const ORGANISM_FORM = 'the scientific name ChEMBL records, e.g. "Homo sapiens", not a common name';
+const TARGET_TYPE_FORM = 'one full target class exactly, e.g. "SINGLE PROTEIN"';
+
+/** Two or three phrases as prose: "a and b", "a, b, and c". */
+function joinAnd(items: string[]): string {
+  return items.length <= 2
+    ? items.join(' and ')
+    : `${items.slice(0, -1).join(', ')}, and ${items.at(-1)}`;
+}
+
+/**
+ * What a zero-hit target search tries next. `organism` and `target_type` match
+ * forms a caller rarely guesses (the scientific name, the full class), so either
+ * one sent is the first filter to drop; the advice after it names only the
+ * identifiers the call sent. The handler's at-least-one gate means some
+ * identifier was sent.
+ */
+function zeroHitAdvice(sent: SentFilters): string {
+  const checks = [
+    sent.accession && 'the accession',
+    sent.geneSymbol && 'the gene symbol',
+    sent.targetChemblId && 'the target ID',
+  ].filter((check): check is string => Boolean(check));
+  const advice = [
+    checks.length > 0 ? `verify ${joinAnd(checks)}` : undefined,
+    sent.nameQuery ? 'check the spelling or broaden the name query' : undefined,
+  ]
+    .filter(Boolean)
+    .join(', or ');
+  let retry: string | undefined;
+  if (sent.organism && sent.targetType) {
+    retry = `Retry without organism and target_type first: organism matches ${ORGANISM_FORM}, and target_type matches ${TARGET_TYPE_FORM}.`;
+  } else if (sent.organism) {
+    retry = `Retry without organism first: it matches ${ORGANISM_FORM}.`;
+  } else if (sent.targetType) {
+    retry = `Retry without target_type first: it matches ${TARGET_TYPE_FORM}.`;
+  }
+  return retry
+    ? `${retry} Otherwise ${advice}.`
+    : `${advice.charAt(0).toUpperCase()}${advice.slice(1)}.`;
+}
 
 const TargetComponentSchema = z
   .object({
@@ -65,14 +125,14 @@ const TargetSchema = z
 export const chemblSearchTargets = tool('chembl_search_targets', {
   title: 'chembl-search-targets',
   description:
-    'Resolve a protein/gene/UniProt accession to the ChEMBL target ID that chembl_get_bioactivities needs for the target→leads workflow. Supply at least one of accession (UniProt, e.g. P00533), gene_symbol (e.g. EGFR), or query (free-text name); filter further by organism and target_type. Returns each target with its type, organism, and component UniProt accessions + gene symbols. A UniProt accession from the uniprot/protein server is the most precise input. A capped result carries nextCursor — pass it back as cursor with the same filters to read the next page.',
+    'Resolve a protein/gene/UniProt accession to the ChEMBL target ID that chembl_get_bioactivities needs for the target→leads workflow. Supply at least one of accession (UniProt, e.g. P00533), gene_symbol (e.g. EGFR), or query (free-text name, or a ChEMBL target ID such as CHEMBL203 to read that one target); filter further by organism and target_type. Returns each target with its type, organism, and component UniProt accessions + gene symbols. A UniProt accession from the uniprot/protein server is the most precise input. A capped result carries nextCursor — pass it back as cursor with the same filters to read the next page.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     query: z
       .string()
       .optional()
       .describe(
-        'Free-text name match against the target preferred name, e.g. "kinase" or "growth factor receptor".',
+        'Free-text name match against the target preferred name, e.g. "kinase" or "growth factor receptor" — or a ChEMBL target ID in any case, e.g. "CHEMBL203", which returns that one target.',
       ),
     accession: optionalCodeInput.describe(
       'UniProt accession of a target component, e.g. "P00533". The most precise resolver — from the uniprot/protein server.',
@@ -85,10 +145,10 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
       .string()
       .optional()
       .describe(
-        'Restrict to a source organism, e.g. "Homo sapiens" (case-insensitive exact match).',
+        'Restrict to a source organism by the scientific name ChEMBL records, e.g. "Homo sapiens" (case-insensitive exact match) — a common name such as "human" matches nothing.',
       ),
     target_type: optionalCodeInput.describe(
-      'Restrict to a target class, e.g. "SINGLE PROTEIN" or "PROTEIN COMPLEX".',
+      'Restrict to one target class, named in full, e.g. "SINGLE PROTEIN" or "PROTEIN COMPLEX" (exact match on the whole class, case-insensitive here) — a partial class such as "PROTEIN" matches nothing.',
     ),
     limit: z
       .number()
@@ -126,7 +186,7 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
       .string()
       .optional()
       .describe(
-        'Guidance when no target matched — echoes the filters and suggests how to broaden — and the disclosure that a limit above the maximum was served at the maximum.',
+        'Guidance when no target matched — echoes every filter sent, names the organism or target_type form ChEMBL matches, and suggests how to broaden — and the disclosure that a limit above the maximum was served at the maximum.',
       ),
   },
   errors: [
@@ -150,7 +210,7 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
       code: JsonRpcErrorCode.InvalidParams,
       when: 'None of query, accession, or gene_symbol was supplied.',
       recovery:
-        'Supply at least one: accession (UniProt, e.g. P00533), gene_symbol (e.g. EGFR), or query (free-text name).',
+        'Supply at least one: accession (UniProt, e.g. P00533), gene_symbol (e.g. EGFR), or query (free-text name or ChEMBL target ID).',
     },
   ],
 
@@ -159,9 +219,19 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
     // gate lives here. Any combination is valid — the three AND upstream, so extra
     // ones narrow. Guard for empty strings (form clients send "" not undefined).
     const query = input.query?.trim() || undefined;
+    /**
+     * A query that is a ChEMBL ID in any case names one target. No preferred name
+     * contains "CHEMBL", so routing it to the exact, case-sensitive
+     * `target_chembl_id` filter instead of the name match loses no match.
+     */
+    const targetChemblId =
+      query && isChemblId(query.toUpperCase()) ? query.toUpperCase() : undefined;
+    const nameQuery = targetChemblId ? undefined : query;
     // Every accession and target type ChEMBL records is uppercase; the schema has trimmed and uppercased both.
     const accession = input.accession;
     const geneSymbol = input.gene_symbol?.trim() || undefined;
+    const organism = input.organism?.trim() || undefined;
+    const targetType = input.target_type;
     if (!query && !accession && !geneSymbol) {
       throw ctx.fail('missing_input');
     }
@@ -183,11 +253,12 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
     const offset = cursor ? decodeCursor(cursor, ctx).offset : 0;
     const page = await getChemblService().searchTargets(
       {
-        query,
+        query: nameQuery,
+        targetChemblId,
         accession,
         geneSymbol,
-        organism: input.organism?.trim() || undefined,
-        targetType: input.target_type,
+        organism,
+        targetType,
         limit,
         offset,
       },
@@ -219,7 +290,10 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
         const filters = [
           accession && `accession="${accession}"`,
           geneSymbol && `gene_symbol="${geneSymbol}"`,
-          query && `query="${query}"`,
+          targetChemblId && `query="${targetChemblId}" (a ChEMBL target ID)`,
+          nameQuery && `query="${nameQuery}"`,
+          organism && `organism="${organism}"`,
+          targetType && `target_type="${targetType}"`,
         ]
           .filter(Boolean)
           .join(', ');
@@ -230,7 +304,7 @@ export const chemblSearchTargets = tool('chembl_search_targets', {
         const empty =
           offset > 0 && page.totalCount > 0
             ? `That cursor starts past the end of the ${page.totalCount} targets matching ${filters} — the walk is complete.`
-            : `No target matched ${filters}. Verify the accession/symbol, or broaden with a free-text query.`;
+            : `No target matched ${filters}. ${zeroHitAdvice({ accession, geneSymbol, targetChemblId, nameQuery, organism, targetType })}`;
         notice = notice ? `${notice} ${empty}` : empty;
       }
       if (notice) ctx.enrich.notice(notice);

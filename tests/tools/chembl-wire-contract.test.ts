@@ -9,10 +9,11 @@
  *      before the handler runs, rather than silently stripped — a caller's typo
  *      surfaces as a typo instead of as a wrong answer. No tool on this server
  *      proxies arbitrary upstream query parameters, so none opts back out with
- *      `.passthrough()` / `.catchall()`; this asserts that for all eight.
+ *      `.passthrough()` / `.catchall()`; this asserts that for all nine.
  *   2. `canvas_id` INPUT fields advertise the minted id shape, so an impossible
- *      value is rejected at argument validation; the OUTPUT field stays a plain
- *      string, since a minted id is reported rather than validated.
+ *      value is rejected at argument validation; the optional one also admits a
+ *      blank, read as omitted (#45). The OUTPUT field stays a plain string, since
+ *      a minted id is reported rather than validated.
  *   3. Both consumption surfaces carry the same payload. `structuredContent` and
  *      `content[]` are read by different clients, on success (domain fields +
  *      enrichment trailer) and on failure (the declared `error` envelope).
@@ -35,6 +36,7 @@ import { chemblDataframeDrop } from '@/mcp-server/tools/definitions/chembl-dataf
 import { chemblDataframeQuery } from '@/mcp-server/tools/definitions/chembl-dataframe-query.tool.js';
 import { chemblGetAssay } from '@/mcp-server/tools/definitions/chembl-get-assay.tool.js';
 import { chemblGetBioactivities } from '@/mcp-server/tools/definitions/chembl-get-bioactivities.tool.js';
+import { chemblGetDocuments } from '@/mcp-server/tools/definitions/chembl-get-documents.tool.js';
 import { chemblGetDrugInfo } from '@/mcp-server/tools/definitions/chembl-get-drug-info.tool.js';
 import { chemblSearchMolecules } from '@/mcp-server/tools/definitions/chembl-search-molecules.tool.js';
 import { chemblSearchTargets } from '@/mcp-server/tools/definitions/chembl-search-targets.tool.js';
@@ -49,7 +51,8 @@ const TOOLS = [
   { def: chemblGetBioactivities, valid: { molecule_chembl_id: 'CHEMBL25' } },
   { def: chemblSearchTargets, valid: { accession: 'P00533' } },
   { def: chemblGetDrugInfo, valid: { molecule_chembl_id: 'CHEMBL941' } },
-  { def: chemblGetAssay, valid: { assay_chembl_id: 'CHEMBL674637' } },
+  { def: chemblGetAssay, valid: { assay_chembl_ids: ['CHEMBL674637'] } },
+  { def: chemblGetDocuments, valid: { document_chembl_ids: ['CHEMBL3351701'] } },
   { def: chemblDataframeQuery, valid: { canvas_id: MINTED_CANVAS_ID, sql: 'SELECT 1' } },
   { def: chemblDataframeDescribe, valid: { canvas_id: MINTED_CANVAS_ID } },
   {
@@ -140,7 +143,13 @@ describe('canvas_id input shape', () => {
   it.each(CANVAS_ID_INPUTS.map((t) => [t.def.name, t] as const))(
     '%s rejects an id that could not have been minted',
     (_name, { def, rest }) => {
-      for (const bad of ['x', 'Ab3_xY-9Qz0', 'Ab3_xY 9Qz', '']) {
+      for (const bad of [
+        'x',
+        'Ab3_xY-9Qz0',
+        'Ab3_xY 9Qz',
+        'not-a-canvas',
+        ` ${MINTED_CANVAS_ID} `,
+      ]) {
         expect(
           def.input.safeParse({ ...rest, canvas_id: bad }).success,
           `canvas_id ${JSON.stringify(bad)} must be rejected`,
@@ -148,6 +157,28 @@ describe('canvas_id input shape', () => {
       }
     },
   );
+
+  it.each(CANVAS_ID_INPUTS.slice(1).map((t) => [t.def.name, t] as const))(
+    '%s requires a canvas_id, so a blank is rejected',
+    (_name, { def, rest }) => {
+      for (const blank of ['', '   ', '\t']) {
+        expect(def.input.safeParse({ ...rest, canvas_id: blank }).success).toBe(false);
+      }
+    },
+  );
+
+  /** The optional field reads a blank as omitted (#45): a canvas is minted only if the view spills. */
+  it('reads a blank canvas_id on chembl_get_bioactivities as omitted', () => {
+    const omitted = chemblGetBioactivities.input.parse({ molecule_chembl_id: 'CHEMBL25' });
+    for (const blank of ['', '   ', '\t']) {
+      const parsed = chemblGetBioactivities.input.parse({
+        molecule_chembl_id: 'CHEMBL25',
+        canvas_id: blank,
+      });
+      expect(parsed.canvas_id).toBeUndefined();
+      expect(parsed).toEqual(omitted);
+    }
+  });
 
   it('leaves the OUTPUT canvas_id a plain string — a minted id is reported, not validated', () => {
     const shape = chemblGetBioactivities.output.shape;
@@ -190,31 +221,41 @@ describe('success reaches both wire surfaces', () => {
   it('carries the assay fields in structuredContent and renders them in content[]', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
-        assay_chembl_id: 'CHEMBL674637',
-        description: 'Inhibition of EGFR',
-        assay_type: 'B',
-        assay_type_description: 'Binding',
-        target_chembl_id: 'CHEMBL203',
-        assay_organism: 'Homo sapiens',
-        confidence_score: '9',
-        confidence_description: 'Direct single protein target assigned',
+        assays: [
+          {
+            assay_chembl_id: 'CHEMBL674637',
+            description: 'Inhibition of EGFR',
+            assay_type: 'B',
+            assay_type_description: 'Binding',
+            target_chembl_id: 'CHEMBL203',
+            assay_organism: 'Homo sapiens',
+            confidence_score: '9',
+            confidence_description: 'Direct single protein target assigned',
+          },
+        ],
+        page_meta: { total_count: 1, next: null },
       }),
     );
 
     const result = await runToolContract(chemblGetAssay, {
-      assay_chembl_id: 'CHEMBL674637',
+      assay_chembl_ids: ['CHEMBL674637', 'CHEMBL25'],
     });
 
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({
-      assay_chembl_id: 'CHEMBL674637',
-      target_chembl_id: 'CHEMBL203',
-      confidence_score: 9,
+      assays: [
+        { assay_chembl_id: 'CHEMBL674637', target_chembl_id: 'CHEMBL203', confidence_score: 9 },
+      ],
+      not_found_ids: ['CHEMBL25'],
+      deferred_ids: [],
+      notice: expect.stringContaining('(not_found_ids)'),
     });
     const text = contentText(result);
     expect(text).toContain('CHEMBL674637');
     expect(text).toContain('CHEMBL203');
     expect(text).toContain('Confidence: 9');
+    expect(text).toContain('Not found: CHEMBL25');
+    expect(text).toContain('> No assay record in ChEMBL for 1 of 2 IDs looked up');
   });
 
   it('merges enrichment into structuredContent and appends it as a content[] trailer', async () => {
@@ -301,7 +342,7 @@ describe('tool argument representation repairs', () => {
 
     expect(result.isError).toBeFalsy();
     const notice =
-      'limit 101 is above the maximum of 100, so 100 was applied. No target matched query="kinase". Verify the accession/symbol, or broaden with a free-text query.';
+      'limit 101 is above the maximum of 100, so 100 was applied. No target matched query="kinase". Check the spelling or broaden the name query.';
     expect(result.structuredContent).toMatchObject({ targets: [], cap: 100, shown: 0, notice });
     const lines = contentText(result).split('\n');
     expect(lines).toContain('**cap:** 100');
@@ -333,12 +374,19 @@ describe('tool argument representation repairs', () => {
 interface AdvertisedProperty {
   default?: unknown;
   description?: string;
+  enum?: readonly unknown[];
+  items?: AdvertisedProperty;
+  maxItems?: number;
   maximum?: number;
+  minItems?: number;
   minimum?: number;
   minLength?: number;
   pattern?: string;
   type?: string;
 }
+
+/** A value a client sends for one property: a string, a number, or a list of them. */
+type ArgumentValue = string | number | readonly (string | number)[];
 
 /** The input object schema `tools/list` advertises for a tool, as the SDK projects it. */
 interface AdvertisedInput {
@@ -357,8 +405,12 @@ function advertisedInput(def: { input: { '~standard': unknown } }): AdvertisedIn
 const MODELED_KEYWORDS = new Set([
   'default',
   'description',
+  'enum',
+  'items',
   'maximum',
+  'maxItems',
   'minimum',
+  'minItems',
   'minLength',
   'pattern',
   'type',
@@ -366,14 +418,25 @@ const MODELED_KEYWORDS = new Set([
 
 /**
  * Whether a JSON-Schema-validating client accepts `value` for one property: the
- * type, `minLength` in code points, `minimum` / `maximum`, and `pattern` as an
+ * type, `enum` members, `minLength` in code points, `minimum` / `maximum`, `pattern` as an
  * unanchored ECMA-262 regex under the `u` flag, the way JSON Schema validators
- * compile it. A keyword outside that set throws, so a constraint added to the
- * schema later cannot pass here unchecked.
+ * compile it, and for a list `minItems` / `maxItems` with every element checked
+ * against `items`. A keyword outside that set throws, so a constraint added to
+ * the schema later cannot pass here unchecked.
  */
-function admitsValue(property: AdvertisedProperty, value: string | number): boolean {
+function admitsValue(property: AdvertisedProperty, value: ArgumentValue): boolean {
   const unmodeled = Object.keys(property).filter((keyword) => !MODELED_KEYWORDS.has(keyword));
   if (unmodeled.length > 0) throw new Error(`admitsValue does not model ${unmodeled.join(', ')}`);
+  if (typeof value === 'object') {
+    const { items } = property;
+    return (
+      property.type === 'array' &&
+      items !== undefined &&
+      (property.minItems === undefined || value.length >= property.minItems) &&
+      (property.maxItems === undefined || value.length <= property.maxItems) &&
+      value.every((element) => admitsValue(items, element))
+    );
+  }
   if (typeof value === 'number') {
     const typed =
       property.type === 'integer' ? Number.isInteger(value) : property.type === 'number';
@@ -385,6 +448,7 @@ function admitsValue(property: AdvertisedProperty, value: string | number): bool
   }
   return (
     property.type === 'string' &&
+    (property.enum === undefined || property.enum.includes(value)) &&
     (property.minLength === undefined || [...value].length >= property.minLength) &&
     (property.pattern === undefined || new RegExp(property.pattern, 'u').test(value))
   );
@@ -395,7 +459,7 @@ function admitsValue(property: AdvertisedProperty, value: string | number): bool
  * `required` key present, no key outside `properties` while `additionalProperties`
  * is false, and each value admitted by its property.
  */
-function admits(schema: AdvertisedInput, args: Record<string, string | number>): boolean {
+function admits(schema: AdvertisedInput, args: Record<string, ArgumentValue>): boolean {
   return (
     (schema.required ?? []).every((key) => Object.hasOwn(args, key)) &&
     Object.entries(args).every(([key, value]) => {
@@ -451,6 +515,24 @@ const ADVERTISED_FORMS = [
     refused: [0, 10_001],
   },
   {
+    def: chemblGetBioactivities,
+    field: 'canvas_id',
+    admitted: [MINTED_CANVAS_ID, 'ABCDEFGHIJ', '0123456789', '__________', '', '   ', '\t'],
+    refused: ['x', 'Ab3_xY-9Qz0', 'Ab3_xY 9Qz', 'not-a-canvas', ` ${MINTED_CANVAS_ID} `],
+  },
+  {
+    def: chemblGetBioactivities,
+    field: 'potency_view',
+    admitted: ['potency_ranked', 'null_potency', ''],
+    refused: ['x', 'POTENCY_RANKED', 'ranked'],
+  },
+  {
+    def: chemblDataframeDescribe,
+    field: 'canvas_id',
+    admitted: [MINTED_CANVAS_ID],
+    refused: ['', '   ', 'x', ` ${MINTED_CANVAS_ID} `],
+  },
+  {
     def: chemblGetDrugInfo,
     field: 'molecule_chembl_id',
     admitted: [
@@ -465,9 +547,32 @@ const ADVERTISED_FORMS = [
   },
   {
     def: chemblGetAssay,
-    field: 'assay_chembl_id',
-    admitted: ['chembl674637', '  CHEMBL674637  ', 'CHEMBL674637'],
-    refused: ['imatinib', '', '   '],
+    field: 'assay_chembl_ids',
+    admitted: [
+      ['chembl674637'],
+      ['  CHEMBL674637  ', 'CHEMBL674637', 'chembl674637'],
+      Array(1000).fill('CHEMBL1'),
+    ],
+    // A lone string is the framework's repair to make, not a form the schema advertises.
+    refused: [[], ['imatinib'], [''], ['   '], 'CHEMBL674637', Array(1001).fill('CHEMBL1')],
+  },
+  {
+    def: chemblGetDocuments,
+    field: 'document_chembl_ids',
+    admitted: [
+      ['chembl3351701'],
+      ['  CHEMBL3351701  ', 'CHEMBL1240298', 'chembl1201862'],
+      Array(1000).fill('CHEMBL1'),
+    ],
+    refused: [
+      [],
+      ['10.1021/jm501578n'],
+      ['25383627'],
+      [''],
+      ['   '],
+      'CHEMBL3351701',
+      Array(1001).fill('CHEMBL1'),
+    ],
   },
   {
     def: chemblSearchTargets,
@@ -522,7 +627,8 @@ describe('advertised input schemas admit every raw form the handlers normalize (
       chembl_get_bioactivities: { required: undefined, additionalProperties: false },
       chembl_search_targets: { required: undefined, additionalProperties: false },
       chembl_get_drug_info: { required: ['molecule_chembl_id'], additionalProperties: false },
-      chembl_get_assay: { required: ['assay_chembl_id'], additionalProperties: false },
+      chembl_get_assay: { required: ['assay_chembl_ids'], additionalProperties: false },
+      chembl_get_documents: { required: ['document_chembl_ids'], additionalProperties: false },
       chembl_dataframe_query: { required: ['canvas_id', 'sql'], additionalProperties: false },
       chembl_dataframe_describe: { required: ['canvas_id'], additionalProperties: false },
       chembl_dataframe_drop: {
@@ -531,9 +637,11 @@ describe('advertised input schemas admit every raw form the handlers normalize (
       },
     });
     const assay = advertisedInput(chemblGetAssay);
-    expect(admits(assay, { assay_chembl_id: 'CHEMBL674637' })).toBe(true);
+    expect(admits(assay, { assay_chembl_ids: ['CHEMBL674637'] })).toBe(true);
     expect(admits(assay, {})).toBe(false);
-    expect(admits(assay, { assay_chembl_id: 'CHEMBL674637', querry: 'typo' })).toBe(false);
+    expect(admits(assay, { assay_chembl_ids: ['CHEMBL674637'], querry: 'typo' })).toBe(false);
+    // The 0.5.0 key reaches the handler through inputAliases, which advertise nothing.
+    expect(admits(assay, { assay_chembl_id: 'CHEMBL674637' })).toBe(false);
   });
 
   it('rejects a target ID that is no ChEMBL ID with -32602 before any request, routing to the search tool', async () => {

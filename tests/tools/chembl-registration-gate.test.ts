@@ -6,17 +6,24 @@
  * while the registry skips it — so it stays absent from tools/list. Two layers
  * are verified: the env-var → boolean parse (including the stringbool
  * semantics), and the gate index.ts applies — the raw definition when the flag
- * is on, the wrapped one when off, with the eight-tool manifest constant either
- * way and the seven always-on tools untouched. Then the real wiring: the
+ * is on, the wrapped one when off, with the nine-tool manifest constant either
+ * way and the eight always-on tools untouched. Then the real wiring: the
  * non-throwing flag read `src/index.ts` gates on at module load, and `index.ts`
  * itself loaded with `createApp` stubbed — an invalid server env value must not
  * throw at import, and must instead fail the full parse inside `setup()`, where
- * the framework turns it into the configuration banner. Last, the DataCanvas
+ * the framework turns it into the configuration banner. Then the DataCanvas
  * default `index.ts` applies at import: an unset or empty CANVAS_PROVIDER_TYPE
- * reads as duckdb, and an explicit value is kept.
+ * reads as duckdb, and an explicit value is kept. Last, the `.env` load at
+ * import: it validates no framework variable (an invalid one is left to the
+ * parse `createApp()` runs inside its error boundary), it survives a `.env` it
+ * cannot read, and a `.env` in the working directory sets CANVAS_PROVIDER_TYPE
+ * and CHEMBL_DATAFRAME_DROP_ENABLED without overriding the environment.
  * @module tests/tools/chembl-registration-gate
  */
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { disabledTool, z } from '@cyanheads/mcp-ts-core';
 import { parseConfig, parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -27,6 +34,7 @@ import { chemblDataframeDrop } from '@/mcp-server/tools/definitions/chembl-dataf
 import { chemblDataframeQuery } from '@/mcp-server/tools/definitions/chembl-dataframe-query.tool.js';
 import { chemblGetAssay } from '@/mcp-server/tools/definitions/chembl-get-assay.tool.js';
 import { chemblGetBioactivities } from '@/mcp-server/tools/definitions/chembl-get-bioactivities.tool.js';
+import { chemblGetDocuments } from '@/mcp-server/tools/definitions/chembl-get-documents.tool.js';
 import { chemblGetDrugInfo } from '@/mcp-server/tools/definitions/chembl-get-drug-info.tool.js';
 import { chemblSearchMolecules } from '@/mcp-server/tools/definitions/chembl-search-molecules.tool.js';
 import { chemblSearchTargets } from '@/mcp-server/tools/definitions/chembl-search-targets.tool.js';
@@ -58,13 +66,14 @@ function parseDropFlag(): boolean {
   }).dataframeDropEnabled;
 }
 
-/** The always-registered seven tools, in index.ts registration order. */
+/** The always-registered eight tools, in index.ts registration order. */
 const ALWAYS_ON = [
   chemblSearchMolecules,
   chemblGetBioactivities,
   chemblSearchTargets,
   chemblGetDrugInfo,
   chemblGetAssay,
+  chemblGetDocuments,
   chemblDataframeQuery,
   chemblDataframeDescribe,
 ];
@@ -111,13 +120,13 @@ describe('chembl_dataframe_drop — registration gate', () => {
     // skip registration, so a wrapped tool is never the raw definition.
     expect(drop).toBeDefined();
     expect(drop).not.toBe(chemblDataframeDrop);
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(9);
   });
 
   it('hands the registry the raw definition when the flag is on', () => {
     const tools = registeredTools(true);
     expect(tools.find((t) => t.name === 'chembl_dataframe_drop')).toBe(chemblDataframeDrop);
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(9);
   });
 
   it('preserves the definition through the wrapper', () => {
@@ -127,7 +136,7 @@ describe('chembl_dataframe_drop — registration gate', () => {
     expect(drop?.handler).toBe(chemblDataframeDrop.handler);
   });
 
-  it('always registers the seven core tools regardless of the flag', () => {
+  it('always registers the eight core tools regardless of the flag', () => {
     for (const flag of [false, true]) {
       const names = registeredTools(flag).map((t) => t.name);
       expect(names).toContain('chembl_search_molecules');
@@ -265,7 +274,7 @@ describe('src/index.ts — server config parsed in setup() (#30)', () => {
     vi.stubEnv('CHEMBL_DATAFRAME_DROP_ENABLED', 'true');
     const { options, drop, dropEntry } = await loadIndex();
     expect(dropEntry).toBe(drop);
-    expect(options.tools).toHaveLength(8);
+    expect(options.tools).toHaveLength(9);
     expect(runSetup(options)).toBeUndefined();
   });
 
@@ -335,4 +344,97 @@ describe('src/index.ts — DataCanvas on by default', () => {
     // The framework config createApp() reads is parsed from the same env.
     expect(parseConfig().canvas.providerType).toBe(expected);
   });
+});
+
+/** The working directory's `.env`: a file with this body, a directory, or none. */
+type DotEnv = { file: string } | 'directory' | 'absent';
+
+const DOT_ENV_CANVAS_OFF_DROP_ON = {
+  file: 'CANVAS_PROVIDER_TYPE=none\nCHEMBL_DATAFRAME_DROP_ENABLED=true\n',
+};
+
+describe('src/index.ts — .env loaded at import (#47)', () => {
+  const originalCwd = process.cwd();
+  let scratchDir: string | undefined;
+
+  /** Run the rest of the test from a fresh directory holding `dotEnv`. */
+  function enterScratchCwd(dotEnv: DotEnv): void {
+    scratchDir = mkdtempSync(join(tmpdir(), 'chembl-env-'));
+    if (dotEnv === 'directory') mkdirSync(join(scratchDir, '.env'));
+    else if (dotEnv !== 'absent') writeFileSync(join(scratchDir, '.env'), dotEnv.file);
+    process.chdir(scratchDir);
+  }
+
+  /**
+   * Unset rather than blank: `.env` never overrides a variable that is set, even
+   * to an empty string, so a blank stub would hide the file's value.
+   */
+  beforeEach(() => {
+    for (const name of [...SERVER_VARS, 'CANVAS_PROVIDER_TYPE']) {
+      vi.stubEnv(name, undefined as unknown as string);
+    }
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    if (scratchDir) rmSync(scratchDir, { recursive: true, force: true });
+    scratchDir = undefined;
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ['MCP_HTTP_PORT', '12.5', 'http'],
+    ['CANVAS_DEFAULT_ROW_LIMIT', '1.5', 'stdio'],
+  ])(
+    'imports with %s=%s, leaving its rejection to the parse createApp() runs',
+    async (name, value, transport) => {
+      vi.stubEnv('MCP_TRANSPORT_TYPE', transport);
+      vi.stubEnv(name, value);
+      await loadIndex();
+      let parseError: unknown;
+      try {
+        parseConfig();
+      } catch (error) {
+        parseError = error;
+      }
+      expect(parseError).toMatchObject({
+        code: JsonRpcErrorCode.ConfigurationError,
+        message: expect.stringContaining(`${name} (`),
+      });
+    },
+  );
+
+  it('imports when ./.env exists but cannot be read, on the defaults', async () => {
+    enterScratchCwd('directory');
+    const { drop, dropEntry } = await loadIndex();
+    expect(process.env.CANVAS_PROVIDER_TYPE).toBe('duckdb');
+    expect(dropEntry).not.toBe(drop);
+  });
+
+  it.each<[string, DotEnv, Record<string, string>, string, boolean]>([
+    ['no .env', 'absent', {}, 'duckdb', false],
+    [
+      'a .env turning the canvas off and the drop tool on',
+      DOT_ENV_CANVAS_OFF_DROP_ON,
+      {},
+      'none',
+      true,
+    ],
+    [
+      'that .env under explicit environment values',
+      DOT_ENV_CANVAS_OFF_DROP_ON,
+      { CANVAS_PROVIDER_TYPE: 'duckdb', CHEMBL_DATAFRAME_DROP_ENABLED: 'false' },
+      'duckdb',
+      false,
+    ],
+  ])(
+    'with %s, reads CANVAS_PROVIDER_TYPE and the drop flag from env, then .env',
+    async (_label, dotEnv, env, canvas, dropOn) => {
+      for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+      enterScratchCwd(dotEnv);
+      const { drop, dropEntry } = await loadIndex();
+      expect(process.env.CANVAS_PROVIDER_TYPE).toBe(canvas);
+      expect(dropEntry === drop).toBe(dropOn);
+    },
+  );
 });

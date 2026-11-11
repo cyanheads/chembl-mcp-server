@@ -23,7 +23,6 @@
 
 import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import {
-  CanvasIdSchema,
   type CanvasInstance,
   type ColumnType,
   type DataCanvas,
@@ -34,9 +33,11 @@ import { decodeCursor, encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import {
   assayTypeInput,
+  blankAsUnset,
   clampLimit,
   isChemblId,
   LIMIT_CEILING,
+  optionalCanvasIdInput,
   optionalChemblIdInput,
   optionalMoleculeRefInput,
 } from '@/mcp-server/input-normalization.js';
@@ -75,7 +76,7 @@ const VIEW = {
   potency_ranked: {
     table: 'bioactivities',
     sqlExample:
-      'SELECT molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities GROUP BY 1 ORDER BY 2 DESC',
+      'SELECT parent_molecule_chembl_id, MEDIAN(pchembl_value) AS med FROM bioactivities WHERE potential_duplicate IS NOT TRUE GROUP BY 1 ORDER BY 2 DESC',
     narrowWith: 'standard_type or pchembl_value_min',
   },
   null_potency: {
@@ -94,6 +95,12 @@ const ActivitySchema = z
       .string()
       .nullable()
       .describe('Compound preferred name. Null for many research compounds.'),
+    parent_molecule_chembl_id: z
+      .string()
+      .nullable()
+      .describe(
+        'Family parent of the measured compound: the ID ChEMBL files its salts and other alternate forms under, and the one include_alternate_forms reads by. Equals molecule_chembl_id when the compound is its own parent; GROUP BY it to merge a drug with its salts. Null when absent.',
+      ),
     target_chembl_id: z.string().describe('ChEMBL target ID the compound was measured against.'),
     target_pref_name: z.string().nullable().describe('Target preferred name. Null when unnamed.'),
     target_organism: z
@@ -102,7 +109,9 @@ const ActivitySchema = z
       .describe('Target organism, e.g. "Homo sapiens". Null when unspecified.'),
     assay_chembl_id: z
       .string()
-      .describe('ChEMBL assay ID — pass to chembl_get_assay for provenance.'),
+      .describe(
+        'ChEMBL assay ID — pass to chembl_get_assay for provenance; it takes up to 100 distinct assay IDs in one call.',
+      ),
     assay_type: z
       .string()
       .nullable()
@@ -110,6 +119,12 @@ const ActivitySchema = z
         'Assay type code: B=binding, F=functional, A=ADMET, T=toxicity, P=physicochemical, U=unclassified. Null when absent.',
       ),
     assay_description: z.string().nullable().describe('Assay description text. Null when absent.'),
+    bao_label: z
+      .string()
+      .nullable()
+      .describe(
+        'Assay format from the BioAssay Ontology, e.g. "single protein format", "protein format", "cell-based format"; "assay format" means no specific format was assigned. The format of the assay, not the type of the target: a single-protein target has cell-based rows too. Null when absent.',
+      ),
     standard_type: z
       .string()
       .nullable()
@@ -155,6 +170,12 @@ const ActivitySchema = z
       .describe(
         'ChEMBL data-validity annotation, e.g. "Outside typical range", "Potential transcription error", "Non standard unit for type", or "Manually validated" (a value curators confirmed). Null when unannotated.',
       ),
+    potential_duplicate: z
+      .boolean()
+      .nullable()
+      .describe(
+        "ChEMBL's potential_duplicate flag: true when the value is likely a repeat citation of one reported in an earlier document rather than a new measurement — filter on potential_duplicate IS NOT TRUE before counting measurements per compound, which keeps a row whose flag is null. false does not prove the measurement independent. Null when ChEMBL records no flag.",
+      ),
     assay_variant_mutation: z
       .string()
       .nullable()
@@ -171,7 +192,7 @@ const ActivitySchema = z
       .string()
       .nullable()
       .describe(
-        'ChEMBL document ID of the publication or deposited dataset the measurement comes from — cite it. Null when absent.',
+        'ChEMBL document ID of the publication or deposited dataset the measurement comes from — pass to chembl_get_documents for its title, PMID, and DOI to cite. Null when absent.',
       ),
     document_year: z
       .number()
@@ -187,12 +208,14 @@ const ACTIVITY_COLUMNS = {
   activity_id: 'BIGINT',
   molecule_chembl_id: 'VARCHAR',
   molecule_pref_name: 'VARCHAR',
+  parent_molecule_chembl_id: 'VARCHAR',
   target_chembl_id: 'VARCHAR',
   target_pref_name: 'VARCHAR',
   target_organism: 'VARCHAR',
   assay_chembl_id: 'VARCHAR',
   assay_type: 'VARCHAR',
   assay_description: 'VARCHAR',
+  bao_label: 'VARCHAR',
   standard_type: 'VARCHAR',
   standard_relation: 'VARCHAR',
   standard_value: 'DOUBLE',
@@ -204,6 +227,7 @@ const ACTIVITY_COLUMNS = {
   relation: 'VARCHAR',
   activity_comment: 'VARCHAR',
   data_validity_comment: 'VARCHAR',
+  potential_duplicate: 'BOOLEAN',
   assay_variant_mutation: 'VARCHAR',
   assay_variant_accession: 'VARCHAR',
   document_chembl_id: 'VARCHAR',
@@ -335,6 +359,32 @@ async function promoteStaged(
   });
 }
 
+const OR_LIST = new Intl.ListFormat('en', { type: 'disjunction' });
+
+/**
+ * What a zero match tells the caller to loosen: every filter the call sent, by
+ * name, and none it did not. organism leads, since it matches only the target
+ * organism as ChEMBL records it, a scientific name: "human" matches nothing where
+ * "Homo sapiens" matches.
+ */
+function loosenFilters(filters: GetActivitiesOptions): string {
+  const loosen = [
+    filters.standardType !== undefined && 'drop standard_type',
+    filters.pchemblValueMin !== undefined && 'lower pchembl_value_min',
+    filters.assayType !== undefined && 'drop assay_type',
+    filters.variant !== undefined && 'drop variant',
+  ].filter((step) => step !== false);
+  if (filters.organism === undefined) {
+    return loosen.length === 0
+      ? ' No filter narrowed the query, so check the ID.'
+      : ` Broaden the filters (${OR_LIST.format(loosen)}), or check the ID.`;
+  }
+  const organism = ` organism ${JSON.stringify(filters.organism)} must equal the target organism as ChEMBL records it, a scientific name such as "Homo sapiens" in any case: re-call without organism first, then read target_organism on the rows for the name it records.`;
+  return loosen.length === 0
+    ? `${organism} Otherwise check the ID.`
+    : `${organism} Otherwise broaden the other filters (${OR_LIST.format(loosen)}), or check the ID.`;
+}
+
 /**
  * Compose the agent-facing notice for a bioactivities result. Names which side of
  * the pchembl_value split was returned and how to reach the other (so the honest
@@ -351,10 +401,10 @@ async function promoteStaged(
  * reported total. `page` is set on the inline-page branch —
  * canvas disabled, or any cursor page — and says where the page starts in the
  * view and whether rows remain past it. `canvasId` names the canvas the table was
- * staged on, and the supplied canvas a cursor page left untouched. `variant` is the
- * parsed variant filter, which a zero match explains. `typeVariant` is the case
- * variant ChEMBL records for a standard_type that matched nothing, when the lookup
- * found one.
+ * staged on, and the supplied canvas a cursor page left untouched. `filters` are
+ * the parsed filters the call sent, which a zero match names. `typeVariant` is the
+ * case variant ChEMBL records for a standard_type that matched nothing, when the
+ * lookup found one.
  */
 function buildNotice(args: {
   view: PotencyView;
@@ -370,12 +420,12 @@ function buildNotice(args: {
   canvasDisabled: boolean;
   canvasId?: string | undefined;
   page?: { offset: number; hasMore: boolean };
-  variant: VariantFilter | undefined;
+  filters: GetActivitiesOptions;
   typeVariant: { requested: string; recorded: string } | undefined;
 }): string | undefined {
   const {
     view,
-    variant,
+    filters,
     typeVariant,
     previewCount,
     totalCount,
@@ -401,14 +451,18 @@ function buildNotice(args: {
       return `That cursor starts past the end of the ${viewTotal} rows in this view — the walk is complete.`;
     }
     const variantHint =
-      variant?.kind === 'mutation'
+      filters.variant?.kind === 'mutation'
         ? ' variant must equal a recorded variant string whole, case-insensitively, in the order ChEMBL records it: "L858R,T790M" matches its rows, while "T790M,L858R" and a lone "L858R" do not. Re-call without variant and read assay_variant_mutation on the rows for the recorded strings.'
+        : '';
+    const familyHint =
+      filters.molecule?.scope === 'form'
+        ? " A drug's measurements are often filed under another form of its family (a salt, or its parent): re-call with include_alternate_forms: true to read every form."
         : '';
     const empty =
       totalCount === 0
         ? typeVariant
           ? `No measurements matched standard_type "${typeVariant.requested}". standard_type matches exactly, case included, and ChEMBL records a case variant of it under these filters: "${typeVariant.recorded}". Re-call with standard_type: "${typeVariant.recorded}".${variantHint}`
-          : `No measurements matched. Broaden the filters (drop standard_type or lower pchembl_value_min), or check the ID.${variantHint}`
+          : `No measurements matched.${loosenFilters(filters)}${familyHint}${variantHint}`
         : nullView
           ? `Every one of the ${totalCount} matching measurements carries a derivable pchembl_value, so the null_potency view is empty. The default potency_view: "potency_ranked" holds all ${totalCount}.`
           : `All ${totalCount} matching measurements lack a derivable pchembl_value, so none appear in this potency-ranked view — the measurements exist but report no comparable potency. Re-call with potency_view: "null_potency" to retrieve them.`;
@@ -522,7 +576,7 @@ function parseVariant(raw: string | undefined): VariantFilter | undefined {
 export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
   title: 'chembl-get-bioactivities',
   description:
-    'The flagship compound↔target bioactivity bridge: measurements for a molecule (target deconvolution / selectivity), a target (lead finding), or both together (how potently one compound hits one target). Supply at least one of molecule_chembl_id (from chembl_search_molecules) or target_chembl_id (from chembl_search_targets) — supplying both narrows to that compound–target pair, supplying neither is an error. A drug\'s measurements are often split across its salts and other alternate forms, so molecule_chembl_id reads that one form unless include_alternate_forms widens it to the whole family under its parent (a salt\'s ID included), every view, page, and spill reading the same family. Filter by standard_type (IC50/Ki/EC50/…), minimum potency pchembl_value_min, assay_type, organism, and variant (wild type, or one recorded mutant such as "T315I"). Each row carries its activity_comment and data_validity_comment, its assay variant, and its source document for citation. Not every measurement has a derivable pchembl_value, so potency_view picks which side of that split you get: the default "potency_ranked" returns the measurements that have one, most potent first (ChEMBL sorts the rest first otherwise, which is why they are not merged), and "null_potency" returns exactly the measurements that have none. totalCount is the honest full match count across both views either way. Mixing measurement types (IC50 vs Ki) is a scientific error — set standard_type to compare like with like. A popular target carries tens of thousands of rows: results spill to a DataCanvas table (call chembl_dataframe_describe for its columns, then chembl_dataframe_query for honest aggregates across the staged set), while an inline preview answers the immediate question. Each view stages its own table (bioactivities / bioactivities_null_potency), so running both against one canvas_id lets a UNION ALL rebuild the full set. A canvas is minted only when a view spills; pass its canvas_id back and every later non-cursor call re-stages the table of its view with its own rows, even when they fit inline or none match, so a successful call never leaves rows from an earlier query in it, and a spill that fails or is cancelled leaves the earlier table in place. The spill is bounded by a row cap (CHEMBL_MAX_SPILL_ROWS) and a time budget (CHEMBL_SPILL_DEADLINE_MS); when either stops it short of the view, truncated is true, truncated_by names the bound, and the table is a bounded slice, not the complete view. The inline rows are always capped at limit, so compare that against totalCount before treating them as the whole answer. Spilling needs the canvas, which is on unless the server sets CANVAS_PROVIDER_TYPE=none. Whenever a call stages nothing and rows remain past this page — the canvas is off, or the view fit inline with no canvas_id — nextCursor continues the view: pass it back as cursor, with the same filters and potency_view, for the next page. A cursor page is always returned inline and never staged, canvas or not.',
+    'The flagship compound↔target bioactivity bridge: measurements for a molecule (target deconvolution / selectivity), a target (lead finding), or both together (how potently one compound hits one target). Supply at least one of molecule_chembl_id (from chembl_search_molecules) or target_chembl_id (from chembl_search_targets) — supplying both narrows to that compound–target pair, supplying neither is an error. A drug\'s measurements are often split across its salts and other alternate forms, so molecule_chembl_id reads that one form unless include_alternate_forms widens it to the whole family under its parent (a salt\'s ID included), every view, page, and spill reading the same family. Filter by standard_type (IC50/Ki/EC50/…), minimum potency pchembl_value_min, assay_type, organism, and variant (wild type, or one recorded mutant such as "T315I"). Each row carries its activity_comment and data_validity_comment, its assay variant, its source document for citation, its family parent_molecule_chembl_id (merge a drug with its salts on it), ChEMBL\'s potential_duplicate flag for repeat citations, and its assay format (bao_label). Not every measurement has a derivable pchembl_value, so potency_view picks which side of that split you get: the default "potency_ranked" returns the measurements that have one, most potent first (ChEMBL sorts the rest first otherwise, which is why they are not merged), and "null_potency" returns exactly the measurements that have none. totalCount is the honest full match count across both views either way. Mixing measurement types (IC50 vs Ki) is a scientific error — set standard_type to compare like with like. A popular target carries tens of thousands of rows: results spill to a DataCanvas table (call chembl_dataframe_describe for its columns, then chembl_dataframe_query for honest aggregates across the staged set), while an inline preview answers the immediate question. Each view stages its own table (bioactivities / bioactivities_null_potency), so running both against one canvas_id lets a UNION ALL rebuild the full set. A canvas is minted only when a view spills; pass its canvas_id back and every later non-cursor call re-stages the table of its view with its own rows, even when they fit inline or none match, so a successful call never leaves rows from an earlier query in it, and a spill that fails or is cancelled leaves the earlier table in place. The spill is bounded by a row cap (CHEMBL_MAX_SPILL_ROWS) and a time budget (CHEMBL_SPILL_DEADLINE_MS); when either stops it short of the view, truncated is true, truncated_by names the bound, and the table is a bounded slice, not the complete view. The inline rows are always capped at limit, so compare that against totalCount before treating them as the whole answer. Spilling needs the canvas, which is on unless the server sets CANVAS_PROVIDER_TYPE=none. Whenever a call stages nothing and rows remain past this page — the canvas is off, or the view fit inline with no canvas_id — nextCursor continues the view: pass it back as cursor, with the same filters and potency_view, for the next page. A cursor page is always returned inline and never staged, canvas or not.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     molecule_chembl_id: optionalMoleculeRefInput.describe(
@@ -551,9 +605,16 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       .describe(
         'Minimum pchembl_value (−log10 molar potency), e.g. 7 keeps sub-100 nM activities. Only valid on the potency_ranked view — the null_potency rows have no pchembl_value to compare against.',
       ),
+    /**
+     * A blank reads as the default. The schema advertises "" beside the two views so
+     * a validating client may send what a form leaves empty; the preprocess maps it
+     * (and any whitespace) to unset before the enum sees it.
+     */
     potency_view: z
-      .enum(['potency_ranked', 'null_potency'])
-      .default('potency_ranked')
+      .preprocess(
+        blankAsUnset,
+        z.enum(['potency_ranked', 'null_potency', '']).default('potency_ranked'),
+      )
       .describe(
         'Which side of the pchembl_value presence split to retrieve. "potency_ranked" (default) returns the measurements that have a derivable pchembl_value, most potent first. "null_potency" returns exactly the measurements that have none — the rows the ranked view excludes, otherwise unreachable. The two partition the match set and stage to separate canvas tables.',
       ),
@@ -581,7 +642,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       .describe(
         'Maximum rows in the inline preview or cursor page, up to 1000 — a larger value is served at 1000, with a notice saying so. Defaults to the server default (25). With the canvas enabled, a view that spills still stages in full whatever the limit; when a call stages nothing, nextCursor reaches the rows past limit.',
       ),
-    canvas_id: CanvasIdSchema.optional().describe(
+    canvas_id: optionalCanvasIdInput.describe(
       "Optional canvas ID from a prior call to reuse the same canvas. With it, the call re-stages the selected potency_view's table with this call's rows whether they spill, fit inline, or are empty, so a second query of the SAME view REPLACES (overwrites) its prior rows once it succeeds — it does not append, and a spill that fails or is cancelled leaves them — while the other view's table is left intact, which is what lets both coexist on one canvas. Omit it and a fresh canvas is minted only if the view spills. Left untouched on a cursor page, which never stages.",
     ),
     cursor: z
@@ -769,7 +830,8 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       throw ctx.fail('not_a_chembl_id');
     }
 
-    const view: PotencyView = input.potency_view;
+    // The schema has read a blank as the default; "" is an enum member only to be advertised.
+    const view: PotencyView = input.potency_view || 'potency_ranked';
 
     /**
      * A potency floor over rows defined by having no potency matches nothing. Fail
@@ -896,13 +958,13 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
      * Budget for spillover's drain buffer — it decides fit-vs-spill and feeds the
      * overflow sentinel, and nothing else: the inline rows come from the walk's
      * first `limit` rows (`head` below), so a spill shows a full `limit` however
-     * few rows the buffer held. Real rows serialize to 690–870 characters on
-     * average, so 800 per row puts the line at about `limit` average rows: a view
+     * few rows the buffer held. Real rows serialize to 770–975 characters on
+     * average, so 900 per row puts the line at about `limit` average rows: a view
      * much larger than `limit` spills and stays SQL-queryable from its canvas_id,
      * rather than coming back as one page and a cursor with nothing staged. The
-     * floor fits a small view of ~60 rows inline at any `limit`.
+     * floor fits a small view of ~55 rows inline at any `limit`.
      */
-    const previewChars = Math.max(50_000, limit * 800);
+    const previewChars = Math.max(50_000, limit * 900);
 
     if (inlinePage) {
       /**
@@ -935,7 +997,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       const hasMore = preview.length > 0 && nextOffset < viewTotal;
       const notice = buildNotice({
         view,
-        variant,
+        filters,
         typeVariant,
         previewCount: preview.length,
         totalCount,
@@ -969,9 +1031,12 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
     /**
      * A supplied canvas_id is resolved first, so an unknown or expired id fails
      * before the spill walk. Without one, nothing is minted until the view spills
-     * (#28). The framework's refusal at the tenant's canvas cap carries a hint
-     * offering a drop tool, which frees no canvas here, so it is re-raised under
-     * this tool's contract with the original on `cause`.
+     * (#28). The framework's refusal at the tenant's canvas cap offers only reusing
+     * a held canvas_id or waiting for idle canvases to expire, so it is re-raised
+     * under this tool's contract, whose hint adds what this tool can do: narrow
+     * until the view fits inline, which needs no canvas, and stage on a held
+     * canvas_id at the cost of its table for the same view. The original rides on
+     * `cause`.
      */
     const instance =
       input.canvas_id === undefined
@@ -1073,7 +1138,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       const truncatedBy = boundOf(result.handle.rowCount);
       const notice = buildNotice({
         view,
-        variant,
+        filters,
         typeVariant,
         previewCount: preview.length,
         totalCount,
@@ -1119,7 +1184,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       const truncatedBy = boundOf(handle.rowCount);
       const notice = buildNotice({
         view,
-        variant,
+        filters,
         typeVariant,
         previewCount: preview.length,
         totalCount,
@@ -1160,7 +1225,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
     const hasMore = preview.length > 0 && preview.length < viewTotal;
     const notice = buildNotice({
       view,
-      variant,
+      filters,
       typeVariant,
       previewCount: preview.length,
       totalCount,
@@ -1195,7 +1260,8 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
       : result.table_name !== null
         ? `spilled: no — the view fit inline and was re-staged on canvas \`${result.canvas_id}\` as table \`${result.table_name}\` (chembl_dataframe_describe for the columns, then chembl_dataframe_query to SQL them)`
         : result.canvasDisabled
-          ? 'spilled: no — canvas disabled; these rows are a capped preview, not the complete set'
+          ? // A last cursor page has no nextCursor either, so its absence never proves the page is the whole view.
+            `spilled: no — canvas disabled; ${result.nextCursor ? 'more' : 'no'} rows of this view remain past this page`
           : result.activities.length === result.totalCount
             ? 'spilled: no (preview is the full set)'
             : `spilled: no — showing ${result.activities.length} of ${result.totalCount} matching measurements (${result.potency_view} view)`;
@@ -1229,6 +1295,7 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
         a.value != null
           ? mdInline(`${a.relation ?? ''}${a.value} ${a.units ?? ''}`.trim())
           : 'not reported';
+      const duplicate = a.potential_duplicate === null ? '—' : a.potential_duplicate ? 'yes' : 'no';
       // Segments render only when present, so an unannotated row reads as before.
       const comments = [
         a.activity_comment !== null && ` | activity_comment: ${mdInline(a.activity_comment)}`,
@@ -1242,10 +1309,10 @@ export const chemblGetBioactivities = tool('chembl_get_bioactivities', {
           ` | document ${mdInline(a.document_chembl_id ?? '—')}${a.document_year !== null ? ` (${a.document_year})` : ''}`,
       ];
       return [
-        `**${mdInline(a.molecule_chembl_id)}** (${mdInline(a.molecule_pref_name ?? '—')}) → **${mdInline(a.target_chembl_id)}** (${mdInline(a.target_pref_name ?? '—')}) [${mdInline(a.target_organism ?? '—')}]`,
+        `**${mdInline(a.molecule_chembl_id)}** (${mdInline(a.molecule_pref_name ?? '—')}; parent ${mdInline(a.parent_molecule_chembl_id ?? '—')}) → **${mdInline(a.target_chembl_id)}** (${mdInline(a.target_pref_name ?? '—')}) [${mdInline(a.target_organism ?? '—')}]`,
         // standard_type begins its line, where a leading `#` or `>` would open a block.
-        `${mdLineStart(a.standard_type ?? '—')}: ${potency} | pChEMBL: ${pchembl} | raw ${mdInline(a.type ?? '—')}: ${raw}${comments.filter(Boolean).join('')}`,
-        `assay ${mdInline(a.assay_chembl_id)} (${mdInline(a.assay_type ?? '—')}): ${mdInline(a.assay_description ?? '—')} | activity_id ${a.activity_id}${provenance.filter(Boolean).join('')}`,
+        `${mdLineStart(a.standard_type ?? '—')}: ${potency} | pChEMBL: ${pchembl} | raw ${mdInline(a.type ?? '—')}: ${raw} | potential_duplicate: ${duplicate}${comments.filter(Boolean).join('')}`,
+        `assay ${mdInline(a.assay_chembl_id)} (${mdInline(a.assay_type ?? '—')}, ${mdInline(a.bao_label ?? '—')}): ${mdInline(a.assay_description ?? '—')} | activity_id ${a.activity_id}${provenance.filter(Boolean).join('')}`,
       ].join('\n');
     });
     /**

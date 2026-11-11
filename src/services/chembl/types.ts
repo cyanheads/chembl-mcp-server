@@ -22,7 +22,11 @@ export interface Molecule {
   canonical_smiles: string | null;
   /** Full molecular formula, e.g. "C9H8O4". */
   full_molformula: string | null;
-  /** Max clinical phase: 4 = marketed, 0/null = research. The cheap druggability signal. */
+  /**
+   * Max clinical phase: 4 = approved (kept after a withdrawal), 3–1 = trial phase,
+   * 0.5 = early phase 1, −1 = clinical with the phase unknown; `null` when ChEMBL
+   * records no clinical development. The cheap druggability signal.
+   */
   max_phase: number | null;
   /** ChEMBL molecule ID, e.g. "CHEMBL25". */
   molecule_chembl_id: string;
@@ -68,6 +72,8 @@ export interface Activity {
   assay_variant_accession: string | null;
   /** The assay's recorded variant, e.g. "T315I", "L858R,T790M", "UNDEFINED MUTATION". `null` when none is recorded. */
   assay_variant_mutation: string | null;
+  /** BioAssay Ontology assay format, e.g. "single protein format", "cell-based format"; "assay format" when none was assigned. Not the target type. */
+  bao_label: string | null;
   /** ChEMBL's data-validity annotation, e.g. "Outside typical range". `null` when unannotated. */
   data_validity_comment: string | null;
   /** ChEMBL document ID of the measurement's source publication or deposited dataset. */
@@ -78,8 +84,12 @@ export interface Activity {
   molecule_chembl_id: string;
   /** Compound preferred name. `null` for many research compounds. */
   molecule_pref_name: string | null;
+  /** Family parent of the measured compound — the ID its salts and alternate forms are filed under (`include_alternate_forms` reads by it); the compound's own ID when it is the parent. */
+  parent_molecule_chembl_id: string | null;
   /** −log10(molar potency); the rank field. `null` when underivable. */
   pchembl_value: number | null;
+  /** ChEMBL's `potential_duplicate` flag: 1 → `true` (likely a repeat citation of an earlier document's value), 0 → `false` (not proof of independence), absent → `null`. */
+  potential_duplicate: boolean | null;
   /** Original relation string from upstream. */
   relation: string | null;
   /** Standardized relation: "=", ">", "<", etc. */
@@ -185,12 +195,59 @@ export type ListStatus = 'complete' | 'truncated' | 'failed';
  */
 export type ListFailure = 'timeout' | 'upstream_error';
 
+/** One source ChEMBL cites for a {@link Warning}. */
+export interface WarningRef {
+  /** The source's identifier within its type, e.g. a DailyMed set ID or a PubMed ID. */
+  ref_id: string | null;
+  /** Source type, e.g. "DailyMed", "FDA", "WHO", "PubMed". */
+  ref_type: string | null;
+  /** Link to the source. */
+  ref_url: string | null;
+}
+
+/** One withdrawal or boxed-warning record ChEMBL files on a form of a drug. */
+export interface Warning {
+  /** EFO ID of the adverse effect, e.g. "EFO:0000712". */
+  efo_id: string | null;
+  /** EFO term of the adverse effect, e.g. "stroke". */
+  efo_term: string | null;
+  /** The form of the drug's family the record is filed on — the parent, or a salt or other alternate form. */
+  molecule_chembl_id: string | null;
+  /** The sources ChEMBL cites, in upstream order. */
+  refs: WarningRef[];
+  /** Toxicity class, e.g. "cardiotoxicity". */
+  warning_class: string | null;
+  /** Where it applies — a country, a semicolon-joined list of them, "Worldwide", or a region such as "European Union". */
+  warning_country: string | null;
+  /** Why the drug was withdrawn. ChEMBL records none on a boxed warning. */
+  warning_description: string | null;
+  /** "Withdrawn" or "Black Box Warning". */
+  warning_type: string | null;
+  /** Year of the withdrawal. ChEMBL records none on a boxed warning. */
+  warning_year: number | null;
+}
+
 /**
- * Drug pharmacology for one molecule: its own record, joined to the mechanisms and
- * indications ChEMBL records across its family (the parent and its alternate forms).
+ * Drug pharmacology for one molecule: its own record (phase and approval year
+ * included), joined to the regulatory flags, mechanisms, indications, and warnings
+ * ChEMBL records across its family (the parent and its alternate forms).
  */
 export interface DrugInfo {
-  /** Year of first approval, from the molecule record. `null` if unapproved/unknown. */
+  /**
+   * Whether any form of the family carries a boxed warning. `null` when no form
+   * read carries one and the family read failed or was cut short.
+   */
+  black_box_warning: boolean | null;
+  /**
+   * How the family's forms were read for `withdrawn` and `black_box_warning` —
+   * `failed` means the queried form's own record answered alone. The tool reports
+   * it in its notice rather than as an output field.
+   */
+  family_read: { failure: ListFailure | null; status: ListStatus };
+  /**
+   * Year of first approval the queried form's own record writes, never the family's
+   * earliest: ChEMBL files deuterated analogs under their parent. `null` if it records none.
+   */
   first_approval: number | null;
   /** Clinical indication(s). Empty is authoritative only when `indications_status` is `complete`. */
   indications: Indication[];
@@ -210,7 +267,7 @@ export interface DrugInfo {
    * never 0.
    */
   indications_total_count: number | null;
-  /** Max clinical phase across all indications. */
+  /** The queried form's own max clinical phase ({@link Molecule.max_phase}), never the family's highest; a withdrawal keeps 4. */
   max_phase: number | null;
   /** Mechanism(s) of action. Empty is authoritative only when `mechanisms_status` is `complete`. */
   mechanisms: Mechanism[];
@@ -222,10 +279,24 @@ export interface DrugInfo {
   mechanisms_total_count: number | null;
   /** ChEMBL molecule ID, as the molecule's own record writes it. */
   molecule_chembl_id: string;
-  /** The family parent both lists were requested by ({@link Molecule.parent_chembl_id}). */
+  /** The family parent every list and the family flags read were requested by ({@link Molecule.parent_chembl_id}). */
   parent_molecule_chembl_id: string;
   /** Preferred name. */
   pref_name: string | null;
+  /** Withdrawal and boxed-warning records. Empty is authoritative only when `warnings_status` is `complete`. */
+  warnings: Warning[];
+  /** Why `warnings` failed; `null` unless `warnings_status` is `failed`. */
+  warnings_failure: ListFailure | null;
+  /** Retrieval state of `warnings`. */
+  warnings_status: ListStatus;
+  /** Upstream warning total. `null` when the fetch failed — unknown, never 0. */
+  warnings_total_count: number | null;
+  /**
+   * Whether any form of the family (isotope-labelled and deuterated analogs
+   * included) was withdrawn from the market in at least one country. `null` when
+   * no form read carries the flag and the family read failed or was cut short.
+   */
+  withdrawn: boolean | null;
 }
 
 /**
@@ -241,22 +312,85 @@ export interface ListPage<T> {
 
 /** Assay provenance behind a bioactivity row. */
 export interface Assay {
+  /** Cell line or cell type the assay ran in, e.g. "A-431". */
+  assay_cell_type: string | null;
   /** ChEMBL assay ID. */
   assay_chembl_id: string;
+  /** Organism strain, e.g. "Sprague-Dawley". */
+  assay_strain: string | null;
+  /** Tissue the assay ran in, e.g. "Liver". */
+  assay_tissue: string | null;
   /** Assay type code: B=binding, F=functional, A=ADMET, T=toxicity, P=physicochemical, U=unclassified. */
   assay_type: string | null;
   /** Human-readable assay type, e.g. "Binding". */
   assay_type_description: string | null;
+  /** BioAssay Ontology format, e.g. "single protein format", "cell-based format". */
+  bao_label: string | null;
   /** Human-readable confidence description. */
   confidence_description: string | null;
-  /** ChEMBL confidence score, 1–9 (9 = direct assay on the protein target). */
+  /**
+   * ChEMBL confidence score, 0–9: 9 = direct single protein target, lower =
+   * homologous, complex, or non-protein targets, 0 = no target assigned yet
+   * (ChEMBL's default, on the catch-all target). ChEMBL scores every assay.
+   */
   confidence_score: number | null;
   /** Assay description text. */
   description: string | null;
+  /** ChEMBL document ID of the publication or deposited dataset the assay comes from. */
+  document_chembl_id: string | null;
   /** Assay organism. */
   organism: string | null;
   /** ChEMBL target ID the assay measures, when assigned. */
   target_chembl_id: string | null;
+}
+
+/**
+ * The publication, patent, or deposited dataset behind a ChEMBL document ID —
+ * what a bioactivity row or an assay record cites. Every field but the ID is null
+ * when ChEMBL records none: a patent carries only its title, year, and patent number.
+ */
+export interface Document {
+  /** Author list as recorded, e.g. "Knight ZA, Shokat KM.". */
+  authors: string | null;
+  /** PUBLICATION, PATENT, DATASET, or BOOK. */
+  doc_type: string | null;
+  /** ChEMBL document ID. */
+  document_chembl_id: string;
+  /** DOI, e.g. "10.1021/jm501578n"; ChEMBL mints 10.6019/ DOIs for deposited datasets. */
+  doi: string | null;
+  /** First page as recorded, e.g. "10176". */
+  first_page: string | null;
+  /** Journal issue as recorded, e.g. "23". */
+  issue: string | null;
+  /** Journal abbreviation, e.g. "J Med Chem". */
+  journal: string | null;
+  /** Last page as recorded, e.g. "10191". */
+  last_page: string | null;
+  /** Patent number, e.g. "US-8470888-B2". */
+  patent_id: string | null;
+  /** PubMed ID as its digit string, the form PubMed tools take: ChEMBL ships an integer. */
+  pubmed_id: string | null;
+  /** Title as recorded. */
+  title: string | null;
+  /** Journal volume as recorded, e.g. "57". */
+  volume: string | null;
+  /** Publication year. */
+  year: number | null;
+}
+
+/**
+ * One batch lookup by ChEMBL ID: the records found, the IDs looked up that
+ * ChEMBL holds no record of that entity for, and the IDs past the per-call cap
+ * left for another call — each in the order the caller gave, every distinct ID
+ * in exactly one of the three.
+ */
+export interface BatchLookup<T> {
+  /** Distinct IDs past the cap, not looked up. */
+  deferredIds: string[];
+  /** The records found. */
+  items: T[];
+  /** IDs looked up with no record: unknown, or an ID of another entity type. */
+  notFoundIds: string[];
 }
 
 /** Result envelope carrying the upstream `page_meta.total_count` alongside rows. */
@@ -270,8 +404,10 @@ export interface Page<T> {
 /** A page of a molecule search, whose route may stop counting at a ceiling. */
 export interface MoleculePage extends Page<Molecule> {
   /**
-   * `totalCount` is the search route's ceiling rather than a count: at least that
-   * many compounds match, and ChEMBL serves no row past it.
+   * `totalCount` is a lower bound rather than a count: the search route's ceiling
+   * (at least that many compounds match, and ChEMBL serves no row past it), or a
+   * filtered substructure total ChEMBL took from only the first hits up to its
+   * ceiling.
    */
   totalCountCapped: boolean;
 }
@@ -288,6 +424,8 @@ export interface SearchMoleculesOptions {
 /** Options for `structureSearch` (exact / similarity / substructure). */
 export interface StructureSearchOptions {
   limit: number;
+  /** Keep only compounds whose recorded max clinical phase is at least this; a null phase never passes. */
+  maxPhaseMin?: number | undefined;
   /** Zero-based row to start the upstream window at. Defaults to 0. */
   offset?: number | undefined;
   searchType: Extract<SearchType, 'exact' | 'similarity' | 'substructure'>;
@@ -303,7 +441,10 @@ export interface SearchTargetsOptions {
   /** Zero-based row to start the upstream window at. Defaults to 0. */
   offset?: number | undefined;
   organism?: string | undefined;
+  /** Free text matched against the preferred name. */
   query?: string | undefined;
+  /** One ChEMBL target ID, canonical uppercase — ChEMBL matches it exactly and case-sensitively. */
+  targetChemblId?: string | undefined;
   targetType?: string | undefined;
 }
 

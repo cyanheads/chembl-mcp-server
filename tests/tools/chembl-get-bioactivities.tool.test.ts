@@ -509,7 +509,7 @@ describe('chembl_get_bioactivities — include_alternate_forms (#37)', () => {
       expect(result.totalCount).toBe(133);
       expect(sentUrls()).toEqual([
         'https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=CHEMBL941&limit=1&offset=0',
-        'https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=CHEMBL941&limit=25&offset=0&only=activity_comment%2Cactivity_id%2Cassay_chembl_id%2Cassay_description%2Cassay_type%2Cassay_variant_accession%2Cassay_variant_mutation%2Cdata_validity_comment%2Cdocument_chembl_id%2Cdocument_year%2Cmolecule_chembl_id%2Cmolecule_pref_name%2Cpchembl_value%2Crelation%2Cstandard_relation%2Cstandard_type%2Cstandard_units%2Cstandard_value%2Ctarget_chembl_id%2Ctarget_organism%2Ctarget_pref_name%2Ctype%2Cunits%2Cvalue&order_by=-pchembl_value&order_by=activity_id&pchembl_value__isnull=false',
+        'https://www.ebi.ac.uk/chembl/api/data/activity.json?molecule_chembl_id=CHEMBL941&limit=25&offset=0&only=activity_comment%2Cactivity_id%2Cassay_chembl_id%2Cassay_description%2Cassay_type%2Cassay_variant_accession%2Cassay_variant_mutation%2Cbao_label%2Cdata_validity_comment%2Cdocument_chembl_id%2Cdocument_year%2Cmolecule_chembl_id%2Cmolecule_pref_name%2Cparent_molecule_chembl_id%2Cpchembl_value%2Cpotential_duplicate%2Crelation%2Cstandard_relation%2Cstandard_type%2Cstandard_units%2Cstandard_value%2Ctarget_chembl_id%2Ctarget_organism%2Ctarget_pref_name%2Ctype%2Cunits%2Cvalue&order_by=-pchembl_value&order_by=activity_id&pchembl_value__isnull=false',
       ]);
     }
   });
@@ -851,7 +851,7 @@ describe('chembl_get_bioactivities — DataCanvas spill', () => {
 });
 
 /**
- * 150 ranked rows served by offset in 50-row pages. ~67 rows fill the 50,000-character
+ * 150 ranked rows served by offset in 50-row pages. ~60 rows fill the 50,000-character
  * preview budget, so the preview drain reads the pages at offsets 0 and 50 (the
  * overflow sentinel sits in the second) and the spill reads offset 100 while the
  * table is being registered.
@@ -1099,7 +1099,7 @@ describe('chembl_get_bioactivities — supplied canvas_id across failures (#28)'
       'bioactivities_null_potency',
     ]);
     expect(stagedIds(fake, canvasId)).toEqual(viewOrder(rows));
-    expect(tables?.get('bioactivities')?.columns).toHaveLength(24);
+    expect(tables?.get('bioactivities')?.columns).toHaveLength(27);
     expect(
       tables?.get('bioactivities')?.columns.find((c) => c.name === 'pchembl_value')?.type,
     ).toBe('DOUBLE');
@@ -1584,12 +1584,37 @@ describe('chembl_get_bioactivities — canvas_capacity_exhausted (#28)', () => {
       cap: 1,
       activeCount: 1,
     });
-    // The framework's hint — which offers a drop tool — rides only on cause, never the wire.
+    // The framework's own hint rides only on cause, never the wire.
     expect((err as McpError).data).not.toHaveProperty('recovery');
     const cause = (err as McpError).cause as McpError;
     expect(cause).toBeInstanceOf(McpError);
     expect(cause.data).toMatchObject({ reason: 'canvas_capacity_exhausted' });
     expect(fake.countForTenant({ tenantId: 'default' })).toBe(1);
+  });
+
+  /**
+   * Why the refusal is re-raised at all: the framework's hint names no drop tool
+   * (mcp-ts-core #748), only reusing a held canvas_id or waiting for idle canvases
+   * to expire, so it lacks the routes this tool's own hint adds.
+   */
+  it("re-raises for this tool's own routes, which the framework's hint lacks", async () => {
+    await spillAtCap();
+    const err: unknown = await Promise.resolve(
+      chemblGetBioactivities.handler(
+        chemblGetBioactivities.input.parse({ target_chembl_id: 'CHEMBL203' }),
+        ctx(),
+      ),
+    ).catch((e: unknown) => e);
+    const cause = (err as McpError).cause as McpError;
+    const frameworkHint = (cause.data as { recovery?: { hint?: string } }).recovery?.hint ?? '';
+    expect(frameworkHint).toContain('canvas_id');
+    expect(frameworkHint).not.toMatch(/drop/i);
+    expect(frameworkHint).not.toMatch(/inline|narrow|potency_view/i);
+    const ownHint =
+      chemblGetBioactivities.errors?.find((e) => e.reason === 'canvas_capacity_exhausted')
+        ?.recovery ?? '';
+    expect(ownHint).toContain('narrow the filters until the view fits inline');
+    expect(ownHint).toContain('replacing its table for the same potency_view');
   });
 
   it('carries the reason, retryable, and a drop-free recovery on both surfaces', async () => {
@@ -1728,11 +1753,12 @@ describe('chembl_get_bioactivities — a supplied canvas_id re-stages the view (
     const table = fake.canvases.get(canvasId)?.tables.get('bioactivities');
     expect(table?.rows).toEqual([]);
     // An empty table still carries every column at its declared type, so SQL keeps working.
-    expect(table?.columns).toHaveLength(24);
+    expect(table?.columns).toHaveLength(27);
     expect(table?.columns.find((col) => col.name === 'pchembl_value')?.type).toBe('DOUBLE');
     expect(table?.columns.find((col) => col.name === 'activity_id')?.type).toBe('BIGINT');
     expect(table?.columns.find((col) => col.name === 'document_year')?.type).toBe('INTEGER');
     expect(table?.columns.find((col) => col.name === 'activity_comment')?.type).toBe('VARCHAR');
+    expect(table?.columns.find((col) => col.name === 'potential_duplicate')?.type).toBe('BOOLEAN');
 
     const notice = enrichmentOf(c).notice ?? '';
     expect(notice).toContain('No measurements matched');
@@ -2629,6 +2655,55 @@ describe('chembl_get_bioactivities — inline page cursor (#17)', () => {
     }
   });
 
+  /** Every request URL the calls since the last clear sent, in order. */
+  const sentUrls = () => fetchMock.mock.calls.map((call) => String(call[0]));
+
+  it.each(['', '   ', '\t'])(
+    'treats the blank canvas_id %j as omitted: the same requests and result, and no acquire (#45)',
+    async (canvas_id) => {
+      const fake = new FakeDataCanvas();
+      const acquire = vi.spyOn(fake, 'acquire');
+      setCanvas(fake.cast());
+      serveTiedView();
+      const omitted = await contract({ target_chembl_id: 'CHEMBL203', limit: 3 });
+      const omittedUrls = sentUrls();
+      fetchMock.mockClear();
+      const blank = await contract({ target_chembl_id: 'CHEMBL203', limit: 3, canvas_id });
+      expect(blank).toEqual(omitted);
+      expect(sentUrls()).toEqual(omittedUrls);
+      // The view fit inline with no canvas named, so nothing was staged or minted.
+      expect(blank.structured).toMatchObject({ canvas_id: null, table_name: null });
+      expect(typeof blank.structured.nextCursor).toBe('string');
+      expect(acquire).not.toHaveBeenCalled();
+    },
+  );
+
+  it('mints a fresh canvas for a blank canvas_id whose view spills, as for an omitted one (#45)', async () => {
+    const fake = new FakeDataCanvas();
+    const acquire = vi.spyOn(fake, 'acquire');
+    setCanvas(fake.cast());
+    mockUpstream({
+      honest: 26600,
+      activities: Array.from({ length: 120 }, (_, i) => rawActivity(i)),
+    });
+    const omitted = await contract({ target_chembl_id: 'CHEMBL203' });
+    const omittedUrls = sentUrls();
+    fetchMock.mockClear();
+    const blank = await contract({ target_chembl_id: 'CHEMBL203', canvas_id: '  ' });
+    expect(sentUrls()).toEqual(omittedUrls);
+    // Each call asked for a new canvas; the blank never reached acquire as an id.
+    expect(acquire.mock.calls.map((call) => call[0])).toEqual([undefined, undefined]);
+    const omittedId = String(omitted.structured.canvas_id);
+    const blankId = String(blank.structured.canvas_id);
+    expect(blankId).not.toBe(omittedId);
+    expect(blank.structured).toMatchObject({ spilled: true, staged_row_count: 120 });
+    // Apart from the canvas each minted, both surfaces read the same.
+    const anonymize = (surfaces: unknown, id: string) =>
+      JSON.stringify(surfaces).replaceAll(id, '<canvas>');
+    expect(anonymize(blank, blankId)).toBe(anonymize(omitted, omittedId));
+    expect(tablesOn(fake, blankId).bioactivities).toHaveLength(120);
+  });
+
   it('serves a canvas-on cursor page inline, as with the canvas off, acquiring no canvas', async () => {
     const cursor = encodeCursor({ offset: 3, limit: 3 });
     setCanvas(undefined);
@@ -2979,6 +3054,13 @@ const UNANNOTATED = {
   document_year: null,
 } as const;
 
+/** The #53 row fields of a measurement ChEMBL records none of. */
+const UNFLAGGED = {
+  parent_molecule_chembl_id: null,
+  potential_duplicate: null,
+  bao_label: null,
+} as const;
+
 describe('chembl_get_bioactivities — comments, variant, and source document (#38, #39)', () => {
   /** Both client surfaces, through the production contract boundary. */
   async function contract(input: Record<string, unknown>) {
@@ -3101,24 +3183,26 @@ describe('chembl_get_bioactivities — comments, variant, and source document (#
 
     // content[]: the comments on the measurement line, the variant and document on the assay line.
     expect(lines).toContain(
-      'NI: not reported | pChEMBL: — | raw NI: not reported | activity_comment: Not Active',
+      'NI: not reported | pChEMBL: — | raw NI: not reported | potential_duplicate: — | activity_comment: Not Active',
     );
     expect(lines).toContain(
-      'assay CHEMBL600000 (B): Inhibition of EGFR in a binding assay, replicate 0, with extra descriptive text | activity_id 676633 | document CHEMBL1145828 (2003)',
+      'assay CHEMBL600000 (B, —): Inhibition of EGFR in a binding assay, replicate 0, with extra descriptive text | activity_id 676633 | document CHEMBL1145828 (2003)',
     );
     expect(lines).toContain(
-      'IC50: =500000 nM | pChEMBL: — | raw IC50: =500.0 uM | data_validity_comment: Outside typical range',
+      'IC50: =500000 nM | pChEMBL: — | raw IC50: =500.0 uM | potential_duplicate: — | data_validity_comment: Outside typical range',
     );
     expect(lines).toContain(
-      'assay CHEMBL600002 (B): Inhibition of EGFR in a binding assay, replicate 2, with extra descriptive text | activity_id 900003 | variant: T315I (P00519) | document CHEMBL1137930 (2004)',
+      'assay CHEMBL600002 (B, —): Inhibition of EGFR in a binding assay, replicate 2, with extra descriptive text | activity_id 900003 | variant: T315I (P00519) | document CHEMBL1137930 (2004)',
     );
     expect(lines).toContain(
-      'assay CHEMBL600003 (B): Inhibition of EGFR in a binding assay, replicate 3, with extra descriptive text | activity_id 900004 | variant: UNDEFINED MUTATION | document CHEMBL4507235',
+      'assay CHEMBL600003 (B, —): Inhibition of EGFR in a binding assay, replicate 3, with extra descriptive text | activity_id 900004 | variant: UNDEFINED MUTATION | document CHEMBL4507235',
     );
-    // A row with none of the fields renders exactly as before: no segment, no placeholder.
-    expect(lines).toContain('IC50: >7.5 nM | pChEMBL: — | raw IC50: >0.0075 uM');
+    // A row with none of these fields renders no segment and no placeholder for them.
     expect(lines).toContain(
-      'assay CHEMBL600004 (B): Inhibition of EGFR in a binding assay, replicate 4, with extra descriptive text | activity_id 900005',
+      'IC50: >7.5 nM | pChEMBL: — | raw IC50: >0.0075 uM | potential_duplicate: —',
+    );
+    expect(lines).toContain(
+      'assay CHEMBL600004 (B, —): Inhibition of EGFR in a binding assay, replicate 4, with extra descriptive text | activity_id 900005',
     );
   });
 
@@ -3152,7 +3236,7 @@ describe('chembl_get_bioactivities — comments, variant, and source document (#
       assay_variant_accession: 'P00519',
     });
     expect(lines).toContain(
-      'assay CHEMBL600006 (B): Inhibition of EGFR in a binding assay, replicate 6, with extra descriptive text | activity_id 900006 | variant: — (P00519) | document CHEMBL1137930 (2004)',
+      'assay CHEMBL600006 (B, —): Inhibition of EGFR in a binding assay, replicate 6, with extra descriptive text | activity_id 900006 | variant: — (P00519) | document CHEMBL1137930 (2004)',
     );
   });
 
@@ -3191,9 +3275,9 @@ describe('chembl_get_bioactivities — comments, variant, and source document (#
     const rowStart = lines.findIndex((line) => line.startsWith('**CHEMBL0**'));
     const { text, nodes } = parseMarkdown(lines.slice(rowStart, rowStart + 3).join('\n'));
     expect(text.split('\n')).toEqual([
-      'CHEMBL0 (Compound number 0 with a deliberately verbose name for byte weight) → CHEMBL203 (Epidermal growth factor receptor) [Homo sapiens]',
-      'IC50: >1.5 nM | pChEMBL: — | raw IC50: >0.0015 uM | activity_comment: *Not* Active<br> | data_validity_comment: _Potential_ transcription error',
-      `assay CHEMBL600000 (B): ${description} | activity_id 615616 | variant: T315I (P00519) | document CHEMBL1145828 (2003)`,
+      'CHEMBL0 (Compound number 0 with a deliberately verbose name for byte weight; parent —) → CHEMBL203 (Epidermal growth factor receptor) [Homo sapiens]',
+      'IC50: >1.5 nM | pChEMBL: — | raw IC50: >0.0015 uM | potential_duplicate: — | activity_comment: *Not* Active<br> | data_validity_comment: _Potential_ transcription error',
+      `assay CHEMBL600000 (B, —): ${description} | activity_id 615616 | variant: T315I (P00519) | document CHEMBL1145828 (2003)`,
     ]);
     expect(markupNodes(nodes)).toEqual([]);
   });
@@ -3321,13 +3405,15 @@ describe('chembl_get_bioactivities — comments, variant, and source document (#
       });
       return structured.notice;
     };
-    const generic =
-      'No measurements matched. Broaden the filters (drop standard_type or lower pchembl_value_min), or check the ID.';
+    const underVariant =
+      'No measurements matched. Broaden the filters (drop variant), or check the ID.';
     expect(await noticeFor('T790M,L858R')).toBe(
-      `${generic} variant must equal a recorded variant string whole, case-insensitively, in the order ChEMBL records it: "L858R,T790M" matches its rows, while "T790M,L858R" and a lone "L858R" do not. Re-call without variant and read assay_variant_mutation on the rows for the recorded strings.`,
+      `${underVariant} variant must equal a recorded variant string whole, case-insensitively, in the order ChEMBL records it: "L858R,T790M" matches its rows, while "T790M,L858R" and a lone "L858R" do not. Re-call without variant and read assay_variant_mutation on the rows for the recorded strings.`,
     );
-    expect(await noticeFor('wild_type')).toBe(generic);
-    expect(await noticeFor()).toBe(generic);
+    expect(await noticeFor('wild_type')).toBe(underVariant);
+    expect(await noticeFor()).toBe(
+      'No measurements matched. No filter narrowed the query, so check the ID.',
+    );
   });
 
   it('renders the variant filter in the content[] trailer', () => {
@@ -3421,6 +3507,308 @@ describe('chembl_get_bioactivities — comments, variant, and source document (#
   });
 });
 
+describe('chembl_get_bioactivities — the zero-match notice names every filter sent', () => {
+  /** The notice of a zero-match call on CHEMBL203 with `filters`, on both surfaces. */
+  async function noticeFor(filters: Record<string, unknown>) {
+    setCanvas(undefined);
+    mockUpstream({ honest: 0, activities: [] });
+    const result = await runToolContract(
+      chemblGetBioactivities,
+      { target_chembl_id: 'CHEMBL203', ...filters },
+      { context: { tenantId: 'default' } },
+    );
+    expect(result.isError).toBeFalsy();
+    const notice = (result.structuredContent as { notice?: string }).notice;
+    const lines = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n')
+      .split('\n');
+    expect(lines).toContain(`> ${notice}`);
+    return notice;
+  }
+
+  /**
+   * organism matches the target organism ChEMBL records, case aside: on CHEMBL203,
+   * "human" matches nothing while "Homo sapiens" matches every row.
+   */
+  it('tells a call that sent organism to re-call without it, naming the form ChEMBL records', async () => {
+    expect(await noticeFor({ organism: 'human' })).toBe(
+      'No measurements matched. organism "human" must equal the target organism as ChEMBL records it, a scientific name such as "Homo sapiens" in any case: re-call without organism first, then read target_organism on the rows for the name it records. Otherwise check the ID.',
+    );
+  });
+
+  it.each([
+    [{ standard_type: 'IC50' }, '(drop standard_type)'],
+    [{ pchembl_value_min: 7 }, '(lower pchembl_value_min)'],
+    // A floor of 0 is still sent, and it drops every row with no pchembl_value.
+    [{ pchembl_value_min: 0 }, '(lower pchembl_value_min)'],
+    [{ assay_type: 'B' }, '(drop assay_type)'],
+    [{ variant: 'wild_type' }, '(drop variant)'],
+    [{ standard_type: 'IC50', assay_type: 'F' }, '(drop standard_type or drop assay_type)'],
+    [
+      { standard_type: 'Ki', pchembl_value_min: 7, assay_type: 'B', variant: 'wild_type' },
+      '(drop standard_type, lower pchembl_value_min, drop assay_type, or drop variant)',
+    ],
+  ])('names exactly the filters %j sent', async (filters, loosen) => {
+    expect(await noticeFor(filters)).toBe(
+      `No measurements matched. Broaden the filters ${loosen}, or check the ID.`,
+    );
+  });
+
+  it('leads with organism and names the other filters sent after it', async () => {
+    expect(
+      await noticeFor({ organism: 'Mus musculus', standard_type: 'IC50', assay_type: 'B' }),
+    ).toBe(
+      'No measurements matched. organism "Mus musculus" must equal the target organism as ChEMBL records it, a scientific name such as "Homo sapiens" in any case: re-call without organism first, then read target_organism on the rows for the name it records. Otherwise broaden the other filters (drop standard_type or drop assay_type), or check the ID.',
+    );
+  });
+
+  it('names no filter when none was sent', async () => {
+    expect(await noticeFor({})).toBe(
+      'No measurements matched. No filter narrowed the query, so check the ID.',
+    );
+  });
+
+  /** A salt's ID reads only that salt's own rows; the family's can sit under its parent. */
+  it('steers a one-form molecule call to include_alternate_forms', async () => {
+    expect(await noticeFor({ molecule_chembl_id: 'CHEMBL1200479', standard_type: 'Ki' })).toBe(
+      "No measurements matched. Broaden the filters (drop standard_type), or check the ID. A drug's measurements are often filed under another form of its family (a salt, or its parent): re-call with include_alternate_forms: true to read every form.",
+    );
+  });
+
+  /** A family call already read every form, so pointing it at include_alternate_forms would send it in a circle. */
+  it('gives a call that read the whole family no include_alternate_forms hint', async () => {
+    setCanvas(undefined);
+    fetchMock.mockImplementation((url: string | URL) =>
+      Promise.resolve(
+        String(url).includes('/molecule/')
+          ? jsonResponse({
+              molecule_chembl_id: 'CHEMBL1200479',
+              molecule_hierarchy: { parent_chembl_id: 'CHEMBL1123' },
+            })
+          : jsonResponse({ activities: [], page_meta: { total_count: 0, next: null } }),
+      ),
+    );
+    const result = await runToolContract(
+      chemblGetBioactivities,
+      {
+        target_chembl_id: 'CHEMBL203',
+        molecule_chembl_id: 'CHEMBL1200479',
+        include_alternate_forms: true,
+        standard_type: 'Ki',
+      },
+      { context: { tenantId: 'default' } },
+    );
+    expect(result.isError).toBeFalsy();
+    const notice = (result.structuredContent as { notice?: string }).notice;
+    expect(notice).toBe(
+      'No measurements matched. Broaden the filters (drop standard_type), or check the ID.',
+    );
+    const lines = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n')
+      .split('\n');
+    expect(lines).toContain(`> ${notice}`);
+  });
+
+  it('keeps the variant guidance after the filters it names', async () => {
+    expect(await noticeFor({ organism: 'Homo sapiens', variant: 'T790M,L858R' })).toBe(
+      'No measurements matched. organism "Homo sapiens" must equal the target organism as ChEMBL records it, a scientific name such as "Homo sapiens" in any case: re-call without organism first, then read target_organism on the rows for the name it records. Otherwise broaden the other filters (drop variant), or check the ID. variant must equal a recorded variant string whole, case-insensitively, in the order ChEMBL records it: "L858R,T790M" matches its rows, while "T790M,L858R" and a lone "L858R" do not. Re-call without variant and read assay_variant_mutation on the rows for the recorded strings.',
+    );
+  });
+});
+
+describe('chembl_get_bioactivities — family parent, duplicate flag, and assay format (#53)', () => {
+  /** Live `/activity` values for the three fields, on rows otherwise as rawActivity builds them, most potent first. */
+  const FLAGGED_ROWS: Record<string, unknown>[] = [
+    // ABL1 7573328: CHEMBL5416410 is filed under dasatinib's parent, CHEMBL1421.
+    {
+      ...rawActivity(0),
+      activity_id: 7573328,
+      molecule_chembl_id: 'CHEMBL5416410',
+      parent_molecule_chembl_id: 'CHEMBL1421',
+      potential_duplicate: 0,
+      bao_label: 'single protein format',
+    },
+    // EGFR 187807: ChEMBL flags the value as a likely repeat citation, measured in cells.
+    {
+      ...rawActivity(1),
+      activity_id: 187807,
+      molecule_chembl_id: 'CHEMBL29197',
+      parent_molecule_chembl_id: 'CHEMBL29197',
+      potential_duplicate: 1,
+      bao_label: 'cell-based format',
+    },
+    // EGFR 107803: no specific assay format was assigned.
+    {
+      ...rawActivity(2),
+      activity_id: 107803,
+      molecule_chembl_id: 'CHEMBL291667',
+      parent_molecule_chembl_id: 'CHEMBL291667',
+      potential_duplicate: 0,
+      bao_label: 'assay format',
+    },
+    // A row that records none of the three.
+    { ...rawActivity(3), activity_id: 900007 },
+  ];
+  /** The three fields of FLAGGED_ROWS as structuredContent and the staged tables carry them. */
+  const FLAGS = [
+    {
+      activity_id: 7573328,
+      parent_molecule_chembl_id: 'CHEMBL1421',
+      potential_duplicate: false,
+      bao_label: 'single protein format',
+    },
+    {
+      activity_id: 187807,
+      parent_molecule_chembl_id: 'CHEMBL29197',
+      potential_duplicate: true,
+      bao_label: 'cell-based format',
+    },
+    {
+      activity_id: 107803,
+      parent_molecule_chembl_id: 'CHEMBL291667',
+      potential_duplicate: false,
+      bao_label: 'assay format',
+    },
+    {
+      activity_id: 900007,
+      parent_molecule_chembl_id: null,
+      potential_duplicate: null,
+      bao_label: null,
+    },
+  ];
+  /** Where each FLAGGED_ROWS row's three fields land on its molecule, measurement, and assay lines in content[]. */
+  const RENDERED: Record<number, [string, string, string]> = {
+    7573328: ['; parent CHEMBL1421) →', '| potential_duplicate: no', '(B, single protein format):'],
+    187807: ['; parent CHEMBL29197) →', '| potential_duplicate: yes', '(B, cell-based format):'],
+    107803: ['; parent CHEMBL291667) →', '| potential_duplicate: no', '(B, assay format):'],
+    900007: ['; parent —) →', '| potential_duplicate: —', '(B, —):'],
+  };
+
+  /** The FLAGS-shaped entries of `rows` for each FLAGS row, in FLAGS order, whatever order `rows` holds them in. */
+  function flagsIn(rows: readonly unknown[], ids = FLAGS.map((f) => f.activity_id)) {
+    return ids.map((id) => {
+      const row = (rows as Record<string, unknown>[]).find((r) => r.activity_id === id);
+      return (
+        row && {
+          activity_id: row.activity_id,
+          parent_molecule_chembl_id: row.parent_molecule_chembl_id,
+          potential_duplicate: row.potential_duplicate,
+          bao_label: row.bao_label,
+        }
+      );
+    });
+  }
+
+  /** Each listed row's three content[] lines carry its three fields where RENDERED says. */
+  function expectRendered(text: string, ids: readonly number[]) {
+    const blocks = text.split('\n\n');
+    for (const id of ids) {
+      const lines = blocks.find((b) => b.includes(`| activity_id ${id}`))?.split('\n') ?? [];
+      const [molecule, measurement, assay] = RENDERED[id] ?? [];
+      expect(lines[0], `row ${id}`).toContain(molecule);
+      expect(lines[1], `row ${id}`).toContain(measurement);
+      expect(lines[2], `row ${id}`).toContain(assay);
+    }
+  }
+
+  /** Both client surfaces, through the production contract boundary. */
+  async function contract(input: Record<string, unknown>) {
+    const result = await runToolContract(chemblGetBioactivities, input, {
+      context: { tenantId: 'default' },
+    });
+    expect(result.isError).toBeFalsy();
+    return {
+      output: chemblGetBioactivities.output.parse(result.structuredContent),
+      text: result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n'),
+    };
+  }
+
+  /**
+   * 120 rows, FLAGGED_ROWS first, with filler wide enough (~1,080 characters) that the
+   * whole view overflows the 108,000-character budget a limit of 120 buys and spills
+   * while the preview still shows every row; `nullView` drops every pchembl_value.
+   */
+  function spillRows(nullView = false): Record<string, unknown>[] {
+    const filler: Record<string, unknown>[] = Array.from({ length: 116 }, (_, i) => ({
+      ...rawActivity(4 + i),
+      assay_description:
+        `Inhibition of EGFR kinase activity in a radiometric filter-binding assay, replicate ${4 + i}; `.repeat(
+          3,
+        ),
+    }));
+    const rows = [...FLAGGED_ROWS, ...filler];
+    return nullView ? rows.map(({ pchembl_value: _omitted, ...row }) => row) : rows;
+  }
+
+  it('carries the three on an inline page with the canvas off, on both surfaces', async () => {
+    setCanvas(undefined);
+    fetchMock.mockImplementation(activityCorpus({ rows: FLAGGED_ROWS }));
+    const { output, text } = await contract({ target_chembl_id: 'CHEMBL203', limit: 4 });
+    expect(output.activities.map((a) => a.activity_id)).toEqual(FLAGS.map((f) => f.activity_id));
+    expect(flagsIn(output.activities)).toEqual(FLAGS);
+    expectRendered(text, Object.keys(RENDERED).map(Number));
+  });
+
+  it('carries the three on a cursor page', async () => {
+    setCanvas(new FakeDataCanvas().cast());
+    fetchMock.mockImplementation(activityCorpus({ rows: FLAGGED_ROWS }));
+    const { output, text } = await contract({
+      target_chembl_id: 'CHEMBL203',
+      limit: 2,
+      cursor: encodeCursor({ offset: 2, limit: 2 }),
+    });
+    const ids = [107803, 900007];
+    expect(flagsIn(output.activities, ids)).toEqual(FLAGS.slice(2));
+    expectRendered(text, ids);
+  });
+
+  it.each([
+    ['potency_ranked', 'bioactivities'],
+    ['null_potency', 'bioactivities_null_potency'],
+  ] as const)(
+    'carries the three on the %s spill preview and stages them as typed columns of %s',
+    async (potency_view, table) => {
+      const fake = new FakeDataCanvas();
+      setCanvas(fake.cast());
+      const rows = spillRows(potency_view === 'null_potency');
+      fetchMock.mockImplementation(activityCorpus({ honest: 500, rows }));
+      const { output, text } = await contract({
+        target_chembl_id: 'CHEMBL203',
+        potency_view,
+        limit: 120,
+      });
+      expect(output).toMatchObject({ spilled: true, table_name: table, staged_row_count: 120 });
+      expect(flagsIn(output.activities)).toEqual(FLAGS);
+      expectRendered(text, Object.keys(RENDERED).map(Number));
+
+      const staged = fake.canvases.get(output.canvas_id ?? '')?.tables.get(table);
+      expect(flagsIn(staged?.rows ?? [])).toEqual(FLAGS);
+      const types = Object.fromEntries((staged?.columns ?? []).map((c) => [c.name, c.type]));
+      expect(types).toMatchObject({
+        parent_molecule_chembl_id: 'VARCHAR',
+        potential_duplicate: 'BOOLEAN',
+        bao_label: 'VARCHAR',
+      });
+    },
+  );
+
+  it('re-stages the three with an inline fit on a supplied canvas', async () => {
+    const fake = new FakeDataCanvas();
+    setCanvas(fake.cast());
+    const { canvasId } = await canvasWithBothViews(fake);
+    fetchMock.mockImplementation(activityCorpus({ rows: FLAGGED_ROWS }));
+    const { output } = await contract({ target_chembl_id: 'CHEMBL203', canvas_id: canvasId });
+    expect(output).toMatchObject({
+      spilled: false,
+      table_name: 'bioactivities',
+      staged_row_count: 4,
+    });
+    expect(flagsIn(tablesOn(fake, canvasId).bioactivities ?? [])).toEqual(FLAGS);
+  });
+});
+
 describe('chembl_get_bioactivities — input normalization (#41)', () => {
   const sentParams = () =>
     fetchMock.mock.calls.map((call) => new URL(String(call[0])).searchParams);
@@ -3431,8 +3819,9 @@ describe('chembl_get_bioactivities — input normalization (#41)', () => {
       .map((block) => (block.type === 'text' ? block.text : ''))
       .join('\n')
       .split('\n');
+  /** The zero-match notice of a call whose only filter is a standard_type. */
   const TODAYS_EMPTY_NOTICE =
-    'No measurements matched. Broaden the filters (drop standard_type or lower pchembl_value_min), or check the ID.';
+    'No measurements matched. Broaden the filters (drop standard_type), or check the ID.';
 
   beforeEach(() => {
     setCanvas(undefined);
@@ -3578,6 +3967,43 @@ describe('chembl_get_bioactivities — input normalization (#41)', () => {
     expect(sentParams().every((p) => !p.has('assay_type'))).toBe(true);
   });
 
+  it.each(['', '  '])(
+    'reads the blank potency_view %j as the default potency_ranked, on both surfaces (#45)',
+    async (potency_view) => {
+      const call = async (input: Record<string, unknown>) => {
+        mockUpstream({
+          honest: 26600,
+          potent: 19378,
+          activities: Array.from({ length: 3 }, (_, i) => rawActivity(i)),
+        });
+        fetchMock.mockClear();
+        const result = await runToolContract(chemblGetBioactivities, input, {
+          context: { tenantId: 'default' },
+        });
+        return { result, urls: fetchMock.mock.calls.map((c) => String(c[0])) };
+      };
+      const omitted = await call({ target_chembl_id: 'CHEMBL203' });
+      const blank = await call({ target_chembl_id: 'CHEMBL203', potency_view });
+      expect(blank.result.isError).toBeFalsy();
+      expect(blank.result).toEqual(omitted.result);
+      expect(blank.urls).toEqual(omitted.urls);
+      expect(blank.result.structuredContent).toMatchObject({ potency_view: 'potency_ranked' });
+      expect(blank.urls.find((u) => u.includes('order_by='))).toContain(
+        'pchembl_value__isnull=false',
+      );
+    },
+  );
+
+  it('still rejects a potency_view that names neither view (#45)', () => {
+    for (const raw of ['x', 'POTENCY_RANKED', ' null_potency ', 'ranked']) {
+      expect(
+        chemblGetBioactivities.input.safeParse({ target_chembl_id: 'CHEMBL203', potency_view: raw })
+          .success,
+        raw,
+      ).toBe(false);
+    }
+  });
+
   describe('standard_type case variants', () => {
     /**
      * The count and view answer `total`; a `standard_type__iexact` request answers
@@ -3637,6 +4063,21 @@ describe('chembl_get_bioactivities — input normalization (#41)', () => {
         limit: '1',
         offset: '0',
       });
+      const notice =
+        'No measurements matched standard_type "ic50". standard_type matches exactly, case included, and ChEMBL records a case variant of it under these filters: "IC50". Re-call with standard_type: "IC50".';
+      expect(result.structuredContent).toMatchObject({ totalCount: 0, notice });
+      expect(contentLines(result)).toContain(`> ${notice}`);
+    });
+
+    /** The case-variant notice names the one fix that answers the call, on a one-form molecule call too. */
+    it('keeps the case-variant notice to the recorded spelling on a one-form molecule call', async () => {
+      variantUpstream({ total: 0, variant: 'IC50' });
+      const result = await runToolContract(
+        chemblGetBioactivities,
+        { molecule_chembl_id: 'CHEMBL25', standard_type: 'ic50' },
+        { context: { tenantId: 'default' } },
+      );
+      expect(result.isError).toBeFalsy();
       const notice =
         'No measurements matched standard_type "ic50". standard_type matches exactly, case included, and ChEMBL records a case variant of it under these filters: "IC50". Re-call with standard_type: "IC50".';
       expect(result.structuredContent).toMatchObject({ totalCount: 0, notice });
@@ -3769,6 +4210,7 @@ describe('chembl_get_bioactivities format()', () => {
           units: 'uM',
           relation: '=',
           ...UNANNOTATED,
+          ...UNFLAGGED,
         },
       ],
       totalCount: 26600,
@@ -3881,6 +4323,7 @@ describe('chembl_get_bioactivities format()', () => {
           units: null,
           relation: null,
           ...UNANNOTATED,
+          ...UNFLAGGED,
         },
       ],
       totalCount: 1,
@@ -3939,6 +4382,7 @@ describe('chembl_get_bioactivities format()', () => {
           units: 'nM',
           relation: '=',
           ...UNANNOTATED,
+          ...UNFLAGGED,
         },
       ],
       // 26600 total but only 2 rows previewed, canvas disabled — must NOT say "full set".
@@ -3955,8 +4399,10 @@ describe('chembl_get_bioactivities format()', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('**26600** measurements total');
     expect(text).not.toContain('preview is the full set');
-    expect(text).toContain('canvas disabled');
-    expect(text).toContain('capped preview');
+    // No nextCursor, so no row of the view remains past this page: the label says so without claiming the set.
+    expect(text).toContain(
+      'spilled: no — canvas disabled; no rows of this view remain past this page.',
+    );
     // No nextCursor on the output, so no continuation line either (#17).
     expect(text.toLowerCase()).not.toContain('cursor');
   });
@@ -3984,6 +4430,7 @@ describe('chembl_get_bioactivities format()', () => {
           units: 'nM',
           relation: '=',
           ...UNANNOTATED,
+          ...UNFLAGGED,
         },
       ],
       totalCount: 26600,
@@ -3998,6 +4445,9 @@ describe('chembl_get_bioactivities format()', () => {
       nextCursor: 'OPAQUE-CURSOR-TOKEN',
     });
     const text = blocks.map((b) => (b as { text: string }).text).join('\n');
+    expect(text).toContain(
+      'spilled: no — canvas disabled; more rows of this view remain past this page.',
+    );
     // The whole line: the header names potency_view on every response, continuation or not.
     expect(text).toContain(
       'More rows remain in this view — re-call with cursor="OPAQUE-CURSOR-TOKEN" and the same filters and potency_view for the next page.',
@@ -4047,11 +4497,14 @@ describe('chembl_get_bioactivities format()', () => {
       assay_variant_accession: 'P00519',
       document_chembl_id: 'CHEMBL1137930',
       document_year: 2004,
+      parent_molecule_chembl_id: 'CHEMBL939',
+      potential_duplicate: false,
+      bao_label: 'single protein format',
     });
     expect(text.split('\n\n')[1]?.split('\n')).toEqual([
-      '**CHEMBL939** (GEFITINIB) → **CHEMBL203** (Epidermal growth factor receptor erbB1) [Homo sapiens]',
-      'IC50: <=41 nM | pChEMBL: 7.39 | raw IC50: <=0.041 uM | activity_comment: Not Active | data_validity_comment: Outside typical range',
-      'assay CHEMBL674637 (B): Inhibition of EGFR | activity_id 32770 | variant: T315I (P00519) | document CHEMBL1137930 (2004)',
+      '**CHEMBL939** (GEFITINIB; parent CHEMBL939) → **CHEMBL203** (Epidermal growth factor receptor erbB1) [Homo sapiens]',
+      'IC50: <=41 nM | pChEMBL: 7.39 | raw IC50: <=0.041 uM | potential_duplicate: no | activity_comment: Not Active | data_validity_comment: Outside typical range',
+      'assay CHEMBL674637 (B, single protein format): Inhibition of EGFR | activity_id 32770 | variant: T315I (P00519) | document CHEMBL1137930 (2004)',
     ]);
   });
 
@@ -4086,14 +4539,17 @@ describe('chembl_get_bioactivities format()', () => {
       assay_variant_accession: '[P00519](x)',
       document_chembl_id: 'CHEMBL4\n- x',
       document_year: 2004,
+      parent_molecule_chembl_id: '*CHEMBL5*',
+      potential_duplicate: true,
+      bao_label: '[cell](x) <b>format</b>',
     };
     const block = oneRow(row).split('\n\n')[1] ?? '';
     const { text, nodes } = parseMarkdown(block);
     expect(text).toBe(
       [
-        'CHEMBL_1* ([3H](x) *name*) → CHEMBL`2` (_EGFR_) [Homo <i>sapiens</i>]',
-        '# IC50: <10 n*M | pChEMBL: 8 | raw > Ki: <=0.01&amp; u_M_ | activity_comment: *Not* Active | data_validity_comment: <br>Outside',
-        'assay CHEMBL3\\ (B*): Affinity in displacing [125I](R)-DOI\n# forged heading | activity_id 7 | variant: T315I_ ([P00519](x)) | document CHEMBL4\n- x (2004)',
+        'CHEMBL_1* ([3H](x) *name*; parent *CHEMBL5*) → CHEMBL`2` (_EGFR_) [Homo <i>sapiens</i>]',
+        '# IC50: <10 n*M | pChEMBL: 8 | raw > Ki: <=0.01&amp; u_M_ | potential_duplicate: yes | activity_comment: *Not* Active | data_validity_comment: <br>Outside',
+        'assay CHEMBL3\\ (B*, [cell](x) <b>format</b>): Affinity in displacing [125I](R)-DOI\n# forged heading | activity_id 7 | variant: T315I_ ([P00519](x)) | document CHEMBL4\n- x (2004)',
       ].join('\n'),
     );
     expect(markupNodes(nodes)).toEqual([]);

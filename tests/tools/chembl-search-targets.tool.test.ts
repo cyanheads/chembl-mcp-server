@@ -8,7 +8,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { decodeCursor, encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
@@ -131,8 +131,7 @@ describe('chembl_search_targets — input normalization (#41)', () => {
     const c = ctx();
     await chemblSearchTargets.handler(chemblSearchTargets.input.parse({ accession: 'p99999' }), c);
     expect(getEnrichment(c)).toMatchObject({
-      notice:
-        'No target matched accession="P99999". Verify the accession/symbol, or broaden with a free-text query.',
+      notice: 'No target matched accession="P99999". Verify the accession.',
     });
   });
 
@@ -195,7 +194,7 @@ describe('chembl_search_targets — input normalization (#41)', () => {
       truncated: false,
       cap: 100,
       notice:
-        'limit 101 is above the maximum of 100, so 100 was applied. No target matched accession="P99999". Verify the accession/symbol, or broaden with a free-text query.',
+        'limit 101 is above the maximum of 100, so 100 was applied. No target matched accession="P99999". Verify the accession.',
     });
   });
 
@@ -203,6 +202,263 @@ describe('chembl_search_targets — input normalization (#41)', () => {
     expect(chemblSearchTargets.input.safeParse({ query: 'kinase', limit: 10_001 }).success).toBe(
       false,
     );
+  });
+});
+
+/** A target row of the fake `/target.json` corpus. */
+const target = (
+  id: string,
+  pref_name: string,
+  target_type: string,
+  organism: string,
+  components: [accession: string, gene: string][],
+) => ({
+  target_chembl_id: id,
+  pref_name,
+  target_type,
+  organism,
+  target_components: components.map(([accession, gene]) => ({
+    accession,
+    target_component_synonyms: [{ component_synonym: gene, syn_type: 'GENE_SYMBOL' }],
+  })),
+});
+
+const TARGETS = [
+  target('CHEMBL203', 'Epidermal growth factor receptor', 'SINGLE PROTEIN', 'Homo sapiens', [
+    ['P00533', 'EGFR'],
+  ]),
+  target(
+    'CHEMBL2363049',
+    'Epidermal growth factor receptor and ErbB2',
+    'PROTEIN COMPLEX',
+    'Homo sapiens',
+    [
+      ['P00533', 'EGFR'],
+      ['P04626', 'ERBB2'],
+    ],
+  ),
+  target('CHEMBL3608', 'Epidermal growth factor receptor', 'SINGLE PROTEIN', 'Mus musculus', [
+    ['Q01279', 'Egfr'],
+  ]),
+  target('CHEMBL1862', 'Tyrosine-protein kinase ABL', 'SINGLE PROTEIN', 'Homo sapiens', [
+    ['P00519', 'ABL1'],
+  ]),
+];
+
+/**
+ * A fake ChEMBL `/target.json` over {@link TARGETS}, applying each filter the way
+ * ChEMBL does: `target_chembl_id`, `target_type`, and the accession exactly and
+ * case-sensitively, `pref_name__icontains` as a case-insensitive substring, and
+ * the gene symbol and organism case-insensitively exact. Every request URL lands
+ * in the returned list.
+ */
+function stubTargetUpstream(): URL[] {
+  const requests: URL[] = [];
+  fetchMock.mockImplementation((input: string | URL) => {
+    const url = new URL(String(input));
+    requests.push(url);
+    const p = url.searchParams;
+    const lower = (v: string | null) => v?.toLowerCase();
+    const gene = p.get('target_components__target_component_synonyms__component_synonym__iexact');
+    const matches = TARGETS.filter(
+      (t) =>
+        (!p.has('target_chembl_id') || t.target_chembl_id === p.get('target_chembl_id')) &&
+        (!p.has('pref_name__icontains') ||
+          t.pref_name.toLowerCase().includes(lower(p.get('pref_name__icontains')) ?? '')) &&
+        (!p.has('target_components__accession') ||
+          t.target_components.some((c) => c.accession === p.get('target_components__accession'))) &&
+        (gene === null ||
+          t.target_components.some((c) =>
+            c.target_component_synonyms.some(
+              (s) => s.component_synonym.toLowerCase() === lower(gene),
+            ),
+          )) &&
+        (!p.has('organism__iexact') ||
+          t.organism.toLowerCase() === lower(p.get('organism__iexact'))) &&
+        (!p.has('target_type') || t.target_type === p.get('target_type')),
+    );
+    const offset = Number(p.get('offset') ?? 0);
+    const limit = Number(p.get('limit') ?? 25);
+    return Promise.resolve(
+      jsonResponse({
+        targets: matches.slice(offset, offset + limit),
+        page_meta: { total_count: matches.length },
+      }),
+    );
+  });
+  return requests;
+}
+
+/**
+ * A ChEMBL target ID sent as `query` reads that target through the
+ * `target_chembl_id` filter on the same list route (#48), and a zero-hit or
+ * past-the-end notice names every filter the call sent.
+ */
+describe('chembl_search_targets — a target ID as query, and the zero-hit notice (#48)', () => {
+  /** Run through the full contract; hand back structuredContent and the content[] lines. */
+  async function call(input: Record<string, unknown>) {
+    const result = await runToolContract(chemblSearchTargets, input, {
+      context: { tenantId: 'default' },
+    });
+    expect(result.isError).toBeFalsy();
+    const lines = result.content
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('\n')
+      .split('\n');
+    return {
+      structured: result.structuredContent as Record<string, unknown> & {
+        targets: { target_chembl_id: string }[];
+      },
+      lines,
+    };
+  }
+
+  it.each(['CHEMBL203', ' chembl203 '])(
+    'reads the query %j as the target ID through target_chembl_id',
+    async (query) => {
+      const requests = stubTargetUpstream();
+      const { structured, lines } = await call({ query });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.pathname).toBe('/chembl/api/data/target.json');
+      expect(requests[0]?.searchParams.get('target_chembl_id')).toBe('CHEMBL203');
+      expect(requests[0]?.searchParams.has('pref_name__icontains')).toBe(false);
+      expect(idsOf(structured.targets)).toEqual(['CHEMBL203']);
+      expect(structured).toMatchObject({ totalCount: 1 });
+      expect(structured).not.toHaveProperty('notice');
+      expect(lines).toContain('**CHEMBL203** — Epidermal growth factor receptor');
+    },
+  );
+
+  it('ANDs a target ID with target_type upstream, naming both filters when they exclude it', async () => {
+    const requests = stubTargetUpstream();
+    const { structured, lines } = await call({
+      query: 'CHEMBL203',
+      target_type: 'PROTEIN COMPLEX',
+    });
+    const notice =
+      'No target matched query="CHEMBL203" (a ChEMBL target ID), target_type="PROTEIN COMPLEX". Retry without target_type first: it matches one full target class exactly, e.g. "SINGLE PROTEIN". Otherwise verify the target ID.';
+    expect(requests[0]?.searchParams.get('target_type')).toBe('PROTEIN COMPLEX');
+    expect(structured.targets).toEqual([]);
+    expect(structured).toMatchObject({ totalCount: 0, notice });
+    expect(lines).toContain(`> ${notice}`);
+
+    const kept = await call({ query: 'CHEMBL203', target_type: 'single protein' });
+    expect(idsOf(kept.structured.targets)).toEqual(['CHEMBL203']);
+  });
+
+  it('answers an ID no target carries with an empty page and a notice, not an error', async () => {
+    stubTargetUpstream();
+    const { structured } = await call({ query: 'CHEMBL999999991' });
+    expect(structured.targets).toEqual([]);
+    expect(structured.notice).toBe(
+      'No target matched query="CHEMBL999999991" (a ChEMBL target ID). Verify the target ID.',
+    );
+  });
+
+  it.each(['kinase', 'CHEMBL', 'CHEMBL203 kinase', 'chembl-203'])(
+    'keeps the query %j on the preferred-name match',
+    async (query) => {
+      const requests = stubTargetUpstream();
+      await call({ query });
+      expect(requests[0]?.searchParams.get('pref_name__icontains')).toBe(query);
+      expect(requests[0]?.searchParams.has('target_chembl_id')).toBe(false);
+    },
+  );
+
+  it('steers a common-name organism to the scientific name ChEMBL records', async () => {
+    stubTargetUpstream();
+    const { structured, lines } = await call({ gene_symbol: 'EGFR', organism: 'human' });
+    const notice =
+      'No target matched gene_symbol="EGFR", organism="human". Retry without organism first: it matches the scientific name ChEMBL records, e.g. "Homo sapiens", not a common name. Otherwise verify the gene symbol.';
+    expect(structured).toMatchObject({ totalCount: 0, notice });
+    expect(lines).toContain(`> ${notice}`);
+    const fixed = await call({ gene_symbol: 'EGFR', organism: 'homo sapiens' });
+    expect(idsOf(fixed.structured.targets)).toEqual(['CHEMBL203', 'CHEMBL2363049']);
+  });
+
+  it('steers a partial target_type to the full class ChEMBL records', async () => {
+    stubTargetUpstream();
+    const { structured } = await call({ accession: 'P00533', target_type: 'protein' });
+    expect(structured.notice).toBe(
+      'No target matched accession="P00533", target_type="PROTEIN". Retry without target_type first: it matches one full target class exactly, e.g. "SINGLE PROTEIN". Otherwise verify the accession.',
+    );
+  });
+
+  it('names both narrowing filters when both were sent', async () => {
+    stubTargetUpstream();
+    const { structured } = await call({
+      gene_symbol: 'EGFR',
+      organism: 'human',
+      target_type: 'protein',
+    });
+    expect(structured.notice).toBe(
+      'No target matched gene_symbol="EGFR", organism="human", target_type="PROTEIN". Retry without organism and target_type first: organism matches the scientific name ChEMBL records, e.g. "Homo sapiens", not a common name, and target_type matches one full target class exactly, e.g. "SINGLE PROTEIN". Otherwise verify the gene symbol.',
+    );
+  });
+
+  it('never asks a name-only search to verify an identifier it did not send', async () => {
+    stubTargetUpstream();
+    const { structured } = await call({ query: 'kinase', organism: 'human' });
+    expect(structured.notice).toBe(
+      'No target matched query="kinase", organism="human". Retry without organism first: it matches the scientific name ChEMBL records, e.g. "Homo sapiens", not a common name. Otherwise check the spelling or broaden the name query.',
+    );
+    expect(structured.notice).not.toMatch(/accession|gene/);
+  });
+
+  it.each([
+    [
+      { query: 'zzz' },
+      'No target matched query="zzz". Check the spelling or broaden the name query.',
+    ],
+    [{ gene_symbol: 'ZZZ9' }, 'No target matched gene_symbol="ZZZ9". Verify the gene symbol.'],
+    [
+      { accession: 'P99999', gene_symbol: 'ZZZ9' },
+      'No target matched accession="P99999", gene_symbol="ZZZ9". Verify the accession and the gene symbol.',
+    ],
+    [
+      { accession: 'P99999', query: 'zzz' },
+      'No target matched accession="P99999", query="zzz". Verify the accession, or check the spelling or broaden the name query.',
+    ],
+  ])('advises on exactly the identifiers sent: %j', async (input, notice) => {
+    stubTargetUpstream();
+    const { structured } = await call(input);
+    expect(structured.notice).toBe(notice);
+  });
+
+  it('names every filter in the past-the-end notice', async () => {
+    stubTargetUpstream();
+    const { structured } = await call({
+      gene_symbol: 'EGFR',
+      organism: 'Homo sapiens',
+      target_type: 'single protein',
+      limit: 3,
+      cursor: encodeCursor({ offset: 900, limit: 3 }),
+    });
+    expect(structured.targets).toEqual([]);
+    expect(structured.notice).toBe(
+      'That cursor starts past the end of the 1 targets matching gene_symbol="EGFR", organism="Homo sapiens", target_type="SINGLE PROTEIN" — the walk is complete.',
+    );
+  });
+
+  it('leads with the clamp disclosure before the zero-hit diagnosis', async () => {
+    stubTargetUpstream();
+    const { structured, lines } = await call({
+      gene_symbol: 'EGFR',
+      organism: 'human',
+      limit: 150,
+    });
+    const notice =
+      'limit 150 is above the maximum of 100, so 100 was applied. No target matched gene_symbol="EGFR", organism="human". Retry without organism first: it matches the scientific name ChEMBL records, e.g. "Homo sapiens", not a common name. Otherwise verify the gene symbol.';
+    expect(structured).toMatchObject({ cap: 100, notice });
+    expect(lines).toContain(`> ${notice}`);
+  });
+
+  it('describes the target-ID query and the forms organism and target_type match', () => {
+    const shape = chemblSearchTargets.input.shape;
+    expect(shape.query.description).toContain('CHEMBL203');
+    expect(shape.organism.description).toContain('scientific name');
+    expect(shape.target_type.description).toContain('full');
+    expect(chemblSearchTargets.description).toContain('ChEMBL target ID');
   });
 });
 

@@ -2,14 +2,14 @@
 
 DuckDB SQL over the tables `chembl_get_bioactivities` stages: `bioactivities` (the `potency_ranked` view) and `bioactivities_null_potency`. Both have the same columns; `chembl_dataframe_describe` lists them. Swap in your own IDs.
 
-## Leads on one target, per compound
+## Leads on one target, per parent compound
 
-Stage the target with one `standard_type` and `variant: "wild_type"` first.
+Stage the target with one `standard_type` and `variant: "wild_type"` first. Grouping on `parent_molecule_chembl_id` merges a drug with its salts, and `potential_duplicate IS NOT TRUE` drops values likely re-cited from an earlier document (a null flag stays in).
 
 ```sql
-SELECT molecule_chembl_id, COUNT(*) AS n, MEDIAN(pchembl_value) AS med_p, COUNT(DISTINCT document_chembl_id) AS docs
+SELECT parent_molecule_chembl_id, COUNT(*) AS n, MEDIAN(pchembl_value) AS med_p, COUNT(DISTINCT document_chembl_id) AS docs
 FROM bioactivities
-WHERE assay_type = 'B'
+WHERE assay_type = 'B' AND potential_duplicate IS NOT TRUE
 GROUP BY 1
 ORDER BY med_p DESC, n DESC
 LIMIT 20

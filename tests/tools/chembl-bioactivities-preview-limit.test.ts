@@ -2,8 +2,8 @@
  * @fileoverview Tests for the inline-preview boundary of chembl_get_bioactivities —
  * `limit` bounds the rows returned inline on ALL THREE response branches, not just
  * the two that happened to enforce it. `spillover()` sizes its preview buffer by a
- * character budget (`max(50_000, limit * 800)`), so the canvas-enabled branch where
- * the view fits inline drains ~67 rows regardless of how small `limit` is; the cap
+ * character budget (`max(50_000, limit * 900)`), so the canvas-enabled branch where
+ * the view fits inline drains ~60 rows regardless of how small `limit` is; the cap
  * is applied to the returned rows, never to the budget (which is what drives the
  * fit-vs-spill decision and its overflow sentinel), and a spill's rows are the
  * walk's first `limit`, however few the buffer held.
@@ -34,7 +34,7 @@ function jsonResponse(body: unknown): Response {
 }
 
 /**
- * A row serializing to ~745 chars, so ~67 of them fill the 50,000-character preview budget.
+ * A row serializing to ~830 chars, so ~60 of them fill the 50,000-character preview budget.
  * `FITS_INLINE` rows therefore exhaust the stream under budget (no spill) while
  * still being far more rows than a small `limit` asks for — the exact shape the
  * live CHEMBL941 × CHEMBL385 pair produces.
@@ -473,7 +473,7 @@ describe('chembl_get_bioactivities — preview boundary disclosure', () => {
 describe('chembl_get_bioactivities — a spill shows limit rows of real width', () => {
   /**
    * A row as wide as a real EGFR binding measurement with its comment, variant, and
-   * source document: ~1,320 serialized characters, past the budget's 800 per row, so
+   * source document: ~1,320 serialized characters, past the budget's 900 per row, so
    * once `limit` lifts the budget above its 50,000 floor the drain buffer holds fewer
    * rows than `limit`, and the preview still shows `limit`.
    */
@@ -538,7 +538,7 @@ describe('chembl_get_bioactivities — a spill shows limit rows of real width', 
 
 describe('chembl_get_bioactivities — fit-vs-spill line sits at about limit average rows', () => {
   /**
-   * `rawActivity` serializes to ~745 characters, inside the 690–870 average of real
+   * `rawActivity` serializes to ~830 characters, inside the 770–975 average of real
    * rows. A view of 1.5 × `limit` such rows has to spill, so the whole view is
    * SQL-queryable from the canvas_id it returns; returning `limit` rows plus a
    * cursor with nothing staged would leave the caller no way to query the view.
@@ -552,8 +552,8 @@ describe('chembl_get_bioactivities — fit-vs-spill line sits at about limit ave
     );
     const { result } = await withCanvas({ target_chembl_id: 'CHEMBL203', limit: 1000 });
     const widths = result.activities.map((a) => JSON.stringify(a).length);
-    expect(Math.min(...widths)).toBeGreaterThanOrEqual(690);
-    expect(Math.max(...widths)).toBeLessThanOrEqual(870);
+    expect(Math.min(...widths)).toBeGreaterThanOrEqual(770);
+    expect(Math.max(...widths)).toBeLessThanOrEqual(975);
   });
 
   it.each([

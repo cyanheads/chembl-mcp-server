@@ -237,3 +237,140 @@ describe('comment, variant, and document columns through DuckDB (#38, #39)', () 
     ).toEqual([{ n: 80 }]);
   });
 });
+
+describe('family parent, duplicate flag, and assay format columns through DuckDB (#53)', () => {
+  /**
+   * 240 rows a view: ChEMBL's potential_duplicate 1 on every fourth, 0 on the next
+   * two, and absent on the last; the mesylate CHEMBL1642 on every third under
+   * parent CHEMBL941, with no parent recorded on every tenth; single protein format
+   * on even rows, cell-based on odd ones, and no format on every eighth from 7.
+   */
+  function serve(view: 'potency_ranked' | 'null_potency') {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL | Request) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (!url.searchParams.has('order_by')) {
+          return Promise.resolve(Response.json({ page_meta: { total_count: 480 } }));
+        }
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        return Promise.resolve(
+          Response.json({
+            activities: Array.from({ length: 120 }, (_, i) => {
+              const n = offset + i;
+              return {
+                activity_id: n + 1,
+                molecule_chembl_id: n % 3 === 0 ? 'CHEMBL1642' : 'CHEMBL941',
+                target_chembl_id: 'CHEMBL1862',
+                assay_chembl_id: 'CHEMBL674637',
+                assay_description: 'Assay measurement '.repeat(40),
+                pchembl_value: view === 'null_potency' ? null : '7.39',
+                ...(n % 10 !== 0 && { parent_molecule_chembl_id: 'CHEMBL941' }),
+                ...(n % 4 !== 3 && { potential_duplicate: n % 4 === 0 ? 1 : 0 }),
+                ...(n % 8 !== 7 && {
+                  bao_label: n % 2 === 0 ? 'single protein format' : 'cell-based format',
+                }),
+              };
+            }),
+            page_meta: { total_count: 240 },
+          }),
+        );
+      }),
+    );
+  }
+
+  async function sql(canvasId: string, query: string) {
+    const result = await runToolContract(
+      chemblDataframeQuery,
+      chemblDataframeQuery.input.parse({ canvas_id: canvasId, sql: query }),
+      { context },
+    );
+    expect(result.isError).toBeFalsy();
+    return (result.structuredContent as { rows: Record<string, unknown>[] }).rows;
+  }
+
+  it('stages all three as typed columns on both view tables, queryable and UNION-able by SQL', async () => {
+    let canvasId: string | undefined;
+    for (const view of ['potency_ranked', 'null_potency'] as const) {
+      serve(view);
+      const staged = await runToolContract(
+        chemblGetBioactivities,
+        {
+          target_chembl_id: 'CHEMBL1862',
+          limit: 1,
+          potency_view: view,
+          ...(canvasId && { canvas_id: canvasId }),
+        },
+        { context },
+      );
+      expect(staged.isError).toBeFalsy();
+      expect(staged.structuredContent).toMatchObject({ spilled: true, staged_row_count: 240 });
+      canvasId =
+        chemblGetBioactivities.output.parse(staged.structuredContent).canvas_id ?? undefined;
+    }
+    if (!canvasId) throw new Error('nothing was staged');
+
+    const described = await runToolContract(
+      chemblDataframeDescribe,
+      chemblDataframeDescribe.input.parse({ canvas_id: canvasId }),
+      { context },
+    );
+    const tables = (
+      described.structuredContent as {
+        tables: { name: string; columns: { name: string; type: string }[] }[];
+      }
+    ).tables;
+    for (const name of ['bioactivities', 'bioactivities_null_potency']) {
+      const columns = Object.fromEntries(
+        (tables.find((t) => t.name === name)?.columns ?? []).map((c) => [c.name, c.type]),
+      );
+      expect(columns).toMatchObject({
+        parent_molecule_chembl_id: 'VARCHAR',
+        potential_duplicate: 'BOOLEAN',
+        bao_label: 'VARCHAR',
+      });
+    }
+
+    // ChEMBL's 1 and 0 stage as true and false, and an absent flag as NULL, never false.
+    expect(
+      await sql(
+        canvasId,
+        'SELECT potential_duplicate, COUNT(*) AS n FROM bioactivities GROUP BY 1 ORDER BY 1 NULLS LAST',
+      ),
+    ).toEqual([
+      { potential_duplicate: false, n: 120 },
+      { potential_duplicate: true, n: 60 },
+      { potential_duplicate: null, n: 60 },
+    ]);
+    expect(
+      await sql(canvasId, 'SELECT COUNT(*) AS n FROM bioactivities WHERE NOT potential_duplicate'),
+    ).toEqual([{ n: 120 }]);
+    // The salt and its parent merge on the family column; rows recording no parent stay apart.
+    expect(
+      await sql(
+        canvasId,
+        'SELECT parent_molecule_chembl_id, COUNT(DISTINCT molecule_chembl_id) AS forms, COUNT(*) AS n FROM bioactivities_null_potency GROUP BY 1 ORDER BY 1 NULLS LAST',
+      ),
+    ).toEqual([
+      { parent_molecule_chembl_id: 'CHEMBL941', forms: 2, n: 216 },
+      { parent_molecule_chembl_id: null, forms: 2, n: 24 },
+    ]);
+    expect(
+      await sql(
+        canvasId,
+        'SELECT bao_label, COUNT(*) AS n FROM bioactivities GROUP BY 1 ORDER BY 1 NULLS LAST',
+      ),
+    ).toEqual([
+      { bao_label: 'cell-based format', n: 90 },
+      { bao_label: 'single protein format', n: 120 },
+      { bao_label: null, n: 30 },
+    ]);
+    // Both tables share one column list, so a positional UNION ALL lines up.
+    expect(
+      await sql(
+        canvasId,
+        'SELECT COUNT(*) AS n, COUNT(potential_duplicate) AS flagged FROM (SELECT * FROM bioactivities UNION ALL SELECT * FROM bioactivities_null_potency) WHERE NOT potential_duplicate OR potential_duplicate IS NULL',
+      ),
+    ).toEqual([{ n: 360, flagged: 240 }]);
+  });
+});

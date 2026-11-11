@@ -236,7 +236,7 @@ describe('chembl_dataframe_query — happy + boundary', () => {
   });
 });
 
-/** Narrow two-column rows — 200 of these still sit far under the render budget. */
+/** Narrow two-column rows. */
 function narrowRows(n: number): Record<string, unknown>[] {
   return Array.from({ length: n }, (_, i) => ({
     activity_id: 1000 + i,
@@ -244,7 +244,7 @@ function narrowRows(n: number): Record<string, unknown>[] {
   }));
 }
 
-/** ~1 KB of assay text per row — a few dozen of these exhaust the render budget. */
+/** ~1 KB of assay text per row — the width of a `SELECT *` over real assay descriptions. */
 function wideRows(n: number): Record<string, unknown>[] {
   return Array.from({ length: n }, (_, i) => ({
     activity_id: 2000 + i,
@@ -266,8 +266,22 @@ function renderQuery(
   return (chemblDataframeQuery.format!(result)[0] as { text: string }).text;
 }
 
-describe('chembl_dataframe_query — content[] render budget (#10)', () => {
-  it('renders every row of an under-budget result, past the old 50-row cut', async () => {
+/** The first cell of each table line — the activity_id the fixtures lead with. */
+function firstCells(lines: string[]): string[] {
+  return lines.map((line) => line.split(' | ')[0]?.replace(/^\| /, '') ?? '');
+}
+
+/** Paging guidance a truncated result carries — the query is rewritten, never appended to. */
+const PAGE_IN_QUERY =
+  'ORDER BY a unique column (e.g. activity_id) and LIMIT/OFFSET written into the query';
+
+/**
+ * #52: content[] renders every row structuredContent.rows carries. The caller's
+ * SQL LIMIT sets the page, and the canvas row cap (`truncated`) is the one
+ * server-side ceiling — no character budget cuts the table.
+ */
+describe('chembl_dataframe_query — content[] renders every returned row (#52)', () => {
+  it('renders every row of a narrow result, past the old 50-row cut', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 1000, molecule_chembl_id: 'CHEMBL0' }]);
@@ -282,7 +296,6 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     });
     const result = await chemblDataframeQuery.handler(input, ctx);
     expect(result.row_count).toBe(60);
-    expect(result.rendered_rows).toBe(60);
     expect(result.truncated).toBe(false);
 
     const text = renderQuery(result);
@@ -293,7 +306,7 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     expect(text).not.toContain('more rows');
   });
 
-  it('bounds a large result by the character budget and names the LIMIT/OFFSET path', async () => {
+  it('renders all 200 rows of a wide result on both surfaces, in the same order', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
@@ -301,34 +314,33 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
       { rows: wideRows(200) },
       { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
     ];
-    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
-    const input = chemblDataframeQuery.input.parse({
-      canvas_id: canvasId,
-      sql: 'SELECT activity_id, assay_description FROM bioactivities',
-    });
-    const result = await chemblDataframeQuery.handler(input, ctx);
-    expect(result.row_count).toBe(200);
-    expect(result.rendered_rows).toBeGreaterThan(0);
-    expect(result.rendered_rows).toBeLessThan(200);
-    // The renderer's budget, not the engine's row cap — the two are independent.
-    expect(result.truncated).toBe(false);
+    const result = await runToolContract(
+      chemblDataframeQuery,
+      {
+        canvas_id: canvasId,
+        sql: 'SELECT activity_id, assay_description FROM bioactivities ORDER BY activity_id LIMIT 200',
+      },
+      AS_DEFAULT_TENANT,
+    );
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      rows: { activity_id: number }[];
+      row_count: number;
+      truncated: boolean;
+    };
+    expect(structured).toMatchObject({ row_count: 200, truncated: false });
 
-    const text = renderQuery(result);
+    const text = resultText(result);
     const dataLines = tableDataLines(text);
-    expect(dataLines).toHaveLength(result.rendered_rows);
-    expect(dataLines.join('\n').length).toBeLessThanOrEqual(40_000);
-    expect(text).toContain(`rendered_rows: ${result.rendered_rows} of 200`);
-    expect(text).toContain('LIMIT');
-    expect(text).toContain('OFFSET');
-    // The canvas-cap disclosure must not fire for a render-budget cap.
-    expect(text).not.toContain('canvas row cap');
+    // Today's 40,000-character budget held 39 of these rows.
+    expect(dataLines).toHaveLength(200);
+    expect(firstCells(dataLines)).toEqual(structured.rows.map((row) => String(row.activity_id)));
+    expect(text.startsWith('200 rows.\n\n| activity_id | assay_description |')).toBe(true);
+    expect(structured).not.toHaveProperty('rendered_rows');
   });
 
-  /**
-   * The budget measures the lines format() emits, escapes included, so text dense
-   * in markup characters still fits the 40,000-character table.
-   */
-  it('counts the escapes a cell takes against the render budget', async () => {
+  /** Escapes change a cell's length, never which rows the table holds. */
+  it('renders every row of escape-dense text, each cell escaped', async () => {
     const fake = new FakeDataCanvas();
     setCanvas(fake.cast());
     const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
@@ -349,36 +361,51 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
       }),
       ctx,
     );
-    // Each escaped row is 2,011 characters plus its newline: 19 fit in 40,000 (39 unescaped).
-    expect(result.rendered_rows).toBe(19);
     const dataLines = tableDataLines(renderQuery(result));
-    expect(dataLines).toHaveLength(19);
-    expect(dataLines.join('\n').length).toBeLessThanOrEqual(40_000);
+    // Today's budget held 19 of these escaped rows.
+    expect(dataLines).toHaveLength(200);
+    expect(firstCells(dataLines)).toEqual(Array.from({ length: 200 }, (_, i) => String(2000 + i)));
+    expect(dataLines.at(-1)).toBe(`| 2199 | ${'\\*'.repeat(1000)} |`);
   });
 
-  it('discloses the canvas row cap without a render note when the table fits', () => {
+  it('renders every row of a result at the canvas row cap, with truncated stated above the table', async () => {
+    const fake = new FakeDataCanvas({ defaultRowLimit: 100 });
+    setCanvas(fake.cast());
+    const canvasId = await seedCanvas(fake, [{ activity_id: 2000, assay_description: 'seed' }]);
+    // One row past the cap: the provider returns the first 100 and marks the cut.
+    fake.queryResults = [
+      { rows: wideRows(101) },
+      { rows: [{ column_types: ['BIGINT', 'VARCHAR'] }] },
+    ];
+    const ctx = createMockContext({ tenantId: 'default', errors: chemblDataframeQuery.errors });
+    const result = await chemblDataframeQuery.handler(
+      chemblDataframeQuery.input.parse({
+        canvas_id: canvasId,
+        sql: 'SELECT activity_id, assay_description FROM bioactivities',
+      }),
+      ctx,
+    );
+    expect(result).toMatchObject({ row_count: 100, truncated: true });
+
+    const text = renderQuery(result);
+    const dataLines = tableDataLines(text);
+    expect(dataLines).toHaveLength(100);
+    expect(firstCells(dataLines)).toEqual(Array.from({ length: 100 }, (_, i) => String(2000 + i)));
+    const note = text.indexOf('truncated: yes');
+    expect(note).toBeGreaterThan(-1);
+    expect(note).toBeLessThan(text.indexOf('| activity_id |'));
+    expect(text).toContain(PAGE_IN_QUERY);
+  });
+
+  it('discloses the canvas row cap above a table that holds every row', () => {
     const text = renderQuery({
       rows: narrowRows(60),
       row_count: 60,
-      rendered_rows: 60,
       truncated: true,
     });
     expect(tableDataLines(text)).toHaveLength(60);
     expect(text).toContain('truncated at the canvas row cap');
     expect(text).not.toContain('render budget');
-  });
-
-  it('discloses both caps independently when the engine and the renderer each capped', () => {
-    const text = renderQuery({
-      rows: narrowRows(200),
-      row_count: 200,
-      rendered_rows: 12,
-      truncated: true,
-    });
-    expect(tableDataLines(text)).toHaveLength(12);
-    expect(text).toContain('rendered_rows: 12 of 200');
-    expect(text).toContain('render budget');
-    expect(text).toContain('truncated at the canvas row cap');
   });
 
   it('returns an empty result when OFFSET runs past the end of the table', async () => {
@@ -393,9 +420,59 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     });
     const result = await chemblDataframeQuery.handler(input, ctx);
     expect(result.row_count).toBe(0);
-    expect(result.rendered_rows).toBe(0);
     expect(result.truncated).toBe(false);
     expect(renderQuery(result)).toContain('Query returned no rows.');
+  });
+
+  it('carries no rendered_rows field on the output schema', () => {
+    expect(Object.keys(chemblDataframeQuery.output.shape)).toEqual([
+      'rows',
+      'row_count',
+      'truncated',
+    ]);
+  });
+
+  /**
+   * DuckDB rejects a second LIMIT, so advice to append one breaks on any SQL that
+   * already ends in a LIMIT. Every caller-visible string is checked: the tool
+   * description, each input and output field description, the error contract, and
+   * format() on a truncated, an untruncated, and an empty result.
+   */
+  it('never names rendered_rows or tells the caller to append LIMIT/OFFSET', () => {
+    const fields = [
+      ...Object.values(chemblDataframeQuery.input.shape),
+      ...Object.values(chemblDataframeQuery.output.shape),
+    ].map((schema) => schema.description ?? '');
+    const contract = (chemblDataframeQuery.errors ?? []).flatMap((e) => [e.when, e.recovery]);
+    const rendered = [
+      renderQuery({ rows: narrowRows(3), row_count: 3, truncated: true }),
+      renderQuery({ rows: narrowRows(3), row_count: 3, truncated: false }),
+      renderQuery({ rows: [], row_count: 0, truncated: false }),
+    ];
+    const texts = [chemblDataframeQuery.description, ...fields, ...contract, ...rendered];
+    expect(fields.every((text) => text.length > 0)).toBe(true);
+    for (const text of texts) {
+      expect(text).not.toContain('rendered_rows');
+      expect(text).not.toMatch(/append/i);
+    }
+  });
+
+  it('tells a truncated result to page with ORDER BY and LIMIT/OFFSET written into the query', () => {
+    expect(chemblDataframeQuery.description).toContain(PAGE_IN_QUERY);
+    expect(chemblDataframeQuery.output.shape.truncated.description).toContain(PAGE_IN_QUERY);
+    expect(renderQuery({ rows: narrowRows(3), row_count: 3, truncated: true })).toContain(
+      PAGE_IN_QUERY,
+    );
+    // An untruncated result is complete: no paging advice.
+    expect(renderQuery({ rows: narrowRows(3), row_count: 3, truncated: false })).not.toContain(
+      'OFFSET',
+    );
+  });
+
+  it('steers the caller to bound the result in the SQL by projecting columns and setting a LIMIT', () => {
+    expect(chemblDataframeQuery.description).toContain(
+      'bound the result in the SQL itself: project only the columns you need and set a LIMIT',
+    );
   });
 
   it('carries a nested cell into content[] as JSON and leaves it uncoerced (#2 boundary)', async () => {
@@ -447,7 +524,6 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const text = renderQuery({
       rows: [{ assay_description: 'Inhibition of EGFR | mutant\nsecond line' }],
       row_count: 1,
-      rendered_rows: 1,
       truncated: false,
     });
     expect(tableDataLines(text)).toEqual(['| Inhibition of EGFR \\| mutant&#10;second line |']);
@@ -467,7 +543,6 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
         },
       ],
       row_count: 1,
-      rendered_rows: 1,
       truncated: false,
     });
     const [line = ''] = tableDataLines(text);
@@ -480,7 +555,6 @@ describe('chembl_dataframe_query — content[] render budget (#10)', () => {
     const text = renderQuery({
       rows: [{ molecule_chembl_id: 'CHEMBL25', pchembl_value: 7.39, ids: ['CHEMBL2'] }],
       row_count: 1,
-      rendered_rows: 1,
       truncated: false,
     });
     expect(tableDataLines(text)).toEqual(['| CHEMBL25 | 7.39 | ["CHEMBL2"] |']);
@@ -756,7 +830,6 @@ describe('dataframe tools — format()', () => {
     const blocks = chemblDataframeQuery.format!({
       rows: [{ molecule_chembl_id: 'CHEMBL1', med: 7.4 }],
       row_count: 1,
-      rendered_rows: 1,
       truncated: false,
     });
     const text = (blocks[0] as { text: string }).text;
@@ -769,7 +842,6 @@ describe('dataframe tools — format()', () => {
     const blocks = chemblDataframeQuery.format!({
       rows: [{ a: 1 }],
       row_count: 1,
-      rendered_rows: 1,
       truncated: true,
     });
     expect((blocks[0] as { text: string }).text).toContain('truncated at the canvas row cap');
@@ -779,7 +851,6 @@ describe('dataframe tools — format()', () => {
     const blocks = chemblDataframeQuery.format!({
       rows: [],
       row_count: 0,
-      rendered_rows: 0,
       truncated: false,
     });
     expect((blocks[0] as { text: string }).text).toContain('no rows');

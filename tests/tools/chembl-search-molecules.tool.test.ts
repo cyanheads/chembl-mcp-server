@@ -15,6 +15,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { decodeCursor, encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
+import { chemblGetDrugInfo } from '@/mcp-server/tools/definitions/chembl-get-drug-info.tool.js';
 import { chemblSearchMolecules } from '@/mcp-server/tools/definitions/chembl-search-molecules.tool.js';
 import { initChemblService } from '@/services/chembl/chembl-service.js';
 import { SUBSTRUCTURE_UNPARSEABLE_BODY } from '../_chembl-error-bodies.js';
@@ -792,6 +793,497 @@ describe('chembl_search_molecules — input boundaries', () => {
 
   it('rejects max_phase_min above 4 at the schema', () => {
     expect(() => chemblSearchMolecules.input.parse({ query: 'x', max_phase_min: 5 })).toThrow();
+  });
+});
+
+/** One analog of the fake structure corpus: its ID and recorded max phase (null when none). */
+interface Analog {
+  id: string;
+  phase: number | null;
+}
+
+/**
+ * The imatinib analog set ChEMBL returns for a similarity search at 70 (counts as
+ * of 2026-11-11): two approved drugs, four other recorded phases, 84 compounds
+ * with no recorded phase.
+ */
+const IMATINIB_ANALOGS: Analog[] = [
+  { id: 'CHEMBL941', phase: 4 },
+  { id: 'CHEMBL1642', phase: 4 },
+  { id: 'CHEMBL3', phase: 3 },
+  { id: 'CHEMBL4', phase: 2 },
+  { id: 'CHEMBL5', phase: 1 },
+  { id: 'CHEMBL6', phase: 0.5 },
+  ...Array.from({ length: 84 }, (_, i) => ({ id: `CHEMBL9${i}`, phase: null })),
+];
+
+const IMATINIB_SMILES = 'Cc1ccc(NC(=O)c2ccc(CN3CCN(C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1';
+
+/**
+ * A fake ChEMBL structure-search upstream. The similarity, substructure, and name
+ * routes page `corpus` by `limit`/`offset` and honor `max_phase__gte`, which a null
+ * phase never passes. The substructure route stops at `ceiling` hits BEFORE it filters,
+ * the way ChEMBL applies a filter to the first 30000 substructure hits only, and
+ * reports at most `ceiling` as the total. The exact route answers `exact` — one
+ * molecule object, whatever the query string, `limit`, or `offset`. Every request
+ * URL lands in the returned list.
+ */
+function stubStructureUpstream(opts: {
+  corpus?: Analog[];
+  ceiling?: number;
+  exact?: Analog;
+}): URL[] {
+  const requests: URL[] = [];
+  fetchMock.mockImplementation((input: string | URL) => {
+    const url = new URL(String(input));
+    requests.push(url);
+    const path = url.pathname.replace('/chembl/api/data/', '');
+    // The name route lists over the corpus like the structure list routes.
+    const route = path.startsWith('molecule/search') ? 'search' : path.split('/')[0];
+    const row = (a: Analog) => ({
+      ...aspirinRaw,
+      molecule_chembl_id: a.id,
+      max_phase: a.phase === null ? null : String(a.phase),
+      ...(route === 'similarity' && { similarity: '80' }),
+    });
+    if (route === 'molecule') {
+      return Promise.resolve(
+        opts.exact ? jsonResponse(row(opts.exact)) : jsonResponse({ error_message: 'nf' }, 404),
+      );
+    }
+    const params = url.searchParams;
+    const min = params.get('max_phase__gte');
+    const reachable =
+      route === 'substructure' ? (opts.corpus ?? []).slice(0, opts.ceiling) : (opts.corpus ?? []);
+    const matches =
+      min === null
+        ? reachable
+        : reachable.filter((a) => a.phase !== null && a.phase >= Number(min));
+    const offset = Number(params.get('offset') ?? 0);
+    const limit = Number(params.get('limit') ?? 25);
+    return Promise.resolve(
+      jsonResponse({
+        molecules: matches.slice(offset, offset + limit).map(row),
+        page_meta: { total_count: matches.length },
+      }),
+    );
+  });
+  return requests;
+}
+
+/**
+ * `max_phase_min` on every search_type (#50): ChEMBL's similarity and
+ * substructure routes take it as `max_phase__gte`, and the one exact hit is
+ * checked against it locally. Inputs the chosen search_type does not read are
+ * named in the notice instead of dropped silently.
+ */
+describe('chembl_search_molecules — max_phase_min on structure searches (#50)', () => {
+  /** Run through the full contract; hand back structuredContent and the content[] lines. */
+  async function call(input: Record<string, unknown>) {
+    const result = await runToolContract(chemblSearchMolecules, input, {
+      context: { tenantId: 'default' },
+    });
+    expect(result.isError).toBeFalsy();
+    const lines = result.content
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('\n')
+      .split('\n');
+    return {
+      structured: result.structuredContent as Record<string, unknown> & {
+        molecules: { molecule_chembl_id: string; max_phase: number | null }[];
+      },
+      lines,
+    };
+  }
+  const similarity = (extra: Record<string, unknown> = {}) => ({
+    search_type: 'similarity',
+    structure: IMATINIB_SMILES,
+    limit: 100,
+    ...extra,
+  });
+  const phases = (molecules: { max_phase: number | null }[]) => molecules.map((m) => m.max_phase);
+
+  it('filters a similarity search upstream by max_phase__gte', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS });
+    const { structured, lines } = await call(similarity({ max_phase_min: 4 }));
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.searchParams.get('max_phase__gte')).toBe('4');
+    expect(idsOf(structured.molecules)).toEqual(['CHEMBL941', 'CHEMBL1642']);
+    expect(phases(structured.molecules)).toEqual([4, 4]);
+    expect(structured).toMatchObject({ totalCount: 2, totalCountCapped: false });
+    expect(structured).not.toHaveProperty('notice');
+    expect(lines).toContain('**2 total**');
+  });
+
+  it('leaves an unfiltered similarity search at the full analog count', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS });
+    const { structured } = await call(similarity());
+    expect(requests[0]?.searchParams.has('max_phase__gte')).toBe(false);
+    expect(structured).toMatchObject({ totalCount: 90 });
+  });
+
+  it('sends max_phase_min 0, which excludes every compound with no recorded phase', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS });
+    const { structured } = await call(similarity({ max_phase_min: 0 }));
+    expect(requests[0]?.searchParams.get('max_phase__gte')).toBe('0');
+    expect(structured.totalCount).toBe(6);
+    expect(phases(structured.molecules)).toEqual([4, 4, 3, 2, 1, 0.5]);
+  });
+
+  it('filters a substructure search upstream and checks the unfiltered total against the ceiling', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(0, 68) });
+    const { structured } = await call({
+      search_type: 'substructure',
+      structure: IMATINIB_SMILES,
+      max_phase_min: 4,
+      limit: 50,
+    });
+    expect(idsOf(structured.molecules)).toEqual(['CHEMBL941', 'CHEMBL1642']);
+    expect(structured).toMatchObject({ totalCount: 2, totalCountCapped: false });
+    expect(structured).not.toHaveProperty('notice');
+    // The page carries the filter; the count beside it asks for one unfiltered row.
+    const filtered = requests.filter((u) => u.searchParams.has('max_phase__gte'));
+    const unfiltered = requests.filter((u) => !u.searchParams.has('max_phase__gte'));
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]?.searchParams.get('limit')).toBe('50');
+    expect(unfiltered).toHaveLength(1);
+    expect(unfiltered[0]?.pathname).toBe(filtered[0]?.pathname);
+    expect(unfiltered[0]?.searchParams.get('limit')).toBe('1');
+  });
+
+  it('sends one request for an unfiltered substructure search', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(0, 68) });
+    const { structured } = await call({ search_type: 'substructure', structure: IMATINIB_SMILES });
+    expect(requests).toHaveLength(1);
+    expect(structured.totalCount).toBe(68);
+  });
+
+  /**
+   * ChEMBL filters only the first 30000 hits of a substructure search, so a
+   * filtered total under that ceiling still misses the qualifying compounds past
+   * it whenever the unfiltered search reaches it.
+   */
+  it('flags a filtered substructure search whose unfiltered hits reach the ceiling as a lower bound', async () => {
+    const corpus: Analog[] = Array.from({ length: 30_010 }, (_, i) => ({
+      id: `CHEMBL${i}`,
+      // Approved: three inside the first 30000 hits, two past them.
+      phase: [7, 900, 29_999, 30_000, 30_009].includes(i) ? 4 : null,
+    }));
+    stubStructureUpstream({ corpus, ceiling: 30_000 });
+    const { structured, lines } = await call({
+      search_type: 'substructure',
+      structure: 'c1ccncc1',
+      max_phase_min: 4,
+    });
+    const notice =
+      'ChEMBL applies max_phase_min to only the first 30000 hits of a substructure search, and substructure structure "c1ccncc1" reaches that ceiling, so the 3 matches are a lower bound: qualifying compounds past those hits are missed. Search a larger, more specific substructure to bring the matches under that ceiling.';
+    expect(idsOf(structured.molecules)).toEqual(['CHEMBL7', 'CHEMBL900', 'CHEMBL29999']);
+    expect(structured).toMatchObject({ totalCount: 3, totalCountCapped: true, notice });
+    expect(lines).toContain(`> ${notice}`);
+    expect(lines).toContain('**totalCountCapped:** true');
+  });
+
+  it('pages a capped filtered substructure search with the ceiling on every page', async () => {
+    const corpus: Analog[] = Array.from({ length: 30_010 }, (_, i) => ({
+      id: `CHEMBL${i}`,
+      phase: i < 5 ? 4 : null,
+    }));
+    stubStructureUpstream({ corpus, ceiling: 30_000 });
+    const first = await call({
+      search_type: 'substructure',
+      structure: 'c1ccncc1',
+      max_phase_min: 4,
+      limit: 2,
+    });
+    const ceiling =
+      'ChEMBL applies max_phase_min to only the first 30000 hits of a substructure search, and substructure structure "c1ccncc1" reaches that ceiling, so the 5 matches are a lower bound: qualifying compounds past those hits are missed. Search a larger, more specific substructure to bring the matches under that ceiling.';
+    expect(first.structured).toMatchObject({
+      truncated: true,
+      totalCountCapped: true,
+      notice: `Showing 2 of 5; pass nextCursor back as cursor for the next page. ${ceiling}`,
+    });
+    const past = await call({
+      search_type: 'substructure',
+      structure: 'c1ccncc1',
+      max_phase_min: 4,
+      limit: 2,
+      cursor: encodeCursor({ offset: 6, limit: 2 }),
+    });
+    expect(past.structured.molecules).toEqual([]);
+    expect(past.structured.notice).toBe(
+      `That cursor starts past the last of the 5 compounds ChEMBL returned, so the walk ends here short of the last match. ${ceiling}`,
+    );
+  });
+
+  it('keeps an exact hit at or above max_phase_min, never sending the filter upstream', async () => {
+    const requests = stubStructureUpstream({ exact: { id: 'CHEMBL941', phase: 4 } });
+    const { structured } = await call({
+      search_type: 'exact',
+      structure: IMATINIB_SMILES,
+      max_phase_min: 4,
+    });
+    expect(idsOf(structured.molecules)).toEqual(['CHEMBL941']);
+    expect(structured).toMatchObject({ totalCount: 1 });
+    expect(structured).not.toHaveProperty('notice');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.searchParams.has('max_phase__gte')).toBe(false);
+  });
+
+  it.each([
+    ['no recorded phase', null, 4],
+    ['a phase below the minimum', 3, 4],
+    ['a phase unknown (−1) under max_phase_min 0', -1, 0],
+  ])(
+    'drops an exact hit with %s, naming max_phase_min in the notice',
+    async (_label, phase, min) => {
+      stubStructureUpstream({ exact: { id: 'CHEMBL205409', phase } });
+      const { structured, lines } = await call({
+        search_type: 'exact',
+        structure: 'CCO',
+        max_phase_min: min,
+      });
+      const notice = `No compound matched exact structure "CCO" with max_phase_min=${min}. Retry without max_phase_min first: it keeps only compounds whose recorded max clinical phase is at least ${min}, and one with no recorded phase never passes. Otherwise check the SMILES, or run a similarity or substructure search.`;
+      expect(structured.molecules).toEqual([]);
+      expect(structured).toMatchObject({ totalCount: 0, notice });
+      expect(lines).toContain(`> ${notice}`);
+    },
+  );
+
+  it('names max_phase_min in the zero-hit notice of a filtered similarity search', async () => {
+    stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(6) });
+    const { structured } = await call(similarity({ structure: 'CCO', max_phase_min: 4 }));
+    expect(structured.notice).toBe(
+      'No compound matched similarity structure "CCO" with max_phase_min=4. Retry without max_phase_min first: it keeps only compounds whose recorded max clinical phase is at least 4, and one with no recorded phase never passes. Otherwise check the SMILES or lower the similarity threshold.',
+    );
+  });
+
+  it('names max_phase_min in the zero-hit notice of a filtered name search', async () => {
+    stubMoleculeCorpus(0);
+    const { structured } = await call({ query: 'zzzz', max_phase_min: 2 });
+    expect(structured.notice).toBe(
+      'No compound matched query "zzzz" with max_phase_min=2. Retry without max_phase_min first: it keeps only compounds whose recorded max clinical phase is at least 2, and one with no recorded phase never passes. Otherwise check the spelling or try a broader name.',
+    );
+  });
+
+  /** Each search_type gets only the advice it can act on: a name search has no SMILES or threshold. */
+  it.each([
+    [
+      'name',
+      { query: 'zzzz' },
+      'No compound matched query "zzzz": check the spelling or try a broader name.',
+    ],
+    [
+      'similarity',
+      similarity({ structure: 'CCO' }),
+      'No compound matched similarity structure "CCO": check the SMILES or lower the similarity threshold.',
+    ],
+    [
+      'substructure',
+      { search_type: 'substructure', structure: 'CCO' },
+      'No compound matched substructure structure "CCO": check the SMILES or try a smaller substructure.',
+    ],
+  ])('fits the unfiltered %s zero-hit advice to the search type', async (_label, input, notice) => {
+    // An empty corpus answers the name route and the structure routes alike.
+    stubStructureUpstream({ corpus: [] });
+    const { structured, lines } = await call(input);
+    expect(structured.notice).toBe(notice);
+    expect(lines).toContain(`> ${notice}`);
+  });
+
+  it('names a query sent with a structure search as ignored', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS });
+    const { structured, lines } = await call(similarity({ query: 'imatinib' }));
+    const notice = 'query was ignored: search_type=similarity searches by structure only.';
+    expect(structured).toMatchObject({ totalCount: 90, notice });
+    expect(lines).toContain(`> ${notice}`);
+    expect(requests[0]?.searchParams.has('q')).toBe(false);
+  });
+
+  it('names a structure sent with a name search as ignored', async () => {
+    stubMoleculeCorpus(5);
+    const { structured, lines } = await call({ query: 'imatinib', structure: 'CCO' });
+    const notice =
+      'structure was ignored: search_type=name searches by query only; set search_type to exact, similarity, or substructure to search by structure.';
+    expect(structured).toMatchObject({ totalCount: 5, notice });
+    expect(lines).toContain(`> ${notice}`);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/molecule/search.json');
+  });
+
+  it.each(['', '   '])('reads a blank %j query on a structure search as omitted', async (query) => {
+    stubStructureUpstream({ corpus: IMATINIB_ANALOGS });
+    const { structured } = await call(similarity({ query }));
+    expect(structured).not.toHaveProperty('notice');
+  });
+
+  it('joins the clamp, the ignored input, and the zero-hit diagnosis in one notice', async () => {
+    stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(6) });
+    const { structured, lines } = await call(
+      similarity({ structure: 'CCO', query: 'imatinib', max_phase_min: 4, limit: 150 }),
+    );
+    const notice =
+      'limit 150 is above the maximum of 100, so 100 was applied. query was ignored: search_type=similarity searches by structure only. No compound matched similarity structure "CCO" with max_phase_min=4. Retry without max_phase_min first: it keeps only compounds whose recorded max clinical phase is at least 4, and one with no recorded phase never passes. Otherwise check the SMILES or lower the similarity threshold.';
+    expect(structured.notice).toBe(notice);
+    expect(lines).toContain(`> ${notice}`);
+  });
+
+  it('carries the ignored input beside the continuation on a capped page', async () => {
+    stubStructureUpstream({ corpus: IMATINIB_ANALOGS });
+    const { structured } = await call(similarity({ query: 'imatinib', limit: 10 }));
+    expect(structured).toMatchObject({
+      truncated: true,
+      notice:
+        'query was ignored: search_type=similarity searches by structure only. Showing 10 of 90; pass nextCursor back as cursor for the next page.',
+    });
+  });
+
+  it('describes max_phase_min for every search_type', () => {
+    const describe = chemblSearchMolecules.input.shape.max_phase_min.description ?? '';
+    expect(describe).not.toContain('search_type=name');
+  });
+
+  /**
+   * similarity_threshold is read only by search_type=similarity. The schema fills
+   * its default (70), so only a value other than 70 shows the caller set it — that
+   * one is named in the same joined notice as an ignored query or structure.
+   */
+  const THRESHOLD_IGNORED =
+    'similarity_threshold was ignored: only search_type=similarity applies a Tanimoto threshold.';
+
+  it('names a similarity_threshold sent with a substructure search as ignored', async () => {
+    const requests = stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(0, 68) });
+    const { structured, lines } = await call({
+      search_type: 'substructure',
+      structure: IMATINIB_SMILES,
+      similarity_threshold: 50,
+      limit: 100,
+    });
+    expect(structured).toMatchObject({
+      totalCount: 68,
+      truncated: false,
+      notice: THRESHOLD_IGNORED,
+    });
+    expect(lines).toContain(`> ${THRESHOLD_IGNORED}`);
+    expect(requests[0]?.pathname).not.toContain('/50');
+  });
+
+  it('names a similarity_threshold sent with a name search as ignored', async () => {
+    stubMoleculeCorpus(5);
+    const { structured, lines } = await call({ query: 'imatinib', similarity_threshold: 80 });
+    expect(structured).toMatchObject({ totalCount: 5, notice: THRESHOLD_IGNORED });
+    expect(lines).toContain(`> ${THRESHOLD_IGNORED}`);
+  });
+
+  it('names a structure and a similarity_threshold sent with a name search in one notice', async () => {
+    stubMoleculeCorpus(5);
+    const { structured, lines } = await call({
+      query: 'imatinib',
+      structure: 'CCO',
+      similarity_threshold: 85,
+    });
+    const notice = `structure was ignored: search_type=name searches by query only; set search_type to exact, similarity, or substructure to search by structure. ${THRESHOLD_IGNORED}`;
+    expect(structured).toMatchObject({ totalCount: 5, notice });
+    expect(lines).toContain(`> ${notice}`);
+  });
+
+  it('carries a query and a similarity_threshold beside the continuation on a capped page', async () => {
+    stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(0, 68) });
+    const { structured } = await call({
+      search_type: 'substructure',
+      structure: IMATINIB_SMILES,
+      query: 'imatinib',
+      similarity_threshold: 50,
+      limit: 10,
+    });
+    expect(structured).toMatchObject({
+      truncated: true,
+      notice: `query was ignored: search_type=substructure searches by structure only. ${THRESHOLD_IGNORED} Showing 10 of 68; pass nextCursor back as cursor for the next page.`,
+    });
+  });
+
+  it.each([
+    [
+      'the default 70 on a substructure search',
+      { search_type: 'substructure', structure: IMATINIB_SMILES, similarity_threshold: 70 },
+    ],
+    ['an omitted threshold on a name search', { query: 'imatinib' }],
+    ['a threshold the similarity search reads', similarity({ similarity_threshold: 50 })],
+  ])('says nothing about similarity_threshold for %s', async (_label, input) => {
+    stubStructureUpstream({ corpus: IMATINIB_ANALOGS.slice(0, 68) });
+    const { structured } = await call({ limit: 100, ...input });
+    expect(structured).not.toHaveProperty('notice');
+  });
+
+  it('describes similarity_threshold as named in the notice when another search_type ignores it', () => {
+    const describe = chemblSearchMolecules.input.shape.similarity_threshold.description ?? '';
+    expect(describe).toContain('other than the default 70');
+    expect(describe).toContain('notice');
+  });
+});
+
+/**
+ * ChEMBL keeps max_phase 4 on a drug withdrawn from a market, so 4 says the drug
+ * reached approval, not that it is sold today. chembl_get_drug_info carries the
+ * withdrawal record; the phase descriptions point there by its field names.
+ */
+describe('chembl_search_molecules — max_phase 4 and withdrawal', () => {
+  const maxPhase =
+    chemblSearchMolecules.output.shape.molecules.element.shape.max_phase.description ?? '';
+
+  it('describes max_phase 4 as reaching approval, pointing at chembl_get_drug_info for withdrawal', () => {
+    expect(maxPhase).toContain('4 = reached approval');
+    expect(maxPhase).toContain('not that it is on the market now');
+    expect(maxPhase).toContain("chembl_get_drug_info's withdrawn and warnings");
+  });
+
+  it('names fields chembl_get_drug_info really returns', () => {
+    expect(Object.keys(chemblGetDrugInfo.output.shape)).toEqual(
+      expect.arrayContaining(['withdrawn', 'warnings']),
+    );
+  });
+
+  it('never calls max_phase_min 4 a filter for marketed drugs', () => {
+    const describe = chemblSearchMolecules.input.shape.max_phase_min.description ?? '';
+    expect(describe).not.toMatch(/marketed/i);
+    expect(describe).toContain('reached approval');
+    expect(chemblSearchMolecules.description).not.toMatch(/marketed|4 = approved/i);
+  });
+});
+
+/**
+ * The exact structure route ignores `offset` upstream, so the one hit is windowed
+ * locally the way the exact-identifier route windows its record: on the first
+ * page, and nothing past it.
+ */
+describe('chembl_search_molecules — exact structure search and the cursor offset (#50)', () => {
+  it('returns the exact hit on the first page', async () => {
+    stubStructureUpstream({ exact: { id: 'CHEMBL941', phase: 4 } });
+    const c = ctx();
+    const result = await chemblSearchMolecules.handler(
+      chemblSearchMolecules.input.parse({ search_type: 'exact', structure: IMATINIB_SMILES }),
+      c,
+    );
+    expect(idsOf(result.molecules)).toEqual(['CHEMBL941']);
+    expect(result).not.toHaveProperty('nextCursor');
+  });
+
+  it('reports a cursor past the exact hit as an exhausted walk', async () => {
+    stubStructureUpstream({ exact: { id: 'CHEMBL941', phase: 4 } });
+    const c = ctx();
+    const result = await chemblSearchMolecules.handler(
+      chemblSearchMolecules.input.parse({
+        search_type: 'exact',
+        structure: IMATINIB_SMILES,
+        limit: 3,
+        cursor: encodeCursor({ offset: 3, limit: 3 }),
+      }),
+      c,
+    );
+    expect(result.molecules).toEqual([]);
+    expect(result).not.toHaveProperty('nextCursor');
+    expect(getEnrichment(c)).toMatchObject({
+      totalCount: 1,
+      notice: `That cursor starts past the end of the 1 compounds matching exact structure "${IMATINIB_SMILES}" — the walk is complete.`,
+    });
   });
 });
 

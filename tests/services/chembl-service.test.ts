@@ -540,6 +540,174 @@ describe('ChemblService.structureSearch — similarity rides only the similarity
 });
 
 /**
+ * `maxPhaseMin` on a structure search (#50). The exact route is a by-resource
+ * fetch, so its one hit is checked locally; the substructure route filters only
+ * its first 30000 hits, so a filtered substructure search also reads the
+ * unfiltered total to tell whether that ceiling cut it.
+ */
+describe('ChemblService.structureSearch — maxPhaseMin (#50)', () => {
+  const ctx = () => createMockContext({ tenantId: 'default' });
+  const exact = (phase: unknown, extra: { maxPhaseMin?: number; offset?: number }) => {
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonResponse({ molecule_chembl_id: 'CHEMBL941', max_phase: phase })),
+    );
+    return new ChemblService(config).structureSearch(
+      { structure: 'CCO', searchType: 'exact', similarityThreshold: 70, limit: 25, ...extra },
+      ctx(),
+    );
+  };
+
+  it.each([
+    ['at the minimum', '4.0', 4, 1],
+    ['above it', '4.0', 3, 1],
+    ['below it', '3.0', 4, 0],
+    ['with no recorded phase', null, 0, 0],
+    ['with the phase unknown (−1)', '-1.0', 0, 0],
+  ])('keeps or drops an exact hit %s', async (_label, phase, maxPhaseMin, kept) => {
+    const page = await exact(phase, { maxPhaseMin });
+    expect(page).toMatchObject({ totalCount: kept, totalCountCapped: false });
+    expect(page.items).toHaveLength(kept);
+    expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('max_phase__gte');
+  });
+
+  it('keeps an exact hit whatever its phase when no minimum is set', async () => {
+    const page = await exact(null, {});
+    expect(page.items.map((m) => m.molecule_chembl_id)).toEqual(['CHEMBL941']);
+  });
+
+  it.each([
+    [0, 1],
+    [1, 0],
+    [25, 0],
+  ])(
+    'windows the one exact hit at offset %i to %i rows over a total of 1',
+    async (offset, rows) => {
+      const page = await exact('4.0', { offset });
+      expect(page.items).toHaveLength(rows);
+      expect(page.totalCount).toBe(1);
+    },
+  );
+
+  it('windows a filtered-out exact hit to an empty page over a total of 0 at any offset', async () => {
+    const page = await exact(null, { maxPhaseMin: 4, offset: 3 });
+    expect(page).toEqual({ items: [], totalCount: 0, totalCountCapped: false });
+  });
+
+  /** A substructure route that answers the filtered page and the unfiltered count separately. */
+  function substructureRoute(answer: {
+    filtered: () => Promise<Response>;
+    unfiltered: (signal: AbortSignal | undefined) => Promise<Response>;
+  }) {
+    fetchMock.mockImplementation((url: string | URL, init?: RequestInit) =>
+      new URL(String(url)).searchParams.has('max_phase__gte')
+        ? answer.filtered()
+        : answer.unfiltered(init?.signal ?? undefined),
+    );
+  }
+  const filteredSubstructure = (signal?: AbortSignal) =>
+    new ChemblService(config).structureSearch(
+      {
+        structure: 'c1ccncc1',
+        searchType: 'substructure',
+        similarityThreshold: 70,
+        limit: 25,
+        maxPhaseMin: 4,
+      },
+      signal ? createMockContext({ tenantId: 'default', signal }) : ctx(),
+    );
+  const page = (total: number) =>
+    jsonResponse({
+      molecules: [{ molecule_chembl_id: 'CHEMBL941', max_phase: '4.0' }],
+      page_meta: { total_count: total },
+    });
+
+  it.each([
+    ['reaches', 30_000, true],
+    ['stays under', 29_999, false],
+  ])(
+    'flags the filtered total when the unfiltered search %s the ceiling',
+    async (_l, total, capped) => {
+      substructureRoute({
+        filtered: () => Promise.resolve(page(97)),
+        unfiltered: () => Promise.resolve(page(total)),
+      });
+      await expect(filteredSubstructure()).resolves.toMatchObject({
+        totalCount: 97,
+        totalCountCapped: capped,
+      });
+    },
+  );
+
+  /** Whether a request carrying the phase filter went out. */
+  const sentFilteredPage = () =>
+    fetchMock.mock.calls.some((call) =>
+      new URL(String(call[0])).searchParams.has('max_phase__gte'),
+    );
+
+  it('fails the call when the unfiltered count fails', async () => {
+    substructureRoute({
+      filtered: () => Promise.resolve(page(97)),
+      unfiltered: () => Promise.resolve(jsonResponse({ error_message: 'bad' }, 400)),
+    });
+    await expect(filteredSubstructure()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+    });
+    expect(sentFilteredPage()).toBe(true);
+  });
+
+  it('abandons the unfiltered count once the filtered page fails, throwing the page failure', async () => {
+    let countSignal: AbortSignal | undefined;
+    substructureRoute({
+      filtered: () => Promise.resolve(jsonResponse({ error_message: 'bad' }, 400)),
+      // Hangs until its request is aborted.
+      unfiltered: (signal) =>
+        new Promise((_resolve, reject) => {
+          countSignal = signal;
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        }),
+    });
+    await expect(filteredSubstructure()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+    });
+    expect(countSignal?.aborted).toBe(true);
+  });
+
+  it('rethrows a caller abort rather than an upstream failure', async () => {
+    const caller = new AbortController();
+    substructureRoute({
+      filtered: () => Promise.resolve(page(97)),
+      unfiltered: (signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+          caller.abort(new Error('caller went away'));
+        }),
+    });
+    await expect(filteredSubstructure(caller.signal)).rejects.toThrow('caller went away');
+    expect(sentFilteredPage()).toBe(true);
+  });
+
+  it('sends no unfiltered count for a filtered similarity search or an unfiltered substructure one', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(page(2)));
+    const svc = new ChemblService(config);
+    await svc.structureSearch(
+      {
+        structure: 'CCO',
+        searchType: 'similarity',
+        similarityThreshold: 70,
+        limit: 25,
+        maxPhaseMin: 4,
+      },
+      ctx(),
+    );
+    await svc.structureSearch(
+      { structure: 'CCO', searchType: 'substructure', similarityThreshold: 70, limit: 25 },
+      ctx(),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
  * One parent rule on every molecule the service normalizes (#36, #37): the
  * hierarchy's parent, or the record's own ID when ChEMBL records none — never the
  * active metabolite.
@@ -1543,12 +1711,15 @@ describe('ChemblService activities — only= field selection (#34)', () => {
     'assay_type',
     'assay_variant_accession',
     'assay_variant_mutation',
+    'bao_label',
     'data_validity_comment',
     'document_chembl_id',
     'document_year',
     'molecule_chembl_id',
     'molecule_pref_name',
+    'parent_molecule_chembl_id',
     'pchembl_value',
+    'potential_duplicate',
     'relation',
     'standard_relation',
     'standard_type',
@@ -1661,12 +1832,15 @@ describe('ChemblService activities — only= field selection (#34)', () => {
       assay_type: 'B',
       assay_variant_accession: 'P00533',
       assay_variant_mutation: 'L858R',
+      bao_label: 'single protein format',
       data_validity_comment: 'Outside typical range',
       document_chembl_id: 'CHEMBL1145828',
       document_year: 2003,
       molecule_chembl_id: 'CHEMBL68920',
       molecule_pref_name: 'GEFITINIB',
+      parent_molecule_chembl_id: 'CHEMBL68920',
       pchembl_value: 7,
+      potential_duplicate: false,
       relation: '=',
       standard_relation: '=',
       standard_type: 'IC50',
@@ -1700,5 +1874,63 @@ describe('ChemblService activities — only= field selection (#34)', () => {
     normalizeActivity(recording('7.5'));
     expect([...read].sort()).toEqual([...ACTIVITY_FIELDS].sort());
     expect([...ACTIVITY_FIELDS].sort()).toEqual(READ_FIELDS);
+  });
+});
+
+describe('normalizeActivity — family parent, duplicate flag, and assay format (#53)', () => {
+  /** The three fields as live `/activity` rows carry them: a salt of dasatinib, and an EGFR repeat citation. */
+  const SALT = {
+    activity_id: 7573328,
+    molecule_chembl_id: 'CHEMBL5416410',
+    parent_molecule_chembl_id: 'CHEMBL1421',
+    potential_duplicate: 0,
+    bao_label: 'single protein format',
+  };
+  const REPEAT = {
+    activity_id: 187807,
+    molecule_chembl_id: 'CHEMBL29197',
+    parent_molecule_chembl_id: 'CHEMBL29197',
+    potential_duplicate: 1,
+    bao_label: 'cell-based format',
+  };
+  const pick = (raw: Parameters<typeof normalizeActivity>[0]) => {
+    const { parent_molecule_chembl_id, potential_duplicate, bao_label } = normalizeActivity(raw);
+    return { parent_molecule_chembl_id, potential_duplicate, bao_label };
+  };
+
+  it('carries the parent and assay format as recorded, and ChEMBL 1 / 0 as true / false', () => {
+    expect(pick(SALT)).toEqual({
+      parent_molecule_chembl_id: 'CHEMBL1421',
+      potential_duplicate: false,
+      bao_label: 'single protein format',
+    });
+    expect(pick(REPEAT)).toEqual({
+      parent_molecule_chembl_id: 'CHEMBL29197',
+      potential_duplicate: true,
+      bao_label: 'cell-based format',
+    });
+  });
+
+  it('reads each of the three as null when the row omits it or records null', () => {
+    const {
+      parent_molecule_chembl_id: _p,
+      potential_duplicate: _d,
+      bao_label: _b,
+      ...sparse
+    } = SALT;
+    const nothing = { parent_molecule_chembl_id: null, potential_duplicate: null, bao_label: null };
+    expect(pick(sparse)).toEqual(nothing);
+    expect(pick({ ...sparse, ...nothing })).toEqual(nothing);
+  });
+
+  /**
+   * The DuckDB appender stores a BOOLEAN column as `Boolean(value)`, so anything but
+   * a real boolean or null would stage wrong: the integer 0 survives, but the string
+   * "0" becomes true.
+   */
+  it('hands the row a real boolean, never the upstream integer', () => {
+    for (const raw of [SALT, REPEAT]) {
+      expect(typeof normalizeActivity(raw).potential_duplicate).toBe('boolean');
+    }
   });
 });
