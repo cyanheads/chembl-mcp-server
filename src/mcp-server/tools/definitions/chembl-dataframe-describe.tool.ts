@@ -64,7 +64,7 @@ export const chemblDataframeDescribe = tool('chembl_dataframe_describe', {
       throw ctx.fail('canvas_disabled');
     }
     const instance = await canvas.acquire(input.canvas_id, ctx);
-    const tables = await instance.describe();
+    const tables = await instance.describe({ signal: ctx.signal });
     return {
       tables: tables.map((t) => ({
         name: t.name,

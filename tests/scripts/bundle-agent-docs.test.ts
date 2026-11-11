@@ -2,22 +2,15 @@
  * @fileoverview Preserve executable skill modules while removing dependency agent
  * documentation from a built `.mcpb`. Covers the package-root `AGENT_DOC_ENTRY`
  * selector shared by `scripts/clean-mcpb.ts` and `scripts/lint-packaging.ts`
- * (local fix for cyanheads/mcp-ts-core#794): the MCP SDK's `dist/ext/skills/`
- * runtime must survive cleaning, and both scripts must select the same entries.
+ * (cyanheads/mcp-ts-core#794): the MCP SDK's `dist/ext/skills/` runtime must
+ * survive cleaning, and both scripts must select the same entries. The framework
+ * pins the pair only in its own test suite, so this server's copies are pinned here.
  * @module tests/scripts/bundle-agent-docs.test
  */
 
 import { describe, expect, it } from 'vitest';
 import { filterAgentDocEntries } from '../../scripts/clean-mcpb.js';
-
-/**
- * Loaded by URL at run time: `lint-packaging.ts` carries a repo-only
- * `import('../src/mcp-server/skills.js')` fallback that breaks `tsc` when the
- * script joins the test program (cyanheads/mcp-ts-core#797).
- */
-const { AGENT_DOC_ENTRY: lintAgentDocEntry } = (await import(
-  new URL('../../scripts/lint-packaging.ts', import.meta.url).href
-)) as { AGENT_DOC_ENTRY: RegExp };
+import { AGENT_DOC_ENTRY as lintAgentDocEntry } from '../../scripts/lint-packaging.js';
 
 describe('bundle agent documentation selection', () => {
   it.each([
